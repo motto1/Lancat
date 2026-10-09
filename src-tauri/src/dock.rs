@@ -163,6 +163,15 @@ pub fn create_windows(app: &AppHandle) -> tauri::Result<()> {
         let _ = ensure_panel(app);
     }
     spawn_poller(app.clone());
+    // the collapsed app has settled: give back start-up heap and library pages (Linux)
+    let a = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(8));
+        let st = a.state::<DockState>();
+        if a.get_webview_window("panel").is_none() && !st.hovering.load(Ordering::SeqCst) {
+            platform::settle_after_start();
+        }
+    });
     Ok(())
 }
 

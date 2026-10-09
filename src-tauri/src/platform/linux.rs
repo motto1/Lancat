@@ -125,12 +125,71 @@ pub fn trim_heap() {
             malloc_trim(0);
         }
     }
+    if std::env::var_os("LANCAT_KEEP_LIB_PAGES").is_none() {
+        drop_clean_lib_pages();
+    }
+}
+
+/// After the web view is gone, most of what the UI process still holds are *clean* pages of the
+/// libraries WebKit pulled in: libwebkit2gtk / libjavascriptcoregtk code, and Mesa's libgallium +
+/// libLLVM that GTK loaded to composite the GL output (≈ 48 MB on the niri box, see
+/// docs/postmortem-memory.md). They are identical to the files on disk, but because no other
+/// process maps them they count as this process's private memory (USS) until the kernel happens
+/// to reclaim them under pressure.
+///
+/// `MADV_DONTNEED` on a read-only, never-written private file mapping only drops our page-table
+/// entries: the pages stay in the page cache (reclaimable, no longer charged to us) and the next
+/// access is a minor fault. It must never touch a mapping that holds copy-on-write data (RELRO,
+/// .data), because there DONTNEED would revert it to the file's contents, so only mappings that
+/// are not writable and have `Anonymous: 0 kB` are released. (`MADV_PAGEOUT` would be the obvious
+/// call, but since Linux 6.2 it skips file pages of files the caller cannot write, i.e. /usr/lib.)
+/// `LANCAT_KEEP_LIB_PAGES=1` disables it.
+fn drop_clean_lib_pages() {
+    const MADV_DONTNEED: i32 = 4;
+    extern "C" {
+        fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+    }
+    let Ok(smaps) = std::fs::read_to_string("/proc/self/smaps") else { return };
+    let exe = std::fs::read_link("/proc/self/exe").ok();
+    let mut released = 0usize;
+    let mut cur: Option<(usize, usize, bool)> = None; // start, end, candidate
+    let mut flush = |cur: &mut Option<(usize, usize, bool)>, anon_kb: Option<u64>| {
+        if let (Some((s, e, true)), Some(0)) = (*cur, anon_kb) {
+            // SAFETY: the range is one whole VMA of a read-only, unmodified file mapping; dropping
+            // its pages only makes the next access re-read them from the page cache.
+            if unsafe { madvise(s as *mut _, e - s, MADV_DONTNEED) } == 0 {
+                released += e - s;
+            }
+        }
+        *cur = None;
+    };
+    for line in smaps.lines() {
+        let mut it = line.split_whitespace();
+        let Some(first) = it.next() else { continue };
+        if let Some((a, b)) = first.split_once('-').filter(|_| !first.ends_with(':')) {
+            // mapping header: "start-end perms offset dev inode path"
+            let (Ok(s), Ok(e)) = (usize::from_str_radix(a, 16), usize::from_str_radix(b, 16)) else { continue };
+            let perms = it.next().unwrap_or("");
+            let path = it.nth(3).unwrap_or("");
+            let candidate = path.starts_with('/')
+                && path.contains(".so")
+                && !perms.contains('w')
+                && perms.starts_with('r')
+                && exe.as_deref().is_none_or(|x| x.as_os_str() != path);
+            cur = Some((s, e, candidate));
+        } else if first == "Anonymous:" {
+            let kb = it.next().and_then(|v| v.parse::<u64>().ok());
+            flush(&mut cur, kb);
+        }
+    }
+    log::info!("dropped the resident pages of {} MB of read-only library mappings", released >> 20);
 }
 
 /// Process-wide graphics defaults. Must run before GTK, EGL or WebKit initialise (first thing in
 /// `run()`, still single-threaded). Every variable is only set when the user has not set it, and
 /// `LANCAT_NO_GL_DEFAULTS=1` skips all of them.
 pub fn early_init() {
+    limit_malloc_arenas();
     if std::env::var_os("LANCAT_NO_GL_DEFAULTS").is_some() {
         return;
     }
@@ -141,6 +200,31 @@ pub fn early_init() {
     if let Some(json) = mesa_only_vendor() {
         set_default("__EGL_VENDOR_LIBRARY_FILENAMES", &json);
     }
+}
+
+/// glibc gives every thread that ever calls malloc its own arena (up to 8 × cores), and WebKit's
+/// UI-side threads leave a few MB of partly used arenas behind after the web view is gone. Two
+/// arenas are plenty for this app (measured: −1.5 MB after a panel open/close cycle). An explicit
+/// `MALLOC_ARENA_MAX` from the environment wins.
+fn limit_malloc_arenas() {
+    #[cfg(target_env = "gnu")]
+    if std::env::var_os("MALLOC_ARENA_MAX").is_none() {
+        const M_ARENA_MAX: i32 = -8;
+        extern "C" {
+            fn mallopt(param: i32, value: i32) -> i32;
+        }
+        // SAFETY: plain libc call, runs before any other thread exists
+        unsafe {
+            mallopt(M_ARENA_MAX, 2);
+        }
+    }
+}
+
+/// Called once the app has settled after start (collapsed, no web view yet): the WebKit/GTK
+/// libraries were loaded and relocated but most of their code pages are never needed again until
+/// the panel opens, so release them like after a panel is destroyed.
+pub fn settle_after_start() {
+    trim_heap();
 }
 
 fn set_default(key: &str, value: &str) {

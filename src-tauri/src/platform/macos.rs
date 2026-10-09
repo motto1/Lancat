@@ -44,6 +44,8 @@ pub fn place_layer(_win: &WebviewWindow, _x: f64, _y: f64, _w: f64, _h: f64) -> 
 
 pub fn trim_heap() {}
 
+pub fn settle_after_start() {}
+
 pub fn early_init() {}
 
 /// WebKit (macOS) / WebView2 (Windows) shut their helper processes down by themselves once the
