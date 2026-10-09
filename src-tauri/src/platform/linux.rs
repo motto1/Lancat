@@ -127,8 +127,63 @@ pub fn trim_heap() {
     }
 }
 
-/// Process-wide defaults before GTK/WebKit start (none yet).
-pub fn early_init() {}
+/// Process-wide graphics defaults. Must run before GTK, EGL or WebKit initialise (first thing in
+/// `run()`, still single-threaded). Every variable is only set when the user has not set it, and
+/// `LANCAT_NO_GL_DEFAULTS=1` skips all of them.
+pub fn early_init() {
+    if std::env::var_os("LANCAT_NO_GL_DEFAULTS").is_some() {
+        return;
+    }
+    // libglvnd's EGL loads *every* installed vendor library up front and asks each one for a
+    // display. On a hybrid laptop whose screen is driven by Intel/AMD that maps both Mesa
+    // (libgallium + libLLVM) and the whole NVIDIA EGL stack into the UI process and every web
+    // process. Point glvnd at Mesa only when no connected output is driven by the NVIDIA driver.
+    if let Some(json) = mesa_only_vendor() {
+        set_default("__EGL_VENDOR_LIBRARY_FILENAMES", &json);
+    }
+}
+
+fn set_default(key: &str, value: &str) {
+    if std::env::var_os(key).is_none() {
+        log::info!("graphics default: {key}={value}");
+        std::env::set_var(key, value);
+    }
+}
+
+/// The Mesa EGL vendor JSON, if every connected display is driven by a non-NVIDIA DRM driver.
+fn mesa_only_vendor() -> Option<String> {
+    let mut connected = 0;
+    for ent in std::fs::read_dir("/sys/class/drm").ok()?.flatten() {
+        let name = ent.file_name().to_string_lossy().to_string();
+        // connectors are named like card1-eDP-1
+        let Some((card, _)) = name.split_once('-') else { continue };
+        if !card.starts_with("card") {
+            continue;
+        }
+        if std::fs::read_to_string(ent.path().join("status")).map(|s| s.trim() != "connected").unwrap_or(true) {
+            continue;
+        }
+        let driver = std::fs::read_link(format!("/sys/class/drm/{card}/device/driver")).ok()?;
+        if driver.file_name()?.to_string_lossy().starts_with("nvidia") {
+            return None;
+        }
+        connected += 1;
+    }
+    if connected == 0 {
+        return None;
+    }
+    for dir in ["/etc/glvnd/egl_vendor.d", "/usr/share/glvnd/egl_vendor.d", "/usr/local/share/glvnd/egl_vendor.d"] {
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        let mut files: Vec<_> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "json")).collect();
+        files.sort();
+        for f in files {
+            if std::fs::read_to_string(&f).is_ok_and(|s| s.contains("libEGL_mesa")) {
+                return Some(f.to_string_lossy().to_string());
+            }
+        }
+    }
+    None
+}
 
 /// After the last webview is gone: stop WebKit's network process too. WebKitGTK keeps it running
 /// even with no web views (tauri keeps the WebContext alive on Linux for that reason, see
