@@ -295,7 +295,7 @@ pub fn schedule_hover_open(app: &AppHandle) {
     });
 }
 
-fn emit_cursor(app: &AppHandle, inside: bool) {
+pub(crate) fn emit_cursor(app: &AppHandle, inside: bool) {
     #[derive(Serialize, Clone)]
     struct Inside {
         inside: bool,

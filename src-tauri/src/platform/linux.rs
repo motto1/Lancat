@@ -51,8 +51,34 @@ fn init_layer(win: &WebviewWindow, keyboard: bool) {
     gw.set_keyboard_mode(if keyboard { KeyboardMode::OnDemand } else { KeyboardMode::None });
 }
 
+/// Reliable pointer enter/leave for the panel straight from GDK (wl_pointer.enter/leave on
+/// Wayland). WebKitGTK does not deliver DOM `mouseleave` when the pointer leaves a layer-shell
+/// surface, so the frontend never learned the pointer had gone and the panel never collapsed.
+fn watch_crossing(win: &WebviewWindow) {
+    use gtk::prelude::*;
+    use tauri::Manager;
+    let Ok(gw) = win.gtk_window() else { return };
+    gw.add_events(gtk::gdk::EventMask::ENTER_NOTIFY_MASK | gtk::gdk::EventMask::LEAVE_NOTIFY_MASK);
+    let app = win.app_handle().clone();
+    gw.connect_enter_notify_event(move |_, ev| {
+        if ev.detail() != gtk::gdk::NotifyType::Inferior {
+            crate::dock::emit_cursor(&app, true);
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    let app = win.app_handle().clone();
+    gw.connect_leave_notify_event(move |_, ev| {
+        log::debug!("panel leave-notify detail={:?}", ev.detail());
+        if ev.detail() != gtk::gdk::NotifyType::Inferior {
+            crate::dock::emit_cursor(&app, false);
+        }
+        gtk::glib::Propagation::Proceed
+    });
+}
+
 pub fn setup_panel(win: &WebviewWindow) {
     use gtk::prelude::*;
+    watch_crossing(win);
     #[cfg(feature = "layer-shell")]
     if use_layer_shell() {
         init_layer(win, true);
