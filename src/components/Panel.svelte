@@ -4,6 +4,7 @@
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
   import { api, uiLog } from "../lib/api";
   import { app } from "../lib/state.svelte";
   import { edgeOffset, exitTo, springTo } from "../lib/spring";
@@ -161,6 +162,28 @@
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape" && !ui.emojiOpen && !ui.menuOpen) collapse(true);
     };
+    // Keyboard focus moved to another app (e.g. the user clicked elsewhere and started typing).
+    // WebKitGTK on a layer-shell surface does not always blur the textarea, which left
+    // composerFocused stuck at true and blocked collapsing forever. Losing window focus always
+    // releases the composer hold; if the pointer is already outside, collapse as usual.
+    const onWinBlur = () => {
+      uiLog(`window blur, pointerInside=${pointerInside}`);
+      ui.composerFocused = false;
+      (document.activeElement as HTMLElement | null)?.blur?.();
+      if (!pointerInside && phase !== "hidden") scheduleCollapse();
+    };
+    window.addEventListener("blur", onWinBlur);
+    getCurrentWindow()
+      .onFocusChanged(({ payload }) => {
+        if (!payload) onWinBlur();
+      })
+      .then((f) => un.push(f))
+      .catch(() => {});
+    // Pointer moving inside the page proves it is inside (covers a missed mouseenter).
+    const onMove = () => {
+      if (!pointerInside) pointer(true);
+    };
+    document.addEventListener("mousemove", onMove, { passive: true });
     document.documentElement.addEventListener("mouseleave", onLeave);
     document.documentElement.addEventListener("mouseenter", onEnter);
     window.addEventListener("keydown", onKey);
@@ -169,6 +192,8 @@
       document.documentElement.removeEventListener("mouseleave", onLeave);
       document.documentElement.removeEventListener("mouseenter", onEnter);
       window.removeEventListener("keydown", onKey);
+      window.removeEventListener("blur", onWinBlur);
+      document.removeEventListener("mousemove", onMove);
     };
   });
 
