@@ -2,6 +2,8 @@
 
 mod commands;
 mod dock;
+mod platform;
+mod tray;
 
 use std::sync::Arc;
 
@@ -31,6 +33,7 @@ fn start_core(app: &tauri::App) -> anyhow::Result<Arc<Node>> {
 }
 
 pub fn run() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,tao=warn,wry=warn")).try_init();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -58,7 +61,22 @@ pub fn run() {
             commands::import_sticker,
             commands::get_sticker,
             commands::delete_sticker,
+            dock::cmd_open_panel,
+            dock::cmd_hide_panel,
+            dock::set_pinned,
+            dock::set_hold,
+            dock::cmd_open_settings,
+            dock::list_monitors,
         ])
+        .on_window_event(|window, event| {
+            // the panel/dock are never destroyed; closing settings just closes it
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "panel" {
+                    api.prevent_close();
+                    dock::hide_panel(window.app_handle());
+                }
+            }
+        })
         .setup(|app| {
             let node = start_core(app).map_err(|e| e.to_string())?;
             // forward core events to every webview
@@ -76,10 +94,10 @@ pub fn run() {
                 }
             });
             app.manage(Core(node));
-            tauri::WebviewWindowBuilder::new(app, "panel", tauri::WebviewUrl::App("index.html".into()))
-                .title("Lancat")
-                .inner_size(360.0, 520.0)
-                .build()?;
+            app.manage(dock::DockState::default());
+            platform::init_app(app);
+            dock::create_windows(app.handle())?;
+            platform::first_run(app.handle());
             Ok(())
         })
         .run(tauri::generate_context!())

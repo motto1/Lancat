@@ -1,0 +1,166 @@
+// Reactive app state shared by the panel components (Svelte 5 runes).
+import { api, onCore, type CoreEvent, type DeviceInfo, type Message, type Peer, type Settings } from "./api";
+
+function sortPeers(list: Peer[]) {
+  list.sort((a, b) => Number(b.online) - Number(a.online) || b.last_ts - a.last_ts || a.name.localeCompare(b.name));
+}
+
+class AppState {
+  me = $state<DeviceInfo | null>(null);
+  peers = $state<Peer[]>([]);
+  settings = $state<Settings | null>(null);
+  /** Conversation shown on the right. */
+  current = $state<string | null>(null);
+  /** Shift-multi-selected peers (send targets when >1). */
+  selected = $state<string[]>([]);
+  /** "全部" mode: send to every online device. */
+  broadcast = $state(false);
+  messages = $state<Record<string, Message[]>>({});
+  hasMore = $state<Record<string, boolean>>({});
+  progress = $state<Record<string, { done: number; total: number }>>({});
+  typing = $state<Record<string, number>>({});
+  /** Panel is on screen (unread is only cleared while visible). */
+  visible = $state(false);
+  toast = $state<string | null>(null);
+
+  onlinePeers = $derived(this.peers.filter((p) => p.online && !p.blocked));
+  totalUnread = $derived(this.peers.reduce((n, p) => n + (p.blocked ? 0 : p.unread), 0));
+  currentPeer = $derived(this.peers.find((p) => p.id === this.current) ?? null);
+  transferring = $derived(
+    Object.values(this.messages).some((l) => l.some((m) => m.kind === "file" && (m.status === "transferring" || m.status === "receiving"))),
+  );
+
+  /** Ids a message typed in the composer goes to. */
+  targets(): string[] {
+    if (this.broadcast) return this.onlinePeers.map((p) => p.id);
+    if (this.selected.length > 1) return [...this.selected];
+    return this.current ? [this.current] : [];
+  }
+
+  async init() {
+    const [me, peers, settings] = await Promise.all([api.me(), api.peers(), api.settings()]);
+    this.me = me;
+    if (me.os === "windows" || me.os === "macos") document.documentElement.classList.add("native-glass");
+    sortPeers(peers);
+    this.peers = peers;
+    this.settings = settings;
+    applyTheme(settings.theme);
+    if (!this.current && peers.length) await this.open(peers[0].id);
+    await onCore((e) => this.onEvent(e));
+  }
+
+  async open(peerId: string) {
+    this.current = peerId;
+    this.broadcast = false;
+    if (!this.messages[peerId]) {
+      const list = await api.messages(peerId);
+      this.messages[peerId] = list;
+      this.hasMore[peerId] = list.length >= 80;
+    }
+    this.markReadIfVisible();
+  }
+
+  async loadOlder(peerId: string) {
+    const list = this.messages[peerId];
+    if (!list || !this.hasMore[peerId]) return;
+    const older = await api.messages(peerId, list[0]?.ts, 80);
+    this.hasMore[peerId] = older.length >= 80;
+    this.messages[peerId] = [...older, ...list];
+  }
+
+  markReadIfVisible() {
+    const id = this.current;
+    if (!id || !this.visible) return;
+    const p = this.peers.find((x) => x.id === id);
+    if (p && p.unread > 0) {
+      p.unread = 0;
+      api.markRead(id).catch(() => {});
+    }
+  }
+
+  toggleSelect(peerId: string) {
+    this.broadcast = false;
+    const i = this.selected.indexOf(peerId);
+    if (i >= 0) this.selected.splice(i, 1);
+    else {
+      if (this.selected.length === 0 && this.current && this.current !== peerId) this.selected.push(this.current);
+      this.selected.push(peerId);
+    }
+  }
+
+  clearSelection() {
+    this.selected = [];
+  }
+
+  flash(msg: string) {
+    this.toast = msg;
+    setTimeout(() => {
+      if (this.toast === msg) this.toast = null;
+    }, 2600);
+  }
+
+  private upsertMessage(m: Message) {
+    const list = this.messages[m.peer_id];
+    if (!list) return;
+    const i = list.findIndex((x) => x.id === m.id);
+    if (i >= 0) list[i] = m;
+    else {
+      // keep ordered by ts
+      let j = list.length;
+      while (j > 0 && list[j - 1].ts > m.ts) j--;
+      list.splice(j, 0, m);
+    }
+  }
+
+  onEvent(e: CoreEvent) {
+    switch (e.type) {
+      case "peer": {
+        const i = this.peers.findIndex((p) => p.id === e.peer.id);
+        if (i >= 0) this.peers[i] = e.peer;
+        else this.peers.push(e.peer);
+        sortPeers(this.peers);
+        if (!this.current) this.open(e.peer.id);
+        if (e.peer.id === this.current) this.markReadIfVisible();
+        break;
+      }
+      case "peer_removed":
+        this.peers = this.peers.filter((p) => p.id !== e.peer_id);
+        delete this.messages[e.peer_id];
+        if (this.current === e.peer_id) this.current = this.peers[0]?.id ?? null;
+        this.selected = this.selected.filter((x) => x !== e.peer_id);
+        break;
+      case "message":
+        this.upsertMessage(e.message);
+        if (!e.message.outgoing) delete this.typing[e.message.peer_id];
+        break;
+      case "message_update":
+        this.upsertMessage(e.message);
+        if (e.message.status === "done" || e.message.status === "failed") delete this.progress[e.message.id];
+        break;
+      case "progress":
+        this.progress[e.msg_id] = { done: e.done, total: e.total };
+        break;
+      case "typing":
+        if (e.typing) this.typing[e.peer_id] = Date.now() + 5000;
+        else delete this.typing[e.peer_id];
+        break;
+      case "history_cleared":
+        if (e.peer_id) this.messages[e.peer_id] = [];
+        else for (const k of Object.keys(this.messages)) this.messages[k] = [];
+        for (const p of this.peers) if (!e.peer_id || p.id === e.peer_id) (p.unread = 0), (p.last_preview = "");
+        break;
+      case "settings":
+        this.settings = e.settings;
+        applyTheme(e.settings.theme);
+        break;
+    }
+  }
+}
+
+export function applyTheme(theme: string) {
+  const root = document.documentElement;
+  if (theme === "light" || theme === "dark") root.dataset.theme = theme;
+  else delete root.dataset.theme;
+}
+
+export const app = new AppState();

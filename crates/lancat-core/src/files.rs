@@ -264,6 +264,9 @@ impl IncomingTransfer {
         fs::rename(&self.part_path, &target).or_else(|_| fs::copy(&self.part_path, &target).map(|_| ()).and_then(|_| fs::remove_file(&self.part_path)))?;
         strip_exec(&target);
         let _ = fs::remove_file(&self.sidecar_path);
+        if let Some(dir) = self.sidecar_path.parent() {
+            let _ = fs::remove_dir(dir); // only succeeds when no other transfer is pending
+        }
         Ok(target)
     }
 }

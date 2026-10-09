@@ -1,0 +1,262 @@
+<script lang="ts">
+  // The chat popover: spring in from the docked edge, collapse 800 ms after the pointer leaves
+  // (unless the composer has focus, the emoji panel / a menu is open, a transfer runs, or it is pinned).
+  import { onMount } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
+  import { getCurrentWebview } from "@tauri-apps/api/webview";
+  import { api } from "../lib/api";
+  import { app } from "../lib/state.svelte";
+  import { edgeOffset, exitTo, springTo } from "../lib/spring";
+  import { ui } from "../lib/ui.svelte";
+  import Sidebar from "./Sidebar.svelte";
+  import Conversation from "./Conversation.svelte";
+  import Composer from "./Composer.svelte";
+  import Header from "./Header.svelte";
+  import Empty from "./Empty.svelte";
+
+  let shell: HTMLElement;
+  let edge = $state("right");
+  let anim: Animation | null = null;
+  let phase: "hidden" | "opening" | "open" | "closing" = "hidden";
+  let pointerInside = true;
+  let collapseTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function blocked(): boolean {
+    return ui.pinned || ui.composerFocused || ui.emojiOpen || ui.menuOpen || ui.dragging || app.transferring;
+  }
+
+  function show(from: string) {
+    clearTimeout(collapseTimer);
+    app.visible = true;
+    if (phase === "open" || phase === "opening") return;
+    anim?.cancel();
+    phase = "opening";
+    anim = springTo(shell, { ...edgeOffset(edge, 36), scale: 0.94, opacity: 0 }, { x: 0, y: 0, scale: 1, opacity: 1 }, { stiffness: 300, damping: 24 });
+    anim.finished.then(() => phase === "opening" && (phase = "open")).catch(() => {});
+    app.markReadIfVisible();
+    if (from === "drag") ui.dragging = true;
+  }
+
+  async function collapse(force = false) {
+    if (phase === "hidden" || phase === "closing") return;
+    if (!force && blocked()) return;
+    phase = "closing";
+    anim?.cancel();
+    anim = exitTo(shell, { x: 0, y: 0, scale: 1, opacity: 1 }, { ...edgeOffset(edge, 28), scale: 0.96, opacity: 0 }, 220);
+    try {
+      await anim.finished;
+    } catch {
+      return; // cancelled by a re-open
+    }
+    if (phase !== "closing") return;
+    phase = "hidden";
+    app.visible = false;
+    ui.emojiOpen = false;
+    await api.hidePanel();
+  }
+
+  function scheduleCollapse() {
+    clearTimeout(collapseTimer);
+    const delay = app.settings?.collapse_delay_ms ?? 800;
+    const tick = () => {
+      if (pointerInside) return;
+      if (blocked()) {
+        collapseTimer = setTimeout(tick, 400); // re-check until free
+        return;
+      }
+      collapse();
+    };
+    collapseTimer = setTimeout(tick, delay);
+  }
+
+  function pointer(inside: boolean) {
+    if (inside === pointerInside) return;
+    pointerInside = inside;
+    if (inside) clearTimeout(collapseTimer);
+    else scheduleCollapse();
+  }
+
+  // the Rust side tells us when anything blocks collapsing for a while (e.g. native dialog open)
+  $effect(() => {
+    api.setHold(ui.pinned || ui.composerFocused || ui.emojiOpen || ui.menuOpen || app.transferring).catch(() => {});
+  });
+
+  onMount(() => {
+    const un: Array<() => void> = [];
+    app.init();
+    (async () => {
+      un.push(
+        await listen<{ edge: string; reason: string }>("panel://show", (e) => {
+          edge = e.payload.edge;
+          pointerInside = true;
+          show(e.payload.reason);
+        }),
+      );
+      un.push(await listen<{ inside: boolean }>("panel://cursor", (e) => pointer(e.payload.inside)));
+      un.push(await listen("panel://collapse", () => collapse(true)));
+      un.push(await listen<boolean>("panel://pinned", (e) => (ui.pinned = e.payload)));
+      un.push(
+        await getCurrentWebview().onDragDropEvent((ev) => {
+          const p = ev.payload;
+          if (p.type === "enter" || p.type === "over") {
+            ui.dragging = true;
+            pointerInside = true;
+            clearTimeout(collapseTimer);
+            const pos = p.position;
+            ui.dropKey = hitTest(pos.x / devicePixelRatio, pos.y / devicePixelRatio);
+            if (p.type === "enter") ui.dragPaths = p.paths;
+          } else if (p.type === "drop") {
+            const key = hitTest(p.position.x / devicePixelRatio, p.position.y / devicePixelRatio);
+            ui.dragging = false;
+            ui.dropKey = null;
+            dropFiles(key, p.paths);
+          } else {
+            ui.dragging = false;
+            ui.dropKey = null;
+          }
+        }),
+      );
+    })();
+    const onLeave = (e: MouseEvent) => {
+      if (!e.relatedTarget) pointer(false);
+    };
+    const onEnter = () => pointer(true);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !ui.emojiOpen && !ui.menuOpen) collapse(true);
+    };
+    document.documentElement.addEventListener("mouseleave", onLeave);
+    document.documentElement.addEventListener("mouseenter", onEnter);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      un.forEach((f) => f());
+      document.documentElement.removeEventListener("mouseleave", onLeave);
+      document.documentElement.removeEventListener("mouseenter", onEnter);
+      window.removeEventListener("keydown", onKey);
+    };
+  });
+
+  /** Which drop zone is under (x, y): "peer:<id>" | "all" | "conversation" | null */
+  function hitTest(x: number, y: number): string | null {
+    const el = document.elementFromPoint(x, y) as HTMLElement | null;
+    const zone = el?.closest<HTMLElement>("[data-drop]");
+    return zone?.dataset.drop ?? null;
+  }
+
+  async function dropFiles(key: string | null, paths: string[]) {
+    if (!paths.length || !key) return;
+    let targets: string[] = [];
+    if (key === "all") targets = app.onlinePeers.map((p) => p.id);
+    else if (key.startsWith("peer:")) {
+      const id = key.slice(5);
+      targets = app.selected.includes(id) && app.selected.length > 1 ? [...app.selected] : [id];
+    } else if (key === "conversation") targets = app.targets();
+    if (!targets.length) {
+      app.flash("没有可发送的在线设备");
+      return;
+    }
+    try {
+      await api.sendFiles(targets, paths);
+      const names = targets.map((t) => app.peers.find((p) => p.id === t)?.name ?? "?");
+      app.flash(`已发送 ${paths.length} 项给 ${names.length > 2 ? `${names.length} 台设备` : names.join("、")}`);
+      if (targets.length === 1 && key !== "conversation") app.open(targets[0]);
+    } catch (e) {
+      app.flash(String(e));
+    }
+  }
+</script>
+
+<div class="frame">
+  <div class="shell glass" bind:this={shell} class:dragging={ui.dragging}>
+    <Header />
+    <div class="body">
+      <Sidebar />
+      <section class="main" data-drop="conversation" class:drop-hot={ui.dropKey === "conversation"}>
+        {#if app.peers.length === 0}
+          <Empty />
+        {:else}
+          <Conversation />
+          <Composer />
+        {/if}
+      </section>
+    </div>
+    {#if app.toast}
+      <div class="toast">{app.toast}</div>
+    {/if}
+  </div>
+</div>
+
+<style>
+  .frame {
+    position: fixed;
+    inset: 0;
+    padding: 8px;
+  }
+  :global(.native-glass) .frame {
+    padding: 0;
+  }
+  :global(.native-glass) .shell {
+    box-shadow: none;
+    border: none;
+  }
+  .shell {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    border-radius: var(--radius);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    opacity: 0;
+    will-change: transform, opacity;
+  }
+  .body {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+  }
+  .main {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .main::after {
+    content: "";
+    position: absolute;
+    inset: 6px;
+    border-radius: 12px;
+    border: 2px dashed var(--accent);
+    opacity: 0;
+    transform: scale(0.98);
+    transition: opacity 140ms ease, transform 180ms ease;
+    pointer-events: none;
+  }
+  .main.drop-hot::after {
+    opacity: 0.85;
+    transform: scale(1);
+  }
+  .toast {
+    position: absolute;
+    left: 50%;
+    bottom: 64px;
+    transform: translateX(-50%);
+    max-width: 80%;
+    padding: 7px 12px;
+    border-radius: 10px;
+    background: rgba(0, 0, 0, 0.72);
+    color: #fff;
+    font-size: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    animation: toast-in 260ms cubic-bezier(0.2, 0.9, 0.3, 1.2);
+    pointer-events: none;
+  }
+  @keyframes toast-in {
+    from {
+      opacity: 0;
+      transform: translate(-50%, 8px) scale(0.96);
+    }
+  }
+</style>

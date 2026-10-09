@@ -257,6 +257,10 @@ impl Node {
             let node = self.clone();
             let id = info.id.clone();
             self.rt.spawn(async move {
+                if node.me().id > id {
+                    // we are not the dialer: introduce ourselves so the peer can dial us
+                    node.introduce(&id).await;
+                }
                 node.ensure_link(&id).await;
                 // give a dial a moment, then flush anything queued (HTTP fallback if no link)
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -362,6 +366,7 @@ impl Node {
             let node = self.clone();
             let id = info.id.clone();
             tokio::spawn(async move {
+                node.introduce(&id).await;
                 node.ensure_link(&id).await;
                 node.flush_peer(&id).await;
             });
@@ -510,6 +515,16 @@ impl Node {
             }
             Ok(None) => self.set_status(&m.id, "sent"),
             Err(e) => log::debug!("deliver {} via http failed: {e}", m.id),
+        }
+    }
+
+    /// Sends our Hello over HTTP so a peer that cannot discover us learns our address/port.
+    pub(crate) async fn introduce(&self, peer_id: &str) {
+        if self.links.lock().unwrap().contains_key(peer_id) {
+            return;
+        }
+        if let Err(e) = self.post_msg(peer_id, &WsMsg::Hello { device: self.me() }).await {
+            log::debug!("introduce to {peer_id} failed: {e}");
         }
     }
 

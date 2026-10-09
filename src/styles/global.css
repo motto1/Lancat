@@ -1,0 +1,185 @@
+/* Lancat — macOS-like visual language. Only transform/opacity are ever animated. */
+:root {
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro", "Segoe UI Variable Text", "Segoe UI Variable",
+    "Segoe UI", "PingFang SC", "HarmonyOS Sans SC", "MiSans", "Noto Sans CJK SC", "Microsoft YaHei UI", "Inter",
+    "Cantarell", "Ubuntu", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", monospace;
+
+  --accent: #0a84ff;
+  --accent-contrast: #fff;
+  --radius: 14px;
+  --radius-sm: 9px;
+
+  /* light */
+  --glass: rgba(246, 246, 248, 0.86);
+  --glass-strong: rgba(252, 252, 253, 0.94);
+  --glass-border: rgba(0, 0, 0, 0.1);
+  --glass-highlight: rgba(255, 255, 255, 0.75);
+  --sidebar: rgba(0, 0, 0, 0.035);
+  --text: #1d1d1f;
+  --text-2: rgba(60, 60, 67, 0.72);
+  --text-3: rgba(60, 60, 67, 0.45);
+  --sep: rgba(0, 0, 0, 0.08);
+  --bubble-in: rgba(0, 0, 0, 0.06);
+  --bubble-out: var(--accent);
+  --hover: rgba(0, 0, 0, 0.05);
+  --field: rgba(255, 255, 255, 0.7);
+  --shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.12), 0 12px 40px rgba(0, 0, 0, 0.22), 0 2px 8px rgba(0, 0, 0, 0.08);
+  --online: #30d158;
+  --danger: #ff3b30;
+  color-scheme: light dark;
+}
+
+@supports (color: AccentColor) {
+  :root.system-accent {
+    --accent: AccentColor;
+    --accent-contrast: AccentColorText;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --glass: rgba(36, 36, 40, 0.82);
+    --glass-strong: rgba(44, 44, 48, 0.94);
+    --glass-border: rgba(255, 255, 255, 0.12);
+    --glass-highlight: rgba(255, 255, 255, 0.14);
+    --sidebar: rgba(255, 255, 255, 0.04);
+    --text: #f5f5f7;
+    --text-2: rgba(235, 235, 245, 0.68);
+    --text-3: rgba(235, 235, 245, 0.38);
+    --sep: rgba(255, 255, 255, 0.09);
+    --bubble-in: rgba(255, 255, 255, 0.1);
+    --hover: rgba(255, 255, 255, 0.07);
+    --field: rgba(255, 255, 255, 0.07);
+    --shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.14), 0 14px 44px rgba(0, 0, 0, 0.55);
+  }
+}
+:root[data-theme="dark"] {
+  --glass: rgba(36, 36, 40, 0.82);
+  --glass-strong: rgba(44, 44, 48, 0.94);
+  --glass-border: rgba(255, 255, 255, 0.12);
+  --glass-highlight: rgba(255, 255, 255, 0.14);
+  --sidebar: rgba(255, 255, 255, 0.04);
+  --text: #f5f5f7;
+  --text-2: rgba(235, 235, 245, 0.68);
+  --text-3: rgba(235, 235, 245, 0.38);
+  --sep: rgba(255, 255, 255, 0.09);
+  --bubble-in: rgba(255, 255, 255, 0.1);
+  --hover: rgba(255, 255, 255, 0.07);
+  --field: rgba(255, 255, 255, 0.07);
+  --shadow: 0 0 0 0.5px rgba(255, 255, 255, 0.14), 0 14px 44px rgba(0, 0, 0, 0.55);
+  color-scheme: dark;
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+/* With a native material (Win11 Acrylic/Mica, macOS NSVisualEffectView) the CSS tint is lighter. */
+:root.native-glass {
+  --glass: rgba(246, 246, 248, 0.42);
+}
+@media (prefers-color-scheme: dark) {
+  :root.native-glass:not([data-theme="light"]) {
+    --glass: rgba(30, 30, 34, 0.38);
+  }
+}
+:root.native-glass[data-theme="dark"] {
+  --glass: rgba(30, 30, 34, 0.38);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: transparent;
+  font-family: var(--font);
+  font-size: 13px;
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+
+#app {
+  height: 100%;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  border: none;
+  background: none;
+  padding: 0;
+  cursor: default;
+}
+
+input,
+textarea {
+  font: inherit;
+  color: inherit;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.selectable {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+
+/* Glass surface: tint + hairline border + top highlight (CSS "refraction" sheen). */
+.glass {
+  background: var(--glass);
+  -webkit-backdrop-filter: blur(30px) saturate(180%);
+  backdrop-filter: blur(30px) saturate(180%);
+  border: 0.5px solid var(--glass-border);
+  box-shadow: var(--shadow), inset 0 1px 0 var(--glass-highlight);
+}
+
+.icon-btn {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  display: inline-grid;
+  place-items: center;
+  color: var(--text-2);
+  transition: background-color 120ms ease, transform 120ms ease;
+}
+.icon-btn:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.icon-btn:active {
+  transform: scale(0.92);
+}
+.icon-btn.on {
+  color: var(--accent);
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 4px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+:hover::-webkit-scrollbar-thumb {
+  background-color: var(--text-3);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 1ms !important;
+    transition-duration: 1ms !important;
+  }
+}
