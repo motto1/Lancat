@@ -122,6 +122,7 @@ export const api = {
   hidePanel: () => invoke<void>("cmd_hide_panel"),
   setPinned: (pinned: boolean) => invoke<void>("set_pinned", { pinned }),
   panelState: () => invoke<{ visible: boolean; pinned: boolean; edge: string }>("panel_state"),
+  panelShown: () => invoke<void>("panel_shown"),
   setHold: (hold: boolean) => invoke<void>("set_hold", { hold }),
   openSettings: () => invoke<void>("cmd_open_settings"),
   monitors: () => invoke<MonitorInfo[]>("list_monitors"),

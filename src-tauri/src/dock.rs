@@ -34,6 +34,8 @@ pub struct DockState {
     geo: Mutex<Option<Geo>>,
     hover_since: Mutex<Option<Instant>>,
     last_inside: Mutex<Option<bool>>,
+    /// When the current open was requested (for the "panel shown after N ms" log line).
+    open_requested: Mutex<Option<Instant>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -190,6 +192,7 @@ pub fn open_panel(app: &AppHandle, reason: &str) {
     let st = app.state::<DockState>();
     let Some(panel) = app.get_webview_window("panel") else { return };
     if !st.visible.swap(true, Ordering::SeqCst) {
+        *st.open_requested.lock().unwrap() = Some(Instant::now());
         if let Some(geo) = compute(app) {
             *st.geo.lock().unwrap() = Some(geo);
             place(&panel, geo.panel, &geo);
@@ -339,6 +342,15 @@ pub fn panel_state(app: AppHandle) -> PanelState {
         visible: st.visible.load(Ordering::SeqCst),
         pinned: st.pinned.load(Ordering::SeqCst),
         edge: app.state::<Core>().0.settings().dock_edge,
+    }
+}
+
+/// The panel calls this when its open animation starts; logs the open latency.
+/// scripts/memprobe.sh greps for "panel shown".
+#[tauri::command]
+pub fn panel_shown(app: AppHandle) {
+    if let Some(t) = app.state::<DockState>().open_requested.lock().unwrap().take() {
+        log::info!("panel shown {} ms after open request", t.elapsed().as_millis());
     }
 }
 

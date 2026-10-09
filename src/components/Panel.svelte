@@ -38,6 +38,7 @@
     phase = "opening";
     anim = springTo(shell, { ...edgeOffset(edge, 36), scale: 0.94, opacity: 0 }, { x: 0, y: 0, scale: 1, opacity: 1 }, { stiffness: 300, damping: 24 });
     uiLog(`panel show (${from}), visibility=${document.visibilityState}`);
+    requestAnimationFrame(() => api.panelShown().catch(() => {}));
     anim.finished.then(() => (uiLog("panel open animation done"), phase === "opening" && (phase = "open"))).catch(() => {});
     app.markReadIfVisible();
     if (from === "drag") ui.dragging = true;

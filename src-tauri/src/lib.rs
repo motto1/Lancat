@@ -47,14 +47,45 @@ fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     r.map_err(|e| e.to_string())
 }
 
+/// Measurement hooks (scripts/memprobe.sh): SIGRTMIN+6 opens the panel, SIGRTMIN+7 collapses it.
+/// Works with or without the single-instance lock (LANCAT_DATA_DIR disables it).
+/// Not SIGUSR1/SIGUSR2: JavaScriptCore uses SIGUSR2 to suspend threads for GC (JSC_SIGNAL_FOR_GC)
+/// and replacing that handler crashes the process.
+#[cfg(unix)]
+fn spawn_signal_control(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let rtmin = 34; // glibc SIGRTMIN (32 and 33 are reserved by NPTL)
+        let (Ok(mut open), Ok(mut close)) = (signal(SignalKind::from_raw(rtmin + 6)), signal(SignalKind::from_raw(rtmin + 7))) else {
+            return;
+        };
+        loop {
+            let opening = tokio::select! {
+                _ = open.recv() => true,
+                _ = close.recv() => false,
+            };
+            let a = app.clone();
+            let _ = app.run_on_main_thread(move || if opening { dock::open_panel(&a, "probe") } else { dock::request_collapse(&a) });
+        }
+    });
+}
+
 pub fn run() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,tao=warn,wry=warn")).try_init();
     let mut builder = tauri::Builder::default();
     // One instance per user. A second launch just opens the panel of the running one.
     // (Skipped when LANCAT_DATA_DIR is set, so two dev instances can run side by side.)
     if std::env::var_os("LANCAT_DATA_DIR").is_none() {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            dock::open_panel(app, "tray");
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // `lancat --hide-panel` collapses the running instance's panel (memprobe.ps1 uses it);
+            // any other second launch opens it.
+            if args.iter().any(|a| a == "--hide-panel") {
+                dock::request_collapse(app);
+            } else if args.iter().any(|a| a == "--open-panel") {
+                dock::open_panel(app, "probe");
+            } else {
+                dock::open_panel(app, "tray");
+            }
         }));
     }
     builder
@@ -91,6 +122,7 @@ pub fn run() {
             dock::set_pinned,
             dock::set_hold,
             dock::panel_state,
+            dock::panel_shown,
             dock::cmd_open_settings,
             dock::list_monitors,
             autostart_enabled,
@@ -139,6 +171,8 @@ pub fn run() {
                 });
             }
             platform::first_run(app.handle());
+            #[cfg(unix)]
+            spawn_signal_control(app.handle().clone());
             Ok(())
         })
         .run(tauri::generate_context!())
