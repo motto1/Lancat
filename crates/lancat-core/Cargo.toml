@@ -4,5 +4,35 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+description = "Lancat core: LAN discovery (mDNS + UDP), transport (axum HTTP/WebSocket), SQLite store"
 
 [dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "fs", "io-util", "io-std", "signal"] }
+axum = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = "0.30"
+futures-util = { version = "0.3", features = ["sink"] }
+reqwest = { version = "0.13", default-features = false }
+mdns-sd = "0.21"
+socket2 = { version = "0.6", features = ["all"] }
+if-addrs = "0.15"
+rusqlite = { version = "0.40", features = ["bundled"] }
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+dirs = "7"
+hostname = "0.4"
+anyhow = "1"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["humantime"], optional = true }
+
+[features]
+default = ["cli"]
+cli = ["dep:env_logger"]
+
+[[bin]]
+name = "lancat-cli"
+required-features = ["cli"]
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,676 @@
+//! `Node`: the running Lancat core. Owns the store, peer table, links and transfers.
+
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, bail, Context, Result};
+use tokio::sync::{broadcast, mpsc, watch};
+
+use crate::events::{CoreEvent, PeerView};
+use crate::files::IncomingTransfer;
+use crate::netutil;
+use crate::protocol::*;
+use crate::store::{FileBody, Message, Settings, Store};
+
+/// Startup configuration (not user settings; those live in the store).
+#[derive(Debug, Clone)]
+pub struct NodeConfig {
+    pub data_dir: PathBuf,
+    /// TCP port for HTTP/WebSocket. 0 = pick a free port (tests).
+    pub port: u16,
+    /// UDP heartbeat port.
+    pub udp_port: u16,
+    pub enable_mdns: bool,
+    pub enable_udp: bool,
+    /// Overrides the display name (e.g. LANCAT_NAME for a second local instance).
+    pub name_override: Option<String>,
+    /// Overrides the receive directory (LANCAT_RECV_DIR).
+    pub recv_dir_override: Option<PathBuf>,
+}
+
+impl NodeConfig {
+    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            data_dir: data_dir.into(),
+            port: DEFAULT_PORT,
+            udp_port: DEFAULT_PORT,
+            enable_mdns: true,
+            enable_udp: true,
+            name_override: None,
+            recv_dir_override: None,
+        }
+    }
+
+    /// Applies LANCAT_* environment overrides, so two instances can run on one machine:
+    /// `LANCAT_PORT=47821 LANCAT_DATA_DIR=/tmp/lc2 LANCAT_NAME=second lancat`
+    pub fn with_env(mut self) -> Self {
+        let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        if let Some(d) = env("LANCAT_DATA_DIR") {
+            self.data_dir = d.into();
+        }
+        if let Some(p) = env("LANCAT_PORT").and_then(|p| p.parse().ok()) {
+            self.port = p;
+        }
+        if let Some(p) = env("LANCAT_UDP_PORT").and_then(|p| p.parse().ok()) {
+            self.udp_port = p;
+        }
+        if env("LANCAT_NO_MDNS").is_some() {
+            self.enable_mdns = false;
+        }
+        if env("LANCAT_NO_UDP").is_some() {
+            self.enable_udp = false;
+        }
+        if let Some(n) = env("LANCAT_NAME") {
+            self.name_override = Some(n);
+        }
+        if let Some(r) = env("LANCAT_RECV_DIR") {
+            self.recv_dir_override = Some(r.into());
+        }
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PeerState {
+    pub info: DeviceInfo,
+    pub addr: IpAddr,
+    pub last_seen: Instant,
+    pub online: bool,
+}
+
+pub(crate) struct Link {
+    pub tx: mpsc::UnboundedSender<String>,
+    pub conn_id: u64,
+}
+
+pub struct Node {
+    pub cfg: NodeConfig,
+    pub store: Store,
+    me: RwLock<DeviceInfo>,
+    events: broadcast::Sender<CoreEvent>,
+    pub(crate) peers: RwLock<HashMap<String, PeerState>>,
+    pub(crate) links: Mutex<HashMap<String, Link>>,
+    pub(crate) dialing: Mutex<HashSet<String>>,
+    pub(crate) incoming: Mutex<HashMap<String, Arc<IncomingTransfer>>>,
+    pub(crate) active_out: Mutex<HashSet<String>>,
+    pub(crate) http: reqwest::Client,
+    pub(crate) conn_seq: AtomicU64,
+    pub(crate) mdns: Mutex<Option<crate::discovery::Mdns>>,
+    shutdown_tx: watch::Sender<bool>,
+    pub(crate) rt: tokio::runtime::Handle,
+}
+
+impl Node {
+    /// Starts the node: opens the store, binds TCP, starts discovery and housekeeping.
+    pub async fn start(cfg: NodeConfig) -> Result<Arc<Node>> {
+        std::fs::create_dir_all(&cfg.data_dir).with_context(|| format!("create {}", cfg.data_dir.display()))?;
+        let store = Store::open(&cfg.data_dir.join("lancat.db"))?;
+        store.mark_interrupted().ok();
+
+        let id = match store.kv_get("device_id")? {
+            Some(id) => id,
+            None => {
+                let id = uuid::Uuid::new_v4().to_string();
+                store.kv_set("device_id", &id)?;
+                id
+            }
+        };
+        let settings = store.settings();
+        let name = cfg
+            .name_override
+            .clone()
+            .or_else(|| Some(settings.device_name.clone()).filter(|n| !n.is_empty()))
+            .unwrap_or_else(netutil::host_name);
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, cfg.port)))
+            .await
+            .with_context(|| format!("bind TCP port {}", cfg.port))?;
+        let port = listener.local_addr()?.port();
+
+        let me = DeviceInfo { id, name, os: netutil::os_name().into(), ver: env!("CARGO_PKG_VERSION").into(), port };
+        let (events, _) = broadcast::channel(1024);
+        let (shutdown_tx, _) = watch::channel(false);
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(4))
+            .pool_idle_timeout(Duration::from_secs(30))
+            .build()?;
+
+        let node = Arc::new(Node {
+            cfg,
+            store,
+            me: RwLock::new(me),
+            events,
+            peers: RwLock::new(HashMap::new()),
+            links: Mutex::new(HashMap::new()),
+            dialing: Mutex::new(HashSet::new()),
+            incoming: Mutex::new(HashMap::new()),
+            active_out: Mutex::new(HashSet::new()),
+            http,
+            conn_seq: AtomicU64::new(1),
+            mdns: Mutex::new(None),
+            shutdown_tx,
+            rt: tokio::runtime::Handle::current(),
+        });
+
+        crate::server::spawn(node.clone(), listener);
+        crate::discovery::start(node.clone());
+        node.clone().spawn_housekeeping();
+        log::info!("lancat node {} ({}) listening on :{}", node.me().id, node.me().name, port);
+        Ok(node)
+    }
+
+    pub fn me(&self) -> DeviceInfo {
+        self.me.read().unwrap().clone()
+    }
+
+    pub fn port(&self) -> u16 {
+        self.me.read().unwrap().port
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<CoreEvent> {
+        self.events.subscribe()
+    }
+
+    pub(crate) fn emit(&self, ev: CoreEvent) {
+        let _ = self.events.send(ev);
+    }
+
+    pub(crate) fn shutdown_rx(&self) -> watch::Receiver<bool> {
+        self.shutdown_tx.subscribe()
+    }
+
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+        crate::discovery::stop(self);
+        self.links.lock().unwrap().clear();
+    }
+
+    // ------------------------------------------------------------------ settings
+    pub fn settings(&self) -> Settings {
+        self.store.settings()
+    }
+
+    pub fn set_settings(&self, s: Settings) -> Result<Settings> {
+        let old = self.store.settings();
+        self.store.save_settings(&s)?;
+        if s.device_name != old.device_name && self.cfg.name_override.is_none() {
+            let name = if s.device_name.trim().is_empty() { netutil::host_name() } else { s.device_name.trim().to_string() };
+            self.me.write().unwrap().name = name;
+            crate::discovery::reannounce(self);
+            // let connected peers know
+            let hello = WsMsg::Hello { device: self.me() };
+            let txt = serde_json::to_string(&hello).unwrap_or_default();
+            for l in self.links.lock().unwrap().values() {
+                let _ = l.tx.send(txt.clone());
+            }
+        }
+        self.emit(CoreEvent::Settings { settings: s.clone() });
+        Ok(s)
+    }
+
+    pub fn receive_dir(&self) -> PathBuf {
+        if let Some(d) = &self.cfg.recv_dir_override {
+            return d.clone();
+        }
+        let s = self.store.settings();
+        if !s.receive_dir.trim().is_empty() {
+            return PathBuf::from(s.receive_dir.trim());
+        }
+        dirs::download_dir().unwrap_or_else(|| self.cfg.data_dir.join("Downloads"))
+    }
+
+    // ------------------------------------------------------------------ peers
+    /// Called whenever we hear from a peer (mDNS, UDP, WS, HTTP).
+    pub(crate) fn peer_seen(self: &Arc<Self>, info: DeviceInfo, addr: IpAddr) {
+        if info.id == self.me().id || info.id.is_empty() {
+            return;
+        }
+        let (changed, came_online) = {
+            let mut peers = self.peers.write().unwrap();
+            match peers.get_mut(&info.id) {
+                Some(p) => {
+                    let changed = p.info != info || p.addr != addr || !p.online;
+                    let came_online = !p.online;
+                    p.info = info.clone();
+                    p.addr = addr;
+                    p.last_seen = Instant::now();
+                    p.online = true;
+                    (changed, came_online)
+                }
+                None => {
+                    peers.insert(info.id.clone(), PeerState { info: info.clone(), addr, last_seen: Instant::now(), online: true });
+                    (true, true)
+                }
+            }
+        };
+        if changed {
+            let _ = self.store.upsert_device(&info, &addr.to_string(), now_ms());
+            self.emit_peer(&info.id);
+        }
+        if came_online {
+            log::info!("peer online: {} ({}) at {}:{}", info.name, info.id, addr, info.port);
+            let node = self.clone();
+            let id = info.id.clone();
+            self.rt.spawn(async move {
+                node.ensure_link(&id).await;
+                // give a dial a moment, then flush anything queued (HTTP fallback if no link)
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                node.flush_peer(&id).await;
+            });
+        }
+    }
+
+    /// Refreshes liveness without other changes (pings, chunk traffic).
+    pub(crate) fn touch_peer(&self, id: &str) {
+        if let Some(p) = self.peers.write().unwrap().get_mut(id) {
+            p.last_seen = Instant::now();
+        }
+    }
+
+    pub(crate) fn peer_addr(&self, id: &str) -> Option<(IpAddr, u16)> {
+        if let Some(p) = self.peers.read().unwrap().get(id) {
+            return Some((p.addr, p.info.port));
+        }
+        let d = self.store.device(id)?;
+        Some((d.last_addr.parse().ok()?, d.port))
+    }
+
+    pub fn is_online(&self, id: &str) -> bool {
+        self.peers.read().unwrap().get(id).map(|p| p.online).unwrap_or(false)
+    }
+
+    pub fn peer_view(&self, id: &str) -> Option<PeerView> {
+        let row = self.store.device(id)?;
+        let peers = self.peers.read().unwrap();
+        let rt = peers.get(id);
+        Some(PeerView {
+            id: row.id.clone(),
+            name: rt.map(|p| p.info.name.clone()).unwrap_or(row.name),
+            os: row.os,
+            ver: row.ver,
+            online: rt.map(|p| p.online).unwrap_or(false),
+            addr: rt.map(|p| p.addr.to_string()).unwrap_or(row.last_addr),
+            port: rt.map(|p| p.info.port).unwrap_or(row.port),
+            blocked: row.blocked,
+            unread: row.unread,
+            last_ts: row.last_ts,
+            last_preview: row.last_preview,
+        })
+    }
+
+    pub fn peers(&self) -> Vec<PeerView> {
+        let rows = self.store.devices().unwrap_or_default();
+        let peers = self.peers.read().unwrap();
+        let mut v: Vec<PeerView> = rows
+            .into_iter()
+            .map(|row| {
+                let rt = peers.get(&row.id);
+                PeerView {
+                    id: row.id.clone(),
+                    name: rt.map(|p| p.info.name.clone()).unwrap_or(row.name),
+                    os: row.os,
+                    ver: row.ver,
+                    online: rt.map(|p| p.online).unwrap_or(false),
+                    addr: rt.map(|p| p.addr.to_string()).unwrap_or(row.last_addr),
+                    port: rt.map(|p| p.info.port).unwrap_or(row.port),
+                    blocked: row.blocked,
+                    unread: row.unread,
+                    last_ts: row.last_ts,
+                    last_preview: row.last_preview,
+                }
+            })
+            .collect();
+        // online first, then most recent conversation
+        v.sort_by(|a, b| b.online.cmp(&a.online).then(b.last_ts.cmp(&a.last_ts)).then(a.name.cmp(&b.name)));
+        v
+    }
+
+    pub(crate) fn emit_peer(&self, id: &str) {
+        if let Some(p) = self.peer_view(id) {
+            self.emit(CoreEvent::Peer { peer: p });
+        }
+    }
+
+    /// Manually add a peer by "ip:port" (or "ip", default port) — for networks that block multicast/broadcast.
+    pub async fn add_peer_addr(self: &Arc<Self>, addr: &str) -> Result<PeerView> {
+        let sa: SocketAddr = match addr.parse() {
+            Ok(sa) => sa,
+            Err(_) => SocketAddr::new(addr.parse::<IpAddr>().map_err(|_| anyhow!("无效地址: {addr}"))?, DEFAULT_PORT),
+        };
+        if !netutil::is_private(&sa.ip()) {
+            bail!("只允许局域网地址");
+        }
+        let resp = self
+            .http
+            .get(format!("http://{}/info", fmt_sa(&sa)))
+            .header(HEADER_DEVICE_ID, self.me().id)
+            .timeout(Duration::from_secs(4))
+            .send()
+            .await?
+            .error_for_status()?;
+        let info: DeviceInfo = json_body(resp).await?;
+        if info.id == self.me().id {
+            bail!("这是本机");
+        }
+        self.peer_seen(info.clone(), sa.ip());
+        {
+            let node = self.clone();
+            let id = info.id.clone();
+            tokio::spawn(async move {
+                node.ensure_link(&id).await;
+                node.flush_peer(&id).await;
+            });
+        }
+        self.peer_view(&info.id).ok_or_else(|| anyhow!("peer vanished"))
+    }
+
+    pub fn set_blocked(&self, id: &str, blocked: bool) -> Result<()> {
+        self.store.set_blocked(id, blocked)?;
+        if blocked {
+            self.links.lock().unwrap().remove(id);
+        }
+        self.emit_peer(id);
+        Ok(())
+    }
+
+    pub fn forget_peer(&self, id: &str) -> Result<()> {
+        self.store.forget_device(id)?;
+        self.peers.write().unwrap().remove(id);
+        self.links.lock().unwrap().remove(id);
+        self.emit(CoreEvent::PeerRemoved { peer_id: id.into() });
+        Ok(())
+    }
+
+    pub(crate) fn is_blocked_addr(&self, ip: &IpAddr) -> bool {
+        let s = ip.to_string();
+        let st = self.store.settings();
+        st.blocked_ips.iter().any(|b| b.trim() == s) || self.store.blocked_addrs().iter().any(|b| *b == s)
+    }
+
+    // ------------------------------------------------------------------ housekeeping
+    fn spawn_housekeeping(self: Arc<Self>) {
+        let mut stop = self.shutdown_rx();
+        let node = self;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            let mut n: u64 = 0;
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = stop.changed() => break,
+                }
+                n += 1;
+                // offline detection
+                let mut gone = vec![];
+                let mut need_link = vec![];
+                {
+                    let mut peers = node.peers.write().unwrap();
+                    let links = node.links.lock().unwrap();
+                    for (id, p) in peers.iter_mut() {
+                        if p.online && p.last_seen.elapsed() > Duration::from_secs(OFFLINE_SECS) {
+                            p.online = false;
+                            gone.push(id.clone());
+                        } else if p.online && !links.contains_key(id) {
+                            need_link.push(id.clone());
+                        }
+                    }
+                }
+                for id in gone {
+                    log::info!("peer offline: {id}");
+                    node.links.lock().unwrap().remove(&id);
+                    node.emit_peer(&id);
+                }
+                // reconnect every 3s
+                if n % 3 == 0 {
+                    for id in need_link {
+                        let node = node.clone();
+                        tokio::spawn(async move { node.ensure_link(&id).await });
+                    }
+                }
+                // probe manual peers every heartbeat
+                if n % HEARTBEAT_SECS == 0 {
+                    for a in node.store.settings().manual_peers {
+                        let node = node.clone();
+                        tokio::spawn(async move {
+                            let _ = node.add_peer_addr(&a).await;
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------ messaging
+    fn new_outgoing(&self, peer_id: &str, kind: &str, body: serde_json::Value) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            peer_id: peer_id.into(),
+            outgoing: true,
+            kind: kind.into(),
+            body,
+            status: "pending".into(),
+            ts: now_ms(),
+        }
+    }
+
+    pub async fn send_text(self: &Arc<Self>, peer_id: &str, text: &str) -> Result<Message> {
+        if text.is_empty() {
+            bail!("空消息");
+        }
+        let m = self.new_outgoing(peer_id, "text", serde_json::json!({ "text": text }));
+        self.store.insert_message(&m, false)?;
+        self.emit(CoreEvent::Message { message: m.clone() });
+        self.deliver(&m).await;
+        Ok(self.store.message(&m.id)?.unwrap_or(m))
+    }
+
+    pub async fn send_emoji(self: &Arc<Self>, peer_id: &str, emoji: EmojiPayload) -> Result<Message> {
+        let m = self.new_outgoing(peer_id, "emoji", serde_json::to_value(&emoji)?);
+        self.store.insert_message(&m, false)?;
+        self.emit(CoreEvent::Message { message: m.clone() });
+        self.deliver(&m).await;
+        Ok(self.store.message(&m.id)?.unwrap_or(m))
+    }
+
+    pub fn send_typing(&self, peer_id: &str, typing: bool) {
+        let msg = serde_json::to_string(&WsMsg::Typing { typing }).unwrap_or_default();
+        if let Some(l) = self.links.lock().unwrap().get(peer_id) {
+            let _ = l.tx.send(msg);
+        }
+    }
+
+    fn to_wire(m: &Message) -> Option<WsMsg> {
+        match m.kind.as_str() {
+            "text" => Some(WsMsg::Text { id: m.id.clone(), text: m.body.get("text")?.as_str()?.to_string(), ts: m.ts }),
+            "emoji" => Some(WsMsg::Emoji { id: m.id.clone(), emoji: serde_json::from_value(m.body.clone()).ok()?, ts: m.ts }),
+            _ => None,
+        }
+    }
+
+    /// Delivers a text/emoji message: over the WebSocket link when present, else HTTP POST /msg.
+    pub(crate) async fn deliver(self: &Arc<Self>, m: &Message) {
+        let Some(wire) = Self::to_wire(m) else { return };
+        if self.send_over_link(&m.peer_id, &wire) {
+            if m.status == "pending" {
+                self.set_status(&m.id, "sent");
+            }
+            return;
+        }
+        if !self.is_online(&m.peer_id) {
+            return; // stays pending; flushed when the peer comes back
+        }
+        match self.post_msg(&m.peer_id, &wire).await {
+            Ok(Some(reply)) => {
+                self.handle_wire(&m.peer_id, reply, None).await;
+            }
+            Ok(None) => self.set_status(&m.id, "sent"),
+            Err(e) => log::debug!("deliver {} via http failed: {e}", m.id),
+        }
+    }
+
+    pub(crate) fn send_over_link(&self, peer_id: &str, wire: &WsMsg) -> bool {
+        let links = self.links.lock().unwrap();
+        match links.get(peer_id) {
+            Some(l) => l.tx.send(serde_json::to_string(wire).unwrap_or_default()).is_ok(),
+            None => false,
+        }
+    }
+
+    async fn post_msg(&self, peer_id: &str, wire: &WsMsg) -> Result<Option<WsMsg>> {
+        let (ip, port) = self.peer_addr(peer_id).ok_or_else(|| anyhow!("unknown peer"))?;
+        let resp = self
+            .http
+            .post(format!("http://{}/msg", fmt_sa(&SocketAddr::new(ip, port))))
+            .header(HEADER_DEVICE_ID, self.me().id)
+            .header("content-type", "application/json")
+            .body(serde_json::to_vec(wire)?)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?
+            .error_for_status()?;
+        let bytes = resp.bytes().await?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        Ok(serde_json::from_slice(&bytes).ok())
+    }
+
+    pub(crate) fn set_status(&self, id: &str, status: &str) {
+        if let Ok(Some(m)) = self.store.update_message(id, status, None) {
+            self.emit(CoreEvent::MessageUpdate { message: m });
+        }
+    }
+
+    /// Resend queued messages and resume interrupted outgoing transfers.
+    pub(crate) async fn flush_peer(self: &Arc<Self>, peer_id: &str) {
+        if !self.is_online(peer_id) {
+            return;
+        }
+        for m in self.store.unacked_outgoing(peer_id).unwrap_or_default() {
+            self.deliver(&m).await;
+        }
+        for m in self.store.unfinished_files(peer_id).unwrap_or_default() {
+            let node = self.clone();
+            tokio::spawn(async move { node.run_transfer(m.id).await });
+        }
+    }
+
+    /// Handles one protocol message from a peer. Returns an optional reply.
+    pub(crate) async fn handle_wire(self: &Arc<Self>, peer_id: &str, msg: WsMsg, remote: Option<IpAddr>) -> Option<WsMsg> {
+        if self.store.is_blocked(peer_id) {
+            return None;
+        }
+        self.touch_peer(peer_id);
+        match msg {
+            WsMsg::Hello { device } => {
+                if let Some(ip) = remote.or_else(|| self.peer_addr(peer_id).map(|a| a.0)) {
+                    if device.id == peer_id {
+                        self.peer_seen(device, ip);
+                    }
+                }
+                None
+            }
+            WsMsg::Text { id, text, ts } => {
+                self.store_incoming(peer_id, &id, "text", serde_json::json!({ "text": text }), "received", ts);
+                Some(WsMsg::Ack { id })
+            }
+            WsMsg::Emoji { id, emoji, ts } => {
+                // custom stickers are capped at 1 MiB of Lottie JSON
+                if emoji.data.as_ref().map(|d| d.len() > 1 << 20).unwrap_or(false) {
+                    return Some(WsMsg::Ack { id });
+                }
+                let body = serde_json::to_value(&emoji).unwrap_or_default();
+                self.store_incoming(peer_id, &id, "emoji", body, "received", ts);
+                Some(WsMsg::Ack { id })
+            }
+            WsMsg::FileOffer { id, transfer_id, name, size, ts } => {
+                let body = FileBody { name, size, transfer_id, ..Default::default() };
+                self.store_incoming(peer_id, &id, "file", serde_json::to_value(body).unwrap_or_default(), "receiving", ts);
+                None
+            }
+            WsMsg::Typing { typing } => {
+                self.emit(CoreEvent::Typing { peer_id: peer_id.into(), typing });
+                None
+            }
+            WsMsg::Ack { id } => {
+                if let Ok(Some(m)) = self.store.message(&id) {
+                    if m.outgoing && m.peer_id == peer_id && m.status != "delivered" && m.kind != "file" {
+                        self.set_status(&id, "delivered");
+                    }
+                }
+                None
+            }
+            WsMsg::Ping => Some(WsMsg::Pong),
+            WsMsg::Pong => None,
+        }
+    }
+
+    pub(crate) fn store_incoming(&self, peer_id: &str, id: &str, kind: &str, body: serde_json::Value, status: &str, ts: i64) {
+        let m = Message {
+            id: id.into(),
+            peer_id: peer_id.into(),
+            outgoing: false,
+            kind: kind.into(),
+            body,
+            status: status.into(),
+            // keep the sender's clock only when it is sane, else ours
+            ts: if (ts - now_ms()).abs() < 86_400_000 { ts } else { now_ms() },
+        };
+        if self.store.device(peer_id).is_none() {
+            // message from a peer we never saw via discovery: record a stub
+            let info = DeviceInfo { id: peer_id.into(), name: "Unknown".into(), os: String::new(), ver: String::new(), port: DEFAULT_PORT };
+            let _ = self.store.upsert_device(&info, "", now_ms());
+        }
+        if let Ok(true) = self.store.insert_message(&m, true) {
+            self.emit(CoreEvent::Message { message: m });
+            self.emit_peer(peer_id);
+        }
+    }
+
+    // ------------------------------------------------------------------ history
+    pub fn messages(&self, peer_id: &str, before_ts: Option<i64>, limit: usize) -> Result<Vec<Message>> {
+        self.store.messages(peer_id, before_ts, limit)
+    }
+
+    pub fn mark_read(&self, peer_id: &str) -> Result<()> {
+        self.store.mark_read(peer_id)?;
+        self.emit_peer(peer_id);
+        Ok(())
+    }
+
+    pub fn clear_history(&self, peer_id: Option<&str>) -> Result<()> {
+        self.store.clear_history(peer_id)?;
+        self.emit(CoreEvent::HistoryCleared { peer_id: peer_id.map(String::from) });
+        Ok(())
+    }
+
+    pub fn delete_message(&self, id: &str) -> Result<()> {
+        self.store.delete_message(id)
+    }
+
+    pub fn is_transferring(&self) -> bool {
+        !self.active_out.lock().unwrap().is_empty() || !self.incoming.lock().unwrap().is_empty()
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.cfg.data_dir
+    }
+}
+
+pub(crate) fn fmt_sa(sa: &SocketAddr) -> String {
+    match sa {
+        SocketAddr::V4(v4) => v4.to_string(),
+        SocketAddr::V6(v6) => format!("[{}]:{}", v6.ip(), v6.port()),
+    }
+}
+
+/// reqwest without the `json` feature: small helper.
+pub(crate) async fn json_body<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> Result<T> {
+    let b = resp.bytes().await?;
+    Ok(serde_json::from_slice(&b)?)
+}

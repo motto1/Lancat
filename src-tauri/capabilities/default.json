@@ -3,5 +3,15 @@
   "identifier": "default",
   "description": "Lancat windows",
   "windows": ["dock", "panel", "settings"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-focus",
+    "core:window:allow-start-dragging",
+    "core:window:allow-close",
+    "core:webview:default",
+    "dialog:default",
+    "opener:default"
+  ]
 }
