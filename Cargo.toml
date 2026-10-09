@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/lancat-core", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Motto"]
+license = "MIT"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 8
+strip = true
+panic = "abort"
+
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+debug = false

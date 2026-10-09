@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Lancat windows",
+  "windows": ["dock", "panel", "settings"],
+  "permissions": ["core:default"]
+}
