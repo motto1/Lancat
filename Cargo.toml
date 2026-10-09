@@ -9,11 +9,17 @@ authors = ["Motto"]
 license = "MIT"
 
 [profile.release]
-opt-level = "s"
-lto = "thin"
-codegen-units = 8
+# size first (installer < 15 MB, binary <= 8 MB, see docs/postmortem-memory.md): "z" + fat LTO +
+# one codegen unit; the hot paths that need speed get opt-level 3 below.
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
 strip = true
 panic = "abort"
+
+# file hashing must keep up with gigabit transfers
+[profile.release.package.blake3]
+opt-level = 3
 
 [profile.dev]
 debug = 1
