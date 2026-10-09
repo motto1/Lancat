@@ -8,6 +8,7 @@
   import { app } from "../lib/state.svelte";
   import { edgeOffset, exitTo, springTo } from "../lib/spring";
   import { ui } from "../lib/ui.svelte";
+  import { setLottieActive } from "../lib/lottie";
   import Sidebar from "./Sidebar.svelte";
   import Conversation from "./Conversation.svelte";
   import Composer from "./Composer.svelte";
@@ -28,6 +29,7 @@
   function show(from: string) {
     clearTimeout(collapseTimer);
     app.visible = true;
+    setLottieActive(true);
     if (phase === "open" || phase === "opening") return;
     anim?.cancel();
     phase = "opening";
@@ -51,6 +53,7 @@
     if (phase !== "closing") return;
     phase = "hidden";
     app.visible = false;
+    setLottieActive(false); // nothing animates while hidden
     ui.emojiOpen = false;
     await api.hidePanel();
   }

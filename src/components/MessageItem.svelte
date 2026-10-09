@@ -2,12 +2,18 @@
   import { api, formatSize, type Message } from "../lib/api";
   import { app } from "../lib/state.svelte";
   import { soloEmoji } from "../lib/emoji";
+  import { emojiByChar } from "../lib/lottie";
   import Icon from "./Icon.svelte";
   import Sticker from "./Sticker.svelte";
 
   let { m, first }: { m: Message; first: boolean } = $props();
 
-  let solo = $derived(m.kind === "text" ? soloEmoji(m.body?.text ?? "") : null);
+  let solo = $derived.by(() => {
+    if (m.kind !== "text") return null;
+    const s = soloEmoji(m.body?.text ?? "");
+    if (!s) return null;
+    return { char: s.char, code: emojiByChar(s.char)?.code ?? s.code };
+  });
   let prog = $derived(app.progress[m.id]);
   let pct = $derived(prog && prog.total > 0 ? prog.done / prog.total : m.status === "done" ? 1 : 0);
 
