@@ -1,52 +1,70 @@
 <script lang="ts">
-  // Animated sticker. mode "chat": plays (2 loops) when scrolled into view, replays on hover.
-  // mode "grid": shows the first frame, plays while hovered. Never animates off-screen.
+  // Animated sticker (ThorVG canvas). mode "chat": plays (2 loops) when scrolled into view,
+  // replays on hover. mode "grid": shows the first frame, plays while hovered.
+  // Never animates off-screen; at most MAX_PLAYING stickers animate at once (lib/lottie.ts).
   import { onMount } from "svelte";
-  import type { AnimationItem } from "lottie-web";
   import type { EmojiPayload } from "../lib/api";
-  import { createPlayer, lottieData } from "../lib/lottie";
+  import { createPlayer, destroyPlayer, lottieData, play, stop, type Player } from "../lib/lottie";
 
   let { emoji, size = 160, mode = "chat" }: { emoji: EmojiPayload; size?: number; mode?: "chat" | "grid" } = $props();
 
   let host: HTMLDivElement;
+  let canvas: HTMLCanvasElement;
   let failed = $state(false);
   let ready = $state(false);
-  let anim: AnimationItem | null = null;
+  let anim: Player | null = null;
   let visible = false;
   let hovering = false;
   let loops = 0;
+  let destroyed = false;
+  let loading = false;
 
   function sync() {
-    if (!anim) return;
+    if (!anim || !ready) return;
     if (!visible) {
-      anim.pause();
+      stop(anim);
       return;
     }
     if (mode === "grid") {
-      if (hovering) anim.play();
-      else anim.goToAndStop(0, true);
-    } else if (hovering || loops < 2) anim.play();
+      if (hovering) play(anim);
+      else stop(anim, true);
+    } else if (hovering || loops < 2) play(anim);
   }
 
   async function ensure() {
-    if (anim || failed) return;
+    if (anim || failed || loading) return;
     const p = lottieData(emoji);
     if (!p) {
       failed = true;
       return;
     }
+    loading = true;
     try {
       const data = await p;
-      if (!host) return;
-      anim = createPlayer(host, data, true);
-      anim.addEventListener("loopComplete", () => {
-        loops++;
-        if (mode === "chat" && loops >= 2 && !hovering) anim?.goToAndStop(0, true);
+      if (!canvas || destroyed) return;
+      const a = await createPlayer(canvas, data, true);
+      if (destroyed) {
+        destroyPlayer(a);
+        return;
+      }
+      anim = a;
+      a.addEventListener("load", () => {
+        ready = true;
+        sync();
       });
-      anim.addEventListener("DOMLoaded", () => (ready = true));
-      sync();
+      a.addEventListener("loadError", () => (failed = true));
+      if (a.isLoaded) {
+        ready = true;
+        sync();
+      }
+      a.addEventListener("loop", () => {
+        loops++;
+        if (mode === "chat" && loops >= 2 && !hovering && anim) stop(anim, true);
+      });
     } catch {
       failed = true;
+    } finally {
+      loading = false;
     }
   }
 
@@ -61,8 +79,9 @@
     );
     io.observe(host);
     return () => {
+      destroyed = true;
       io.disconnect();
-      anim?.destroy();
+      if (anim) destroyPlayer(anim);
       anim = null;
     };
   });
@@ -72,6 +91,7 @@
 <div
   class="sticker"
   class:ready
+  bind:this={host}
   style:width="{size}px"
   style:height="{size}px"
   onmouseenter={() => {
@@ -84,7 +104,7 @@
     sync();
   }}
 >
-  <div class="host" bind:this={host}></div>
+  <canvas class="host" bind:this={canvas} width={size} height={size} style:width="{size}px" style:height="{size}px"></canvas>
   {#if failed || !ready}
     <div class="fallback" style:font-size="{Math.round(size * 0.68)}px">{emoji.alt || "🙂"}</div>
   {/if}
