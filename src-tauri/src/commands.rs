@@ -35,6 +35,12 @@ pub fn list_peers(core: State<'_, Core>) -> Vec<PeerView> {
     core.0.peers()
 }
 
+/// Manual refresh: one discovery probe burst on every interface (LAN + virtual LANs).
+#[tauri::command]
+pub fn refresh_peers(core: State<'_, Core>) {
+    core.0.refresh_peers()
+}
+
 #[tauri::command]
 pub fn get_messages(core: State<'_, Core>, peer_id: String, before_ts: Option<i64>, limit: Option<usize>) -> R<Vec<Message>> {
     core.0.messages(&peer_id, before_ts, limit.unwrap_or(80)).map_err(e)

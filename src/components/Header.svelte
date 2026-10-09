@@ -26,6 +26,15 @@
     return p.online ? `在线 · ${osGlyph(p.os)} · ${p.addr}` : "离线";
   });
 
+  // a probe burst lasts ~3 s (0 s / 1 s / 3 s); spin the icon meanwhile
+  let refreshing = $state(false);
+  function refresh() {
+    if (refreshing) return;
+    refreshing = true;
+    api.refreshPeers().catch(() => {});
+    setTimeout(() => (refreshing = false), 3200);
+  }
+
   function togglePin() {
     ui.pinned = !ui.pinned;
     api.setPinned(ui.pinned);
@@ -37,6 +46,9 @@
     <div class="title">{title}</div>
     <div class="sub" class:typing={subtitle === "正在输入…"}>{subtitle}</div>
   </div>
+  <button class="icon-btn" class:spin={refreshing} title="刷新设备（重新探测局域网和虚拟局域网）" onclick={refresh}>
+    <Icon name="retry" size={15} />
+  </button>
   <button class="icon-btn" class:on={ui.pinned} title={ui.pinned ? "取消钉住" : "钉住（不自动收起）"} onclick={togglePin}>
     <Icon name="pin" size={15} />
   </button>
@@ -76,5 +88,16 @@
   }
   .sub.typing {
     color: var(--accent);
+  }
+  .icon-btn.spin {
+    color: var(--accent);
+  }
+  .icon-btn.spin :global(svg) {
+    animation: spin 1s linear infinite;
+  }
+  @keyframes spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 </style>

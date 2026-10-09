@@ -112,6 +112,7 @@ export function uiLog(msg: string, level: "debug" | "warn" = "debug") {
 export const api = {
   me: () => invoke<DeviceInfo>("get_me"),
   peers: () => invoke<Peer[]>("list_peers"),
+  refreshPeers: () => invoke<void>("refresh_peers"),
   messages: (peerId: string, beforeTs?: number, limit = 80) =>
     invoke<Message[]>("get_messages", { peerId, beforeTs: beforeTs ?? null, limit }),
   sendText: (peerIds: string[], text: string) => invoke<Message[]>("send_text", { peerIds, text }),

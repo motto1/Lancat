@@ -130,6 +130,7 @@ pub fn run() {
             commands::ui_log,
             commands::get_me,
             commands::list_peers,
+            commands::refresh_peers,
             commands::get_messages,
             commands::send_text,
             commands::send_emoji,
@@ -216,11 +217,16 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building Lancat")
-        .run(|_app, event| {
+        .run(|app, event| match event {
             // The dock strip is not a tauri window, so destroying the idle panel can leave zero
             // tauri windows; that must not quit the app. Explicit exits (tray → quit) carry a code.
-            if let tauri::RunEvent::ExitRequested { api, code: None, .. } = event {
-                api.prevent_exit();
+            tauri::RunEvent::ExitRequested { api, code: None, .. } => api.prevent_exit(),
+            // any real exit says goodbye so peers mark us offline at once (idempotent)
+            tauri::RunEvent::Exit => {
+                if let Some(core) = app.try_state::<Core>() {
+                    core.0.shutdown();
+                }
             }
+            _ => {}
         });
 }

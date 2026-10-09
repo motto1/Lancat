@@ -22,6 +22,7 @@ pub struct TrayState {
 pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "打开 Lancat", true, None::<&str>)?;
     let pin = CheckMenuItem::with_id(app, "pin", "钉住面板（不自动收起）", true, false, None::<&str>)?;
+    let refresh = MenuItem::with_id(app, "refresh", "刷新设备", true, None::<&str>)?;
     let recv = MenuItem::with_id(app, "recv", "打开接收文件夹", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "设置…", true, None::<&str>)?;
     let enabled = app.autolaunch().is_enabled().unwrap_or(false);
@@ -33,6 +34,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
             &open,
             &pin,
             &PredefinedMenuItem::separator(app)?,
+            &refresh,
             &recv,
             &settings,
             &autostart,
@@ -55,6 +57,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
                     dock::open_panel(app, "tray");
                 }
             }
+            "refresh" => app.state::<Core>().0.refresh_peers(),
             "recv" => {
                 let dir = app.state::<Core>().0.receive_dir();
                 let _ = std::fs::create_dir_all(&dir);
