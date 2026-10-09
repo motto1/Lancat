@@ -64,3 +64,11 @@ pub fn first_run(app: &tauri::AppHandle) {
 }
 
 pub fn init_app(_app: &mut tauri::App) {}
+
+pub fn use_layer_shell() -> bool {
+    false
+}
+
+pub fn place_layer(_win: &WebviewWindow, _x: f64, _y: f64, _w: f64, _h: f64) -> bool {
+    false
+}

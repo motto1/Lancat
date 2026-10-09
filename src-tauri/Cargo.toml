@@ -32,6 +32,12 @@ tauri-plugin-single-instance = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
+# Native Wayland docking (wlr-layer-shell: niri, Sway, Hyprland, KDE …). Needs libgtk-layer-shell.
+gtk-layer-shell = { version = "0.8", optional = true, features = ["v0_6"] }
+
+[features]
+default = []
+layer-shell = ["dep:gtk-layer-shell"]
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 window-vibrancy = "0.6"

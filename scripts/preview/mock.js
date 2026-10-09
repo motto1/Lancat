@@ -41,6 +41,7 @@
     list_stickers: () => [],
     list_monitors: () => [{ index: 0, name: "eDP-1", width: 2560, height: 1600, primary: true }],
     autostart_enabled: () => true,
+    panel_state: () => ({ visible: false, pinned: false, edge: settings.dock_edge }),
     "plugin:event|listen": (a) => {
       (listeners[a.event] ||= []).push(a.handler);
       return a.handler;

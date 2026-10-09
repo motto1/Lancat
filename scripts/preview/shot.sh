@@ -18,7 +18,7 @@ PORT=47999
 sleep 0.6
 CHROME=$(command -v google-chrome-stable || command -v chromium || command -v google-chrome)
 timeout 40 "$CHROME" --headless=new --disable-gpu --no-first-run --user-data-dir="$PWD/$PREV/chrome-profile" \
-  --hide-scrollbars --force-device-scale-factor=2 --window-size="$W,$H" --virtual-time-budget=2500 \
+  --hide-scrollbars --force-device-scale-factor=2 --window-size="$W,$H" --virtual-time-budget=${VT:-2500} \
   --screenshot="$PWD/$OUT" "http://127.0.0.1:$PORT/index.html?$Q" >/dev/null 2>&1 || true
 pkill -f "http.server $PORT" || true
 ls -la "$OUT"

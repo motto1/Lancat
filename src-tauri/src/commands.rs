@@ -15,6 +15,16 @@ fn e<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
 }
 
+/// Frontend diagnostics end up in the app log (RUST_LOG=debug to see them).
+#[tauri::command]
+pub fn ui_log(level: String, msg: String) {
+    if level == "warn" {
+        log::warn!("[ui] {msg}");
+    } else {
+        log::debug!("[ui] {msg}");
+    }
+}
+
 #[tauri::command]
 pub fn get_me(core: State<'_, Core>) -> DeviceInfo {
     core.0.me()

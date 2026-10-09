@@ -28,9 +28,9 @@ impl Node {
         if !self.dialing.lock().unwrap().insert(peer_id.to_string()) {
             return;
         }
-        let res = self.clone().dial(peer_id.to_string()).await;
-        self.dialing.lock().unwrap().remove(peer_id);
-        if let Err(e) = res {
+        // on success the entry is cleared by run_link once the handshake finished
+        if let Err(e) = self.clone().dial(peer_id.to_string()).await {
+            self.dialing.lock().unwrap().remove(peer_id);
             log::debug!("dial {peer_id} failed: {e}");
         }
     }
@@ -108,6 +108,16 @@ impl Node {
         out_tx: mpsc::UnboundedSender<String>,
         dialer: bool,
     ) {
+        // whatever happens below, a dial attempt to `expected` is over when this returns or registers
+        struct DialGuard<'a>(&'a Node, Option<String>);
+        impl Drop for DialGuard<'_> {
+            fn drop(&mut self) {
+                if let Some(id) = self.1.take() {
+                    self.0.dialing.lock().unwrap().remove(&id);
+                }
+            }
+        }
+        let guard = DialGuard(&self, if dialer { expected.clone() } else { None });
         let hello = serde_json::to_string(&WsMsg::Hello { device: self.me() }).unwrap_or_default();
         if dialer && out_tx.send(hello.clone()).is_err() {
             return;
@@ -129,6 +139,7 @@ impl Node {
         self.peer_seen(device, ip);
         let conn_id = self.conn_seq.fetch_add(1, Ordering::Relaxed);
         self.links.lock().unwrap().insert(peer_id.clone(), Link { tx: out_tx.clone(), conn_id });
+        drop(guard); // dial finished: allow future reconnects
         log::info!("link up with {peer_id} ({})", if dialer { "dialed" } else { "accepted" });
         {
             let node = self.clone();

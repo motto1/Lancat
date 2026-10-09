@@ -161,6 +161,11 @@ export function applyTheme(theme: string) {
   const root = document.documentElement;
   if (theme === "light" || theme === "dark") root.dataset.theme = theme;
   else delete root.dataset.theme;
+  // Some engines do not re-resolve inherited `color: var(--text)` after a root attribute flip;
+  // re-assigning it on <body> forces the cascade to pick up the new palette.
+  document.body.style.color = "";
+  void document.body.offsetHeight;
+  document.body.style.color = "var(--text)";
 }
 
 export const app = new AppState();

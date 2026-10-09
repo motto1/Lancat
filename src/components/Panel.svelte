@@ -4,7 +4,7 @@
   import { onMount } from "svelte";
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
-  import { api } from "../lib/api";
+  import { api, uiLog } from "../lib/api";
   import { app } from "../lib/state.svelte";
   import { edgeOffset, exitTo, springTo } from "../lib/spring";
   import { ui } from "../lib/ui.svelte";
@@ -20,6 +20,8 @@
   let anim: Animation | null = null;
   let phase: "hidden" | "opening" | "open" | "closing" = "hidden";
   let pointerInside = true;
+  /** Opened from the tray/shortcut: only auto-collapse after the pointer has visited the panel. */
+  let entered = true;
   let collapseTimer: ReturnType<typeof setTimeout> | undefined;
 
   function blocked(): boolean {
@@ -28,18 +30,21 @@
 
   function show(from: string) {
     clearTimeout(collapseTimer);
+    if (phase === "hidden" || phase === "closing") entered = from === "hover" || from === "drag";
     app.visible = true;
     setLottieActive(true);
     if (phase === "open" || phase === "opening") return;
     anim?.cancel();
     phase = "opening";
     anim = springTo(shell, { ...edgeOffset(edge, 36), scale: 0.94, opacity: 0 }, { x: 0, y: 0, scale: 1, opacity: 1 }, { stiffness: 300, damping: 24 });
-    anim.finished.then(() => phase === "opening" && (phase = "open")).catch(() => {});
+    uiLog(`panel show (${from}), visibility=${document.visibilityState}`);
+    anim.finished.then(() => (uiLog("panel open animation done"), phase === "opening" && (phase = "open"))).catch(() => {});
     app.markReadIfVisible();
     if (from === "drag") ui.dragging = true;
   }
 
   async function collapse(force = false) {
+    uiLog(`collapse(force=${force}) phase=${phase} blocked=${blocked()}`);
     if (phase === "hidden" || phase === "closing") return;
     if (!force && blocked()) return;
     phase = "closing";
@@ -73,6 +78,8 @@
   }
 
   function pointer(inside: boolean) {
+    if (inside) entered = true;
+    if (!inside && !entered) return;
     if (inside === pointerInside) return;
     pointerInside = inside;
     if (inside) clearTimeout(collapseTimer);
@@ -98,6 +105,17 @@
       un.push(await listen<{ inside: boolean }>("panel://cursor", (e) => pointer(e.payload.inside)));
       un.push(await listen("panel://collapse", () => collapse(true)));
       un.push(await listen<boolean>("panel://pinned", (e) => (ui.pinned = e.payload)));
+      // the window may already be on screen (show fired before this webview listened)
+      api
+        .panelState()
+        .then((st) => {
+          ui.pinned = st.pinned;
+          if (st.visible && phase === "hidden") {
+            edge = st.edge;
+            show("tray");
+          }
+        })
+        .catch(() => {});
       un.push(
         await getCurrentWebview().onDragDropEvent((ev) => {
           const p = ev.payload;

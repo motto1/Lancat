@@ -54,6 +54,9 @@ impl Rect {
 struct Geo {
     dock: Rect,
     panel: Rect,
+    /// monitor origin + scale, for layer-shell (logical, output-relative) placement
+    origin: (f64, f64),
+    scale: f64,
 }
 
 #[derive(Serialize, Clone)]
@@ -120,10 +123,14 @@ fn compute(app: &AppHandle) -> Option<Geo> {
             (d, Rect { x: mx + mw - t - gap - pw + MARGIN * sc, y: py, w: pw, h: ph })
         }
     };
-    Some(Geo { dock, panel })
+    Some(Geo { dock, panel, origin: (mx, my), scale: sc })
 }
 
-fn place(w: &WebviewWindow, r: Rect) {
+fn place(w: &WebviewWindow, r: Rect, geo: &Geo) {
+    let (ox, oy) = geo.origin;
+    if platform::place_layer(w, (r.x - ox) / geo.scale, (r.y - oy) / geo.scale, r.w / geo.scale, r.h / geo.scale) {
+        return;
+    }
     let _ = w.set_size(PhysicalSize::new(r.w.round() as u32, r.h.round() as u32));
     let _ = w.set_position(PhysicalPosition::new(r.x.round() as i32, r.y.round() as i32));
 }
@@ -171,20 +178,21 @@ pub fn apply_layout(app: &AppHandle) {
     let Some(geo) = compute(app) else { return };
     *app.state::<DockState>().geo.lock().unwrap() = Some(geo);
     if let Some(d) = app.get_webview_window("dock") {
-        place(&d, geo.dock);
+        place(&d, geo.dock, &geo);
     }
     if let Some(p) = app.get_webview_window("panel") {
-        place(&p, geo.panel);
+        place(&p, geo.panel, &geo);
     }
 }
 
 pub fn open_panel(app: &AppHandle, reason: &str) {
+    log::debug!("open_panel({reason})");
     let st = app.state::<DockState>();
     let Some(panel) = app.get_webview_window("panel") else { return };
     if !st.visible.swap(true, Ordering::SeqCst) {
         if let Some(geo) = compute(app) {
             *st.geo.lock().unwrap() = Some(geo);
-            place(&panel, geo.panel);
+            place(&panel, geo.panel, &geo);
         }
         let _ = panel.show();
         *st.last_inside.lock().unwrap() = Some(true);
@@ -198,6 +206,7 @@ pub fn open_panel(app: &AppHandle, reason: &str) {
 }
 
 pub fn hide_panel(app: &AppHandle) {
+    log::debug!("hide_panel");
     let st = app.state::<DockState>();
     if let Some(panel) = app.get_webview_window("panel") {
         let _ = panel.hide();
@@ -313,6 +322,24 @@ pub fn set_pinned(app: AppHandle, pinned: bool) {
     app.state::<DockState>().pinned.store(pinned, Ordering::SeqCst);
     let _ = app.emit("panel://pinned", pinned);
     crate::tray::sync(&app);
+}
+
+#[derive(Serialize)]
+pub struct PanelState {
+    visible: bool,
+    pinned: bool,
+    edge: String,
+}
+
+/// Lets a freshly loaded panel webview catch up if `panel://show` fired before it listened.
+#[tauri::command]
+pub fn panel_state(app: AppHandle) -> PanelState {
+    let st = app.state::<DockState>();
+    PanelState {
+        visible: st.visible.load(Ordering::SeqCst),
+        pinned: st.pinned.load(Ordering::SeqCst),
+        edge: app.state::<Core>().0.settings().dock_edge,
+    }
 }
 
 #[tauri::command]

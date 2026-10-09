@@ -89,6 +89,10 @@ export interface MonitorInfo {
   primary: boolean;
 }
 
+export function uiLog(msg: string, level: "debug" | "warn" = "debug") {
+  invoke("ui_log", { level, msg }).catch(() => {});
+}
+
 export const api = {
   me: () => invoke<DeviceInfo>("get_me"),
   peers: () => invoke<Peer[]>("list_peers"),
@@ -117,6 +121,7 @@ export const api = {
   openPanel: (reason: string) => invoke<void>("cmd_open_panel", { reason }),
   hidePanel: () => invoke<void>("cmd_hide_panel"),
   setPinned: (pinned: boolean) => invoke<void>("set_pinned", { pinned }),
+  panelState: () => invoke<{ visible: boolean; pinned: boolean; edge: string }>("panel_state"),
   setHold: (hold: boolean) => invoke<void>("set_hold", { hold }),
   openSettings: () => invoke<void>("cmd_open_settings"),
   monitors: () => invoke<MonitorInfo[]>("list_monitors"),

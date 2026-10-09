@@ -35,3 +35,11 @@ pub fn init_app(app: &mut tauri::App) {
     // menu-bar style app: no Dock icon, no app switcher entry
     app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 }
+
+pub fn use_layer_shell() -> bool {
+    false
+}
+
+pub fn place_layer(_win: &WebviewWindow, _x: f64, _y: f64, _w: f64, _h: f64) -> bool {
+    false
+}
