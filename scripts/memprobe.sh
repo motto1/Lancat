@@ -6,15 +6,21 @@
 # /proc/<pid>/smaps_rollup in three states:
 #
 #   idle    panel collapsed, after --settle seconds
-#   open    panel expanded (SIGRTMIN+6), after --open-wait seconds
+#   open    panel expanded like a real hover (SIGRTMIN+8 pre-warm, 150 ms, SIGRTMIN+6 open,
+#           SIGRTMIN+9 pointer leaves the strip), after --open-wait seconds
 #   closed  collapsed again (SIGRTMIN+7), after --after seconds
 #
 # Per process it records PSS, USS (= Private_Clean + Private_Dirty) and SwapPss.
 # The gates use "priv" = USS + SwapPss so that pages the kernel swapped out still count.
+# "dirty" (Private_Dirty + SwapPss) is reported too: USS also counts clean file pages that only
+# this process maps (its own binary, libwebkit2gtk, GL drivers), which the kernel can drop.
 #
 #   A  idle   : sum(priv) over the tree  <= --max-idle   (MB, default 40)
 #   A' closed : sum(priv) over the tree  <= --max-idle   (same gate, after the panel was used)
 #   B  open   : sum(pss + swappss)       <= --max-open   (MB, default 200)
+#
+# Afterwards it does one more hover-open (cold again if the panel was released) and a warm
+# re-open, and reports every "panel shown N ms after open request (cold|warm)" latency.
 #
 # Output: a table on stderr, JSON on stdout (or --json FILE). Exit 1 when a gate fails,
 # 2 on setup errors.
@@ -93,7 +99,7 @@ trap cleanup EXIT
 
 # shellcheck disable=SC2086
 env LANCAT_DATA_DIR="$T/data" LANCAT_RECV_DIR="$T/recv" LANCAT_PORT=$PORT LANCAT_UDP_PORT=$PORT \
-    LANCAT_NO_MDNS=1 LANCAT_NAME=memprobe RUST_LOG=info $EXTRA_ENV \
+    LANCAT_NO_MDNS=1 LANCAT_NAME=memprobe LANCAT_PROBE=1 RUST_LOG=info $EXTRA_ENV \
     "$BIN" > "$T/app.log" 2>&1 < /dev/null &
 APP_PID=$!
 sleep 2
@@ -140,8 +146,11 @@ for p in tree:
     procs.append({'pid': p, 'name': name, 'threads': threads,
                   'rss_kb': f.get('Rss', 0), 'pss_kb': f.get('Pss', 0), 'uss_kb': uss,
                   'swap_pss_kb': f.get('SwapPss', 0), 'priv_kb': uss + f.get('SwapPss', 0),
+                  # dirty = what cannot simply be dropped and re-read from disk (≈ Windows private
+                  # bytes / macOS footprint): Private_Dirty + swapped-out share
+                  'dirty_kb': f.get('Private_Dirty', 0) + f.get('SwapPss', 0),
                   'anon_kb': f.get('Anonymous', 0)})
-tot = {k: sum(x[k] for x in procs) for k in ('rss_kb', 'pss_kb', 'uss_kb', 'swap_pss_kb', 'priv_kb')}
+tot = {k: sum(x[k] for x in procs) for k in ('rss_kb', 'pss_kb', 'uss_kb', 'swap_pss_kb', 'priv_kb', 'dirty_kb')}
 tot['pss_swap_kb'] = tot['pss_kb'] + tot['swap_pss_kb']
 print(json.dumps({'state': state, 'procs': procs, 'total': tot}))
 PY
@@ -150,7 +159,10 @@ PY
 echo "settling ${SETTLE}s (collapsed)…" >&2
 sleep "$SETTLE"
 S_IDLE=$(sample idle)
-kill -s RTMIN+6 "$APP_PID"
+hover_open() { # like a real hover: pointer enters the strip (pre-warm), hover delay, open, pointer moves on
+  kill -s RTMIN+8 "$APP_PID"; sleep 0.15; kill -s RTMIN+6 "$APP_PID"; sleep 0.3; kill -s RTMIN+9 "$APP_PID"
+}
+hover_open
 sleep "$OPEN_WAIT"
 S_OPEN=$(sample open)
 kill -s RTMIN+7 "$APP_PID"
@@ -158,33 +170,40 @@ echo "collapsed, waiting ${AFTER}s…" >&2
 sleep "$AFTER"
 S_CLOSED=$(sample closed)
 kill -0 "$APP_PID" 2>/dev/null || { echo "app died during the probe:" >&2; tail -30 "$T/app.log" >&2; exit 2; }
+# a second open after the panel was released (cold again) and a warm re-open
+hover_open; sleep 2; kill -s RTMIN+7 "$APP_PID"; sleep 1.5; hover_open; sleep 1
 LAT=$(grep -oE 'panel shown [0-9]+ ms' "$T/app.log" | grep -oE '[0-9]+' | head -1)
+LATS=$(grep -oE 'panel shown [0-9]+ ms after open request \((cold|warm)' "$T/app.log" | sed -E 's/panel shown ([0-9]+) ms after open request \((cold|warm)/\2:\1/' | paste -sd, -)
+grep -E 'panel (webview created|shown)' "$T/app.log" | sed 's/^.*INFO  lancat_lib::dock] /  /' >&2
 SIZE=$(stat -c %s "$BIN")
 
-python3 - "$MAX_IDLE" "$MAX_OPEN" "${LAT:-}" "$SIZE" "$LABEL" "$GATE" "$JSON_OUT" "$S_IDLE" "$S_OPEN" "$S_CLOSED" <<'PY'
+python3 - "$MAX_IDLE" "$MAX_OPEN" "${LAT:-}" "$SIZE" "$LABEL" "$GATE" "$JSON_OUT" "${LATS:-}" "$S_IDLE" "$S_OPEN" "$S_CLOSED" <<'PY'
 import json, sys
-max_idle, max_open, lat, size, label, gate, out = sys.argv[1:8]
-samples = [json.loads(s) for s in sys.argv[8:]]
+max_idle, max_open, lat, size, label, gate, out, lats = sys.argv[1:9]
+samples = [json.loads(s) for s in sys.argv[9:]]
 mb = lambda kb: kb / 1024
 err = sys.stderr
 print(f"\n== Lancat memprobe {label}".rstrip(), file=err)
 for s in samples:
     print(f"\n[{s['state']}]", file=err)
-    print(f"  {'process':<22}{'pid':>8}{'thr':>5}{'PSS':>9}{'USS':>9}{'SwapPss':>9}{'priv':>9}", file=err)
+    print(f"  {'process':<22}{'pid':>8}{'thr':>5}{'PSS':>9}{'USS':>9}{'SwapPss':>9}{'priv':>9}{'dirty':>9}", file=err)
     for p in sorted(s['procs'], key=lambda p: -p['pss_kb']):
-        print(f"  {p['name']:<22}{p['pid']:>8}{p['threads']:>5}{mb(p['pss_kb']):>8.1f}M{mb(p['uss_kb']):>8.1f}M{mb(p['swap_pss_kb']):>8.1f}M{mb(p['priv_kb']):>8.1f}M", file=err)
+        print(f"  {p['name']:<22}{p['pid']:>8}{p['threads']:>5}{mb(p['pss_kb']):>8.1f}M{mb(p['uss_kb']):>8.1f}M{mb(p['swap_pss_kb']):>8.1f}M{mb(p['priv_kb']):>8.1f}M{mb(p['dirty_kb']):>8.1f}M", file=err)
     t = s['total']
-    print(f"  {'TOTAL':<35}{mb(t['pss_kb']):>8.1f}M{mb(t['uss_kb']):>8.1f}M{mb(t['swap_pss_kb']):>8.1f}M{mb(t['priv_kb']):>8.1f}M", file=err)
+    print(f"  {'TOTAL':<35}{mb(t['pss_kb']):>8.1f}M{mb(t['uss_kb']):>8.1f}M{mb(t['swap_pss_kb']):>8.1f}M{mb(t['priv_kb']):>8.1f}M{mb(t['dirty_kb']):>8.1f}M", file=err)
 by = {s['state']: s for s in samples}
 res = {
     'label': label,
     'binary_bytes': int(size),
     'open_latency_ms': int(lat) if lat else None,
+    'open_latencies': lats,  # "cold:620,cold:410,warm:90": first open, re-open after release, warm re-open
     'samples': samples,
     'gates': {
         'A_idle_priv_mb': round(mb(by['idle']['total']['priv_kb']), 1),
         'A_closed_priv_mb': round(mb(by['closed']['total']['priv_kb']), 1),
         'B_open_pss_mb': round(mb(by['open']['total']['pss_swap_kb']), 1),
+        'A_idle_dirty_mb': round(mb(by['idle']['total']['dirty_kb']), 1),
+        'A_closed_dirty_mb': round(mb(by['closed']['total']['dirty_kb']), 1),
         'max_idle_mb': float(max_idle), 'max_open_mb': float(max_open),
     },
 }
@@ -195,7 +214,7 @@ if g['A_closed_priv_mb'] > g['max_idle_mb']: fail.append(f"A closed {g['A_closed
 if g['B_open_pss_mb'] > g['max_open_mb']: fail.append(f"B open {g['B_open_pss_mb']}MB > {max_open}MB")
 res['failures'] = fail
 print(f"\nA idle priv {g['A_idle_priv_mb']}MB | A closed priv {g['A_closed_priv_mb']}MB | B open PSS {g['B_open_pss_mb']}MB"
-      f" | open latency {res['open_latency_ms']} ms | binary {int(size)/1e6:.2f}MB", file=err)
+      f" | open latency {lats or res['open_latency_ms']} ms | binary {int(size)/1e6:.2f}MB", file=err)
 print("GATE: " + ("FAIL — " + "; ".join(fail) if fail else "PASS"), file=err)
 js = json.dumps(res, ensure_ascii=False, indent=1)
 if out:
