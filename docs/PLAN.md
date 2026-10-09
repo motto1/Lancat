@@ -51,12 +51,14 @@
 - WebView 只负责显示；网络、文件读写和状态都在 Rust 里处理
 
 ## 4. 网络协议
-- 端口：TCP 47820 收发数据；UDP 47820 广播兜底；mDNS 用 5353
-- 发现：
-  - mDNS 服务名 `_lancat._tcp.local`，TXT 记录里带 `id/name/os/ver/avatar_hash`
-  - 每 5s 发一次 UDP 广播心跳，应对屏蔽组播的网络
-  - 15s 收不到心跳就判定离线
-  - 多网卡时每张网卡分别广播；自动排除虚拟网卡（VMware、WSL、Docker）
+- 端口：TCP 47820 收发数据；UDP 47820 探测/回复/告别；mDNS 用 5353
+- 发现（事件触发，空闲时不发广播）：
+  - 触发：启动、网络变化（每 5s 比对网卡地址，不发包）、睡眠唤醒、手动刷新；每次在 0s/1s/3s 各发一轮“有人吗”探测后停止
+  - 覆盖本机所有私有 IPv4 网卡，包括 Tailscale、ZeroTier、WireGuard 等虚拟局域网：能广播的发定向广播；/32 或点对点网卡（Tailscale）用 `tailscale status --json` 枚举在线 peer 逐个单播；另外单播已记住设备的上次地址和手动地址
+  - 收到探测：把对方加入列表并单播回复自己的信息，一次交换双方互相发现
+  - mDNS 服务名 `_lancat._tcp.local`，TXT 记录里带 `id/name/os/ver`，只在物理网卡上运行
+  - 在线判定：WebSocket 长连接每 30s ping，连续 2 次无回应判离线；连接被关闭立即复探，3s 无回应判离线；正常退出发 bye，对方立即离线
+  - 零在线设备时每 3 分钟补一轮探测
 - 设备身份：首次启动生成 UUID，持久保存；显示名默认是主机名
 - 消息：每对设备之间保持一条 WebSocket 长连接，消息为 JSON，类型有 `text`、`emoji`、`file_offer`、`typing`、`ack`
 - 文件：

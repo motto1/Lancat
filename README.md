@@ -8,7 +8,7 @@
 
 | 模块 | 已实现 |
 |---|---|
-| 发现 | mDNS `_lancat._tcp.local.`（TXT：`id/name/os/ver`）＋ UDP 47820 每 5s 广播心跳兜底，15s 收不到判离线；跳过 Docker/VMware/WSL/veth 等虚拟网卡；设备 UUID 持久化，名称默认取主机名；可手动添加 `IP[:端口]`（每 5s 探测） |
+| 发现 | 事件触发探测：启动、网络变化、睡眠唤醒、手动刷新时向所有私有 IPv4 网卡（含 Tailscale/ZeroTier/WireGuard 等虚拟局域网）发“有人吗”探测，0/1/3 s 三轮后停止，空闲时不发任何广播；可广播网卡发定向广播，Tailscale 通过 `tailscale status --json` 枚举在线 peer 单播；同时单播已记住设备的上次地址和手动添加的地址。收到探测的一方单播回复，双方一次交换互相发现。物理网卡另有 mDNS `_lancat._tcp.local.`（TXT：`id/name/os/ver`）。在线判定靠 WebSocket 长连接（30 s ping，连续 2 次无回应判离线；连接断开立即复探，3 s 无回应判离线）；正常退出发 bye，对方立即离线；零在线设备时每 3 分钟补探一次。设备 UUID 持久化，名称默认取主机名 |
 | 传输 | TCP 47820 上的 axum：WebSocket 传 `text / emoji / typing / ack / file_offer`（每对设备一条长连接，id 小的一方拨号，断线自动重连，另有 `POST /msg` HTTP 兜底）；文件 `PUT /files/{tid}/{chunk}` 4MB 分块、4 块并发，断点续传（接收端 sidecar 记录已收块，重启后仍可续），每块和整文件 BLAKE3 校验 |
 | 安全 | 只接受私有网段（RFC1918、链路本地、100.64/10、回环、IPv6 ULA/链路本地）；设备黑名单 + IP 黑名单；收到的文件去掉可执行位、永不自动打开或执行；相对路径清洗（防 `..`）；可设单文件大小上限 |
 | 存储 | SQLite（rusqlite bundled）：设备、每设备一个会话（未读数、最后预览）、消息永久保存；离线时发出的消息排队，对方上线自动补发；一键清空 |
@@ -23,9 +23,9 @@
 
 ```
 crates/lancat-core/        纯 Rust 核心（无 GUI 依赖，可无头测试）
-  src/discovery.rs           mDNS + UDP 心跳
+  src/discovery.rs           事件触发 UDP 探测 / 单播回复 / bye + mDNS
   src/server.rs              axum 路由（/info /ws /msg /files /finish）+ 私网/黑名单守卫
-  src/link.rs                每设备 WebSocket 长连接（握手、心跳、重连、分发）
+  src/link.rs                每设备 WebSocket 长连接（握手、30 s ping 保活与离线判定、重连、分发）
   src/transfer.rs            发送端：分块、并发、重试、续传
   src/files.rs               接收端：IncomingTransfer、安全路径、重名、BLAKE3
   src/store.rs               SQLite：devices / conversations / messages / kv(settings)
@@ -128,7 +128,7 @@ LANCAT_DATA_DIR=/tmp/lc2 LANCAT_PORT=47821 LANCAT_NAME=第二台 target/release/
 target/release/lancat-cli serve --port 47822 --name 测试机 --data /tmp/lc3
 target/release/lancat-cli send --to 127.0.0.1:47820 --text 你好 --file ./some.zip
 ```
-其他环境变量：`LANCAT_RECV_DIR`、`LANCAT_UDP_PORT`、`LANCAT_NO_MDNS=1`、`LANCAT_NO_UDP=1`、`LANCAT_OPEN_ON_START=1`（启动即弹出面板，调试/截图用）、`RUST_LOG=debug`。
+其他环境变量：`LANCAT_RECV_DIR`、`LANCAT_UDP_PORT`、`LANCAT_NO_MDNS=1`、`LANCAT_NO_UDP=1`、`LANCAT_PROBE=IP:UDP端口,...`（额外单播探测目标，测试用）、`LANCAT_OPEN_ON_START=1`（启动即弹出面板，调试/截图用）、`RUST_LOG=debug`。
 
 ## 测试
 
