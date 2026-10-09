@@ -151,6 +151,12 @@
         <input type="range" min="200" max="5000" step="50" bind:value={s.collapse_delay_ms} oninput={() => save()} />
         <em>{s.collapse_delay_ms}ms</em>
       </label>
+      <label class="row">
+        <span>收起后释放面板</span>
+        <input type="range" min="0" max="600" step="10" bind:value={s.panel_keep_alive_s} oninput={() => save()} />
+        <em>{s.panel_keep_alive_s === 0 ? "常驻" : `${s.panel_keep_alive_s}s`}</em>
+      </label>
+      <p class="note">面板收起超过这个时间后会销毁网页渲染进程以节省内存（约 100MB），下次弹出时重新创建。设为 0 表示常驻：弹出更快，但内存一直占着。</p>
     </section>
 
     <section>

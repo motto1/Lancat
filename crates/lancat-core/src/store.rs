@@ -78,6 +78,9 @@ pub struct Settings {
     pub manual_peers: Vec<String>,
     pub theme: String,
     pub recent_emoji: Vec<String>,
+    /// Seconds a collapsed chat panel (its WebView) is kept alive before it is destroyed to free
+    /// memory; 0 = keep it resident (instant re-open, ~100 MB more on Linux).
+    pub panel_keep_alive_s: u64,
 }
 
 impl Default for Settings {
@@ -96,6 +99,7 @@ impl Default for Settings {
             manual_peers: vec![],
             theme: "system".into(),
             recent_emoji: vec![],
+            panel_keep_alive_s: 60,
         }
     }
 }

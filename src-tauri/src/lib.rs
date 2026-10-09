@@ -2,6 +2,7 @@
 
 mod commands;
 mod dock;
+mod native_dock;
 mod platform;
 mod tray;
 
@@ -47,7 +48,8 @@ fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     r.map_err(|e| e.to_string())
 }
 
-/// Measurement hooks (scripts/memprobe.sh): SIGRTMIN+6 opens the panel, SIGRTMIN+7 collapses it.
+/// Measurement hooks (scripts/memprobe.sh), real-time signals relative to SIGRTMIN:
+/// +6 open the panel, +7 collapse it, +8 pointer entered the strip (pre-warm), +9 pointer left.
 /// Works with or without the single-instance lock (LANCAT_DATA_DIR disables it).
 /// Not SIGUSR1/SIGUSR2: JavaScriptCore uses SIGUSR2 to suspend threads for GC (JSC_SIGNAL_FOR_GC)
 /// and replacing that handler crashes the process.
@@ -56,30 +58,62 @@ fn spawn_signal_control(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         use tokio::signal::unix::{signal, SignalKind};
         let rtmin = 34; // glibc SIGRTMIN (32 and 33 are reserved by NPTL)
-        let (Ok(mut open), Ok(mut close)) = (signal(SignalKind::from_raw(rtmin + 6)), signal(SignalKind::from_raw(rtmin + 7))) else {
-            return;
+        let mut sigs = vec![];
+        for n in 6..=9 {
+            match signal(SignalKind::from_raw(rtmin + n)) {
+                Ok(s) => sigs.push(s),
+                Err(_) => return,
+            }
+        }
+        let [mut open, mut close, mut enter, mut leave]: [tokio::signal::unix::Signal; 4] = match sigs.try_into() {
+            Ok(a) => a,
+            Err(_) => return,
         };
         loop {
-            let opening = tokio::select! {
-                _ = open.recv() => true,
-                _ = close.recv() => false,
+            let what = tokio::select! {
+                _ = open.recv() => 6,
+                _ = close.recv() => 7,
+                _ = enter.recv() => 8,
+                _ = leave.recv() => 9,
             };
             let a = app.clone();
-            let _ = app.run_on_main_thread(move || if opening { dock::open_panel(&a, "probe") } else { dock::request_collapse(&a) });
+            let _ = app.run_on_main_thread(move || match what {
+                6 => dock::open_panel(&a, "probe"),
+                7 => dock::request_collapse(&a),
+                8 => dock::on_hover_start(&a),
+                _ => dock::on_hover_end(&a),
+            });
         }
     });
 }
 
 pub fn run() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,tao=warn,wry=warn")).try_init();
+    // graphics env defaults must be in place before GTK/EGL/WebKit start (Linux)
+    platform::early_init();
+    // A LAN share tool needs no per-core worker pool: 2 workers (LANCAT_RT_WORKERS overrides).
+    // Tauri would otherwise start one tokio worker per CPU.
+    let workers = std::env::var("LANCAT_RT_WORKERS").ok().and_then(|v| v.parse().ok()).unwrap_or(2usize).max(1);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .max_blocking_threads(8)
+        .thread_name("lancat-rt")
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    tauri::async_runtime::set(rt.handle().clone());
+    // the runtime lives as long as the process
+    std::mem::forget(rt);
     let mut builder = tauri::Builder::default();
     // One instance per user. A second launch just opens the panel of the running one.
     // (Skipped when LANCAT_DATA_DIR is set, so two dev instances can run side by side.)
     if std::env::var_os("LANCAT_DATA_DIR").is_none() {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            // `lancat --hide-panel` collapses the running instance's panel (memprobe.ps1 uses it);
-            // any other second launch opens it.
-            if args.iter().any(|a| a == "--hide-panel") {
+            // `lancat --settings` opens settings, `--hide-panel` collapses the running instance's
+            // panel and `--open-panel` opens it (memprobe.ps1 uses both); any other second launch opens it.
+            if args.iter().any(|a| a == "--settings") {
+                let _ = dock::open_settings(app);
+            } else if args.iter().any(|a| a == "--hide-panel") {
                 dock::request_collapse(app);
             } else if args.iter().any(|a| a == "--open-panel") {
                 dock::open_panel(app, "probe");
@@ -129,7 +163,7 @@ pub fn run() {
             set_autostart,
         ])
         .on_window_event(|window, event| {
-            // the panel/dock are never destroyed; closing settings just closes it
+            // closing the panel only hides it (dock.rs destroys it later); closing settings closes it
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "panel" {
                     api.prevent_close();
@@ -149,6 +183,8 @@ pub fn run() {
                             let _ = handle.emit(EVENT, &ev);
                             if matches!(ev, lancat_core::CoreEvent::Peer { .. } | lancat_core::CoreEvent::HistoryCleared { .. }) {
                                 tray::update_unread(&handle);
+                                let h = handle.clone();
+                                let _ = handle.run_on_main_thread(move || dock::refresh_visual(&h));
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -171,10 +207,20 @@ pub fn run() {
                 });
             }
             platform::first_run(app.handle());
+            if std::env::args().any(|a| a == "--settings") {
+                let _ = dock::open_settings(app.handle());
+            }
             #[cfg(unix)]
             spawn_signal_control(app.handle().clone());
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Lancat");
+        .build(tauri::generate_context!())
+        .expect("error while building Lancat")
+        .run(|_app, event| {
+            // The dock strip is not a tauri window, so destroying the idle panel can leave zero
+            // tauri windows; that must not quit the app. Explicit exits (tray → quit) carry a code.
+            if let tauri::RunEvent::ExitRequested { api, code: None, .. } = event {
+                api.prevent_exit();
+            }
+        });
 }

@@ -29,10 +29,6 @@ fn round_corners(win: &WebviewWindow) {
     }
 }
 
-pub fn setup_dock(win: &WebviewWindow) {
-    round_corners(win);
-}
-
 pub fn setup_panel(win: &WebviewWindow) {
     // Acrylic first (Win11 popover look), Mica as fallback.
     if window_vibrancy::apply_acrylic(win, Some((0, 0, 0, 0))).is_err() {
@@ -65,6 +61,10 @@ pub fn first_run(app: &tauri::AppHandle) {
 
 pub fn init_app(_app: &mut tauri::App) {}
 
+/// TODO-verify: when the panel collapses for a while it is destroyed (dock.rs), which on WebView2
+/// shuts the whole msedgewebview2 process tree down once no WebView2 is left.
+pub fn tune_webview(_win: &WebviewWindow) {}
+
 pub fn use_layer_shell() -> bool {
     false
 }
@@ -72,3 +72,11 @@ pub fn use_layer_shell() -> bool {
 pub fn place_layer(_win: &WebviewWindow, _x: f64, _y: f64, _w: f64, _h: f64) -> bool {
     false
 }
+
+pub fn trim_heap() {}
+
+pub fn early_init() {}
+
+/// WebKit (macOS) / WebView2 (Windows) shut their helper processes down by themselves once the
+/// last web view is gone. TODO-verify with memprobe.ps1 / a macOS probe.
+pub fn reap_web_helpers() {}

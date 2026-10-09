@@ -1,3 +1,4 @@
+performance.mark("main");
 import { mount } from "svelte";
 import App from "./App.svelte";
 

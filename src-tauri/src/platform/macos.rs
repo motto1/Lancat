@@ -16,10 +16,6 @@ extern "C" {
     fn CGEventSourceButtonState(state_id: i32, button: u32) -> bool;
 }
 
-pub fn setup_dock(win: &WebviewWindow) {
-    let _ = apply_vibrancy(win, NSVisualEffectMaterial::HudWindow, Some(NSVisualEffectState::Active), Some(3.0));
-}
-
 pub fn setup_panel(win: &WebviewWindow) {
     let _ = apply_vibrancy(win, NSVisualEffectMaterial::Popover, Some(NSVisualEffectState::Active), Some(14.0));
 }
@@ -30,6 +26,8 @@ pub fn left_button_down() -> bool {
 }
 
 pub fn first_run(_app: &tauri::AppHandle) {}
+
+pub fn tune_webview(_win: &WebviewWindow) {}
 
 pub fn init_app(app: &mut tauri::App) {
     // menu-bar style app: no Dock icon, no app switcher entry
@@ -43,3 +41,11 @@ pub fn use_layer_shell() -> bool {
 pub fn place_layer(_win: &WebviewWindow, _x: f64, _y: f64, _w: f64, _h: f64) -> bool {
     false
 }
+
+pub fn trim_heap() {}
+
+pub fn early_init() {}
+
+/// WebKit (macOS) / WebView2 (Windows) shut their helper processes down by themselves once the
+/// last web view is gone. TODO-verify with memprobe.ps1 / a macOS probe.
+pub fn reap_web_helpers() {}

@@ -93,27 +93,42 @@
   });
 
   onMount(() => {
+    performance.mark("mount");
     const un: Array<() => void> = [];
-    app.init();
+    // A cold panel gets its first-frame state injected by Rust (window.__LANCAT_BOOT__): start the
+    // open animation right away instead of after several IPC round-trips.
+    const boot = window.__LANCAT_BOOT__;
+    app.init(boot).then(() => performance.mark("init"));
+    if (boot?.panel) {
+      ui.pinned = boot.panel.pinned;
+      if (boot.panel.visible) {
+        edge = boot.panel.edge;
+        show(boot.panel.reason || "tray");
+      }
+    }
     (async () => {
-      un.push(
-        await listen<{ edge: string; reason: string }>("panel://show", (e) => {
+      // register all listeners concurrently (each one is an IPC round-trip)
+      const ls = await Promise.all([
+        listen<{ edge: string; reason: string }>("panel://show", (e) => {
           edge = e.payload.edge;
           pointerInside = true;
           show(e.payload.reason);
         }),
-      );
-      un.push(await listen<{ inside: boolean }>("panel://cursor", (e) => pointer(e.payload.inside)));
-      un.push(await listen("panel://collapse", () => collapse(true)));
-      un.push(await listen<boolean>("panel://pinned", (e) => (ui.pinned = e.payload)));
-      // the window may already be on screen (show fired before this webview listened)
+        listen<{ inside: boolean }>("panel://cursor", (e) => pointer(e.payload.inside)),
+        listen("panel://collapse", () => collapse(true)),
+        listen<boolean>("panel://pinned", (e) => (ui.pinned = e.payload)),
+      ]);
+      un.push(...ls);
+      // the window may have been shown before this webview listened (pre-warmed, then opened)
       api
         .panelState()
         .then((st) => {
+          performance.mark("state");
           ui.pinned = st.pinned;
+          // the panel webview is created on demand, so the first show usually happens right here
           if (st.visible && phase === "hidden") {
             edge = st.edge;
-            show("tray");
+            show(st.reason || "tray");
           }
         })
         .catch(() => {});

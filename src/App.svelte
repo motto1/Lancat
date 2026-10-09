@@ -1,7 +1,6 @@
 <script lang="ts">
   import "./styles/global.css";
   import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-  import Dock from "./components/Dock.svelte";
   import Panel from "./components/Panel.svelte";
   import Settings from "./components/Settings.svelte";
 
@@ -9,9 +8,8 @@
   document.documentElement.dataset.window = label;
 </script>
 
-{#if label === "dock"}
-  <Dock />
-{:else if label === "settings"}
+<!-- The dock strip is a native window now (src-tauri/src/native_dock); only panel and settings are web. -->
+{#if label === "settings"}
   <Settings />
 {:else}
   <Panel />

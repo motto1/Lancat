@@ -1,5 +1,5 @@
 // Reactive app state shared by the panel components (Svelte 5 runes).
-import { api, onCore, type CoreEvent, type DeviceInfo, type Message, type Peer, type Settings } from "./api";
+import { api, onCore, type Boot, type CoreEvent, type DeviceInfo, type Message, type Peer, type Settings } from "./api";
 
 function sortPeers(list: Peer[]) {
   list.sort((a, b) => Number(b.online) - Number(a.online) || b.last_ts - a.last_ts || a.name.localeCompare(b.name));
@@ -37,8 +37,14 @@ class AppState {
     return this.current ? [this.current] : [];
   }
 
-  async init() {
-    const [me, peers, settings] = await Promise.all([api.me(), api.peers(), api.settings()]);
+  /** `boot` = state injected by Rust into a freshly created panel (no IPC needed for the first frame). */
+  async init(boot?: Boot) {
+    const [me, peers, settings] = boot ? [boot.me, boot.peers, boot.settings] : await Promise.all([api.me(), api.peers(), api.settings()]);
+    performance.mark("ipc3");
+    if (boot) for (const [id, list] of Object.entries(boot.messages)) {
+      this.messages[id] = list;
+      this.hasMore[id] = list.length >= 80;
+    }
     this.me = me;
     if (me.os === "windows" || me.os === "macos") document.documentElement.classList.add("native-glass");
     sortPeers(peers);
@@ -46,7 +52,26 @@ class AppState {
     this.settings = settings;
     applyTheme(settings.theme);
     if (!this.current && peers.length) await this.open(peers[0].id);
+    performance.mark("msgs");
     await onCore((e) => this.onEvent(e));
+    if (boot) this.resync();
+  }
+
+  /** After a boot from injected state: pick up anything that changed before our listener existed. */
+  private async resync() {
+    try {
+      const peers = await api.peers();
+      sortPeers(peers);
+      this.peers = peers;
+      for (const id of Object.keys(this.messages)) {
+        const list = await api.messages(id);
+        this.messages[id] = list;
+        this.hasMore[id] = list.length >= 80;
+      }
+      this.markReadIfVisible();
+    } catch {
+      /* the next event brings us up to date anyway */
+    }
   }
 
   async open(peerId: string) {

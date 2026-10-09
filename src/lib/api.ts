@@ -64,6 +64,7 @@ export interface Settings {
   manual_peers: string[];
   theme: "system" | "light" | "dark";
   recent_emoji: string[];
+  panel_keep_alive_s: number;
 }
 
 export type CoreEvent =
@@ -75,6 +76,21 @@ export type CoreEvent =
   | { type: "progress"; msg_id: string; peer_id: string; done: number; total: number; outgoing: boolean }
   | { type: "history_cleared"; peer_id: string | null }
   | { type: "settings"; settings: Settings };
+
+/** First-frame state injected into a freshly created panel webview (dock.rs `boot_script`). */
+export interface Boot {
+  me: DeviceInfo;
+  peers: Peer[];
+  settings: Settings;
+  messages: Record<string, Message[]>;
+  panel: { visible: boolean; pinned: boolean; edge: string; reason: string };
+}
+
+declare global {
+  interface Window {
+    __LANCAT_BOOT__?: Boot;
+  }
+}
 
 export interface StickerMeta {
   id: string;
@@ -121,8 +137,15 @@ export const api = {
   openPanel: (reason: string) => invoke<void>("cmd_open_panel", { reason }),
   hidePanel: () => invoke<void>("cmd_hide_panel"),
   setPinned: (pinned: boolean) => invoke<void>("set_pinned", { pinned }),
-  panelState: () => invoke<{ visible: boolean; pinned: boolean; edge: string }>("panel_state"),
-  panelShown: () => invoke<void>("panel_shown"),
+  panelState: () => invoke<{ visible: boolean; pinned: boolean; edge: string; reason: string }>("panel_state"),
+  panelShown: () =>
+    invoke<void>("panel_shown", {
+      pageMs: performance.now(),
+      marks: performance
+        .getEntriesByType("mark")
+        .map((m) => `${m.name}=${Math.round(m.startTime)}`)
+        .join(" "),
+    }),
   setHold: (hold: boolean) => invoke<void>("set_hold", { hold }),
   openSettings: () => invoke<void>("cmd_open_settings"),
   monitors: () => invoke<MonitorInfo[]>("list_monitors"),
