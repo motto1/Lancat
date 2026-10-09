@@ -148,7 +148,7 @@ async fn offline_messages_are_queued_and_flushed() {
     let b_port = b.port();
     b.shutdown();
     drop(b);
-    // wait for A to mark B offline is slow (15 s); instead verify that a send to an
+    // B left with a goodbye, so A already has it offline; verify that a send to an
     // unreachable peer stays pending and is delivered when B comes back on the same port.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let m = a.send_text(&b_id, "queued").await.unwrap();

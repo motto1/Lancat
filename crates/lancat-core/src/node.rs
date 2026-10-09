@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -22,7 +22,7 @@ pub struct NodeConfig {
     pub data_dir: PathBuf,
     /// TCP port for HTTP/WebSocket. 0 = pick a free port (tests).
     pub port: u16,
-    /// UDP heartbeat port.
+    /// UDP discovery port (probes / replies / bye).
     pub udp_port: u16,
     pub enable_mdns: bool,
     pub enable_udp: bool,
@@ -30,6 +30,8 @@ pub struct NodeConfig {
     pub name_override: Option<String>,
     /// Overrides the receive directory (LANCAT_RECV_DIR).
     pub recv_dir_override: Option<PathBuf>,
+    /// Extra unicast probe targets (ip:udp_port), e.g. LANCAT_PROBE=127.0.0.1:47821 for tests.
+    pub extra_probe_targets: Vec<SocketAddr>,
 }
 
 impl NodeConfig {
@@ -42,6 +44,7 @@ impl NodeConfig {
             enable_udp: true,
             name_override: None,
             recv_dir_override: None,
+            extra_probe_targets: vec![],
         }
     }
 
@@ -69,6 +72,9 @@ impl NodeConfig {
         }
         if let Some(r) = env("LANCAT_RECV_DIR") {
             self.recv_dir_override = Some(r.into());
+        }
+        if let Some(p) = env("LANCAT_PROBE") {
+            self.extra_probe_targets.extend(p.split(',').filter_map(|a| a.trim().parse::<SocketAddr>().ok()));
         }
         self
     }
@@ -100,6 +106,10 @@ pub struct Node {
     pub(crate) http: reqwest::Client,
     pub(crate) conn_seq: AtomicU64,
     pub(crate) mdns: Mutex<Option<crate::discovery::Mdns>>,
+    /// Kicks a discovery probe burst (start, network change, wake, manual refresh).
+    pub(crate) probe_kick: tokio::sync::Notify,
+    pub(crate) udp: OnceLock<Arc<tokio::net::UdpSocket>>,
+    stopped: AtomicBool,
     shutdown_tx: watch::Sender<bool>,
     pub(crate) rt: tokio::runtime::Handle,
 }
@@ -153,6 +163,9 @@ impl Node {
             http,
             conn_seq: AtomicU64::new(1),
             mdns: Mutex::new(None),
+            probe_kick: tokio::sync::Notify::new(),
+            udp: OnceLock::new(),
+            stopped: AtomicBool::new(false),
             shutdown_tx,
             rt: tokio::runtime::Handle::current(),
         });
@@ -184,10 +197,42 @@ impl Node {
         self.shutdown_tx.subscribe()
     }
 
+    /// Clean exit: tells peers we are leaving (UDP `bye` + `bye` over each link), then stops.
+    /// Idempotent.
     pub fn shutdown(&self) {
+        if self.stopped.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        crate::discovery::goodbye(self);
+        let bye = serde_json::to_string(&WsMsg::Bye).unwrap_or_default();
+        for l in self.links.lock().unwrap().values() {
+            let _ = l.tx.send(bye.clone());
+        }
         let _ = self.shutdown_tx.send(true);
         crate::discovery::stop(self);
+        // dropping the senders lets each link writer flush the bye and close the socket
         self.links.lock().unwrap().clear();
+    }
+
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// Manual refresh: one probe burst on every interface (UI refresh button / tray item).
+    pub fn refresh_peers(&self) {
+        self.kick_probe("manual refresh");
+    }
+
+    pub(crate) fn kick_probe(&self, reason: &str) {
+        if self.is_stopped() {
+            return;
+        }
+        log::info!("discovery: probe burst ({reason})");
+        self.probe_kick.notify_one();
+    }
+
+    pub fn online_count(&self) -> usize {
+        self.peers.read().unwrap().values().filter(|p| p.online).count()
     }
 
     // ------------------------------------------------------------------ settings
@@ -234,6 +279,13 @@ impl Node {
             let mut peers = self.peers.write().unwrap();
             match peers.get_mut(&info.id) {
                 Some(p) => {
+                    // A peer reachable on both the LAN and an overlay (Tailscale ...) answers on
+                    // both; keep the better path while it is fresh instead of flapping.
+                    // While a link is up its address is proven; a probe that arrived via another
+                    // interface (a second subnet, a VM bridge) must not move the peer.
+                    let linked = self.links.lock().unwrap().contains_key(&info.id);
+                    let fresh = p.online && p.last_seen.elapsed() < Duration::from_secs(120);
+                    let addr = if fresh && (linked || addr_rank(&addr) > addr_rank(&p.addr)) { p.addr } else { addr };
                     let changed = p.info != info || p.addr != addr || !p.online;
                     let came_online = !p.online;
                     p.info = info.clone();
@@ -248,6 +300,7 @@ impl Node {
                 }
             }
         };
+        let addr = self.peers.read().unwrap().get(&info.id).map(|p| p.addr).unwrap_or(addr);
         if changed {
             let _ = self.store.upsert_device(&info, &addr.to_string(), now_ms());
             self.emit_peer(&info.id);
@@ -266,6 +319,76 @@ impl Node {
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 node.flush_peer(&id).await;
             });
+        }
+    }
+
+    pub(crate) fn set_peer_addr(&self, id: &str, ip: IpAddr) {
+        let info = {
+            let mut peers = self.peers.write().unwrap();
+            match peers.get_mut(id) {
+                Some(p) if p.addr != ip => {
+                    p.addr = ip;
+                    Some(p.info.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(info) = info {
+            let _ = self.store.upsert_device(&info, &ip.to_string(), now_ms());
+            self.emit_peer(id);
+        }
+    }
+
+    /// The peer said goodbye (clean exit): offline now, drop the link.
+    pub(crate) fn peer_bye(&self, id: &str, how: &str) {
+        let was = {
+            let mut peers = self.peers.write().unwrap();
+            match peers.get_mut(id) {
+                Some(p) if p.online => {
+                    p.online = false;
+                    true
+                }
+                _ => false,
+            }
+        };
+        self.links.lock().unwrap().remove(id);
+        if was {
+            log::info!("peer offline: {id} ({how})");
+            self.emit_peer(id);
+        }
+    }
+
+    /// A link closed without a goodbye. Ping timeout: the peer has been silent for 60–90 s, it is
+    /// offline. Connection closed: re-probe it and give it a few seconds to answer (or re-link)
+    /// before housekeeping marks it offline.
+    pub(crate) fn link_lost(&self, id: &str, timed_out: bool) {
+        if self.is_stopped() {
+            return;
+        }
+        let addr = {
+            let mut peers = self.peers.write().unwrap();
+            let Some(p) = peers.get_mut(id) else { return };
+            if !p.online {
+                return;
+            }
+            if timed_out {
+                p.online = false;
+                None
+            } else {
+                let keep = Duration::from_secs(LINKLESS_GRACE_SECS - LINK_LOST_GRACE_SECS);
+                p.last_seen = Instant::now().checked_sub(keep).unwrap_or(p.last_seen);
+                Some(p.addr)
+            }
+        };
+        match addr {
+            None => {
+                log::info!("peer offline: {id} (no pong for {} pings)", LINK_MISSED_PINGS);
+                self.emit_peer(id);
+            }
+            Some(ip) => {
+                log::info!("link to {id} closed: re-probing {ip}");
+                crate::discovery::probe_addr(self, ip);
+            }
         }
     }
 
@@ -416,12 +539,20 @@ impl Node {
                 {
                     let mut peers = node.peers.write().unwrap();
                     let links = node.links.lock().unwrap();
+                    // Liveness is the link (ping/pong, close, bye). A peer without a link stays
+                    // online only while it shows other signs of life (probes, HTTP).
                     for (id, p) in peers.iter_mut() {
-                        if p.online && p.last_seen.elapsed() > Duration::from_secs(OFFLINE_SECS) {
+                        if !p.online || links.contains_key(id) {
+                            continue;
+                        }
+                        let quiet = p.last_seen.elapsed();
+                        if quiet > Duration::from_secs(LINKLESS_GRACE_SECS) {
                             p.online = false;
                             gone.push(id.clone());
-                        } else if p.online && !links.contains_key(id) {
-                            need_link.push(id.clone());
+                        } else {
+                            // the designated dialer retries every 3 s; if it cannot reach us
+                            // (firewall on its side of the path), we dial after 6 s instead
+                            need_link.push((id.clone(), quiet > Duration::from_secs(6)));
                         }
                     }
                 }
@@ -430,20 +561,11 @@ impl Node {
                     node.links.lock().unwrap().remove(&id);
                     node.emit_peer(&id);
                 }
-                // reconnect every 3s
+                // reconnect every 3s (local work only; nothing is sent to peers we have not found)
                 if n % 3 == 0 {
-                    for id in need_link {
+                    for (id, force) in need_link {
                         let node = node.clone();
-                        tokio::spawn(async move { node.ensure_link(&id).await });
-                    }
-                }
-                // probe manual peers every heartbeat
-                if n % HEARTBEAT_SECS == 0 {
-                    for a in node.store.settings().manual_peers {
-                        let node = node.clone();
-                        tokio::spawn(async move {
-                            let _ = node.add_peer_addr(&a).await;
-                        });
+                        tokio::spawn(async move { node.dial_link(&id, force).await });
                     }
                 }
             }
@@ -622,6 +744,10 @@ impl Node {
             }
             WsMsg::Ping => Some(WsMsg::Pong),
             WsMsg::Pong => None,
+            WsMsg::Bye => {
+                self.peer_bye(peer_id, "bye");
+                None
+            }
         }
     }
 
@@ -674,6 +800,15 @@ impl Node {
 
     pub fn data_dir(&self) -> &Path {
         &self.cfg.data_dir
+    }
+}
+
+/// Path preference when a peer answers on several addresses: LAN < overlay (CGNAT, Tailscale).
+fn addr_rank(ip: &IpAddr) -> u8 {
+    match ip {
+        IpAddr::V4(v4) if netutil::is_cgnat(v4) => 1,
+        IpAddr::V4(_) => 0,
+        IpAddr::V6(_) => 2,
     }
 }
 

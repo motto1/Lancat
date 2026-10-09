@@ -6,12 +6,23 @@ pub const PROTOCOL_VERSION: &str = "1";
 pub const SERVICE_TYPE: &str = "_lancat._tcp.local.";
 pub const DEFAULT_PORT: u16 = 47820;
 pub const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
-pub const HEARTBEAT_SECS: u64 = 5;
-pub const OFFLINE_SECS: u64 = 15;
+/// A discovery burst: probes go out at these offsets (seconds) after a trigger, then stop.
+pub const PROBE_BURST_SECS: [u64; 3] = [0, 1, 3];
+/// Fallback while no peer is online: one probe round this often.
+pub const IDLE_PROBE_SECS: u64 = 180;
+/// How often the network watcher compares interface addresses / checks for a wake-up.
+pub const NETWATCH_SECS: u64 = 5;
+/// Link keepalive: ping every 30 s; the link is dropped after 2 silent intervals (60–90 s).
+pub const LINK_PING_SECS: u64 = 30;
+pub const LINK_MISSED_PINGS: u32 = 2;
+/// A peer that is online but has no link (and no other traffic) goes offline after this.
+pub const LINKLESS_GRACE_SECS: u64 = 20;
+/// After an unexpected link close the peer is re-probed and marked offline if it does not answer in this time.
+pub const LINK_LOST_GRACE_SECS: u64 = 3;
 pub const HEADER_DEVICE_ID: &str = "x-lancat-id";
 pub const HEADER_CHUNK_HASH: &str = "x-lancat-chunk-hash";
 
-/// What a device says about itself (mDNS TXT, UDP heartbeat, WS hello, GET /info).
+/// What a device says about itself (mDNS TXT, UDP probe/reply, WS hello, GET /info).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceInfo {
     pub id: String,
@@ -21,10 +32,27 @@ pub struct DeviceInfo {
     pub port: u16,
 }
 
-/// UDP broadcast heartbeat payload.
+/// What a UDP discovery datagram means.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BeaconOp {
+    /// "Who's there?" — receivers add the sender and reply by unicast.
+    Probe,
+    /// Unicast answer to a probe.
+    Reply,
+    /// Clean exit: mark the sender offline now.
+    Bye,
+    /// Old (≤ c3ecf32) periodic heartbeat without an `op` field: just "I'm here".
+    #[default]
+    Announce,
+}
+
+/// UDP discovery payload (port 47820). Older peers ignore `op` and treat it as a heartbeat.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Heartbeat {
+pub struct Beacon {
     pub lancat: u8,
+    #[serde(default)]
+    pub op: BeaconOp,
     pub device: DeviceInfo,
 }
 
@@ -57,6 +85,8 @@ pub enum WsMsg {
     Ack { id: String },
     Ping,
     Pong,
+    /// Clean exit: the sender is going away, mark it offline immediately.
+    Bye,
 }
 
 /// POST /files/{transfer_id}
@@ -121,6 +151,20 @@ mod tests {
         assert!(!s.contains("data"));
         assert_eq!(serde_json::from_str::<WsMsg>(&s).unwrap(), e);
         assert_eq!(serde_json::from_str::<WsMsg>(r#"{"type":"ping"}"#).unwrap(), WsMsg::Ping);
+        assert_eq!(serde_json::from_str::<WsMsg>(r#"{"type":"bye"}"#).unwrap(), WsMsg::Bye);
+    }
+
+    #[test]
+    fn beacon_compat() {
+        let d = DeviceInfo { id: "x".into(), name: "n".into(), os: "linux".into(), ver: "0.1.0".into(), port: 47820 };
+        // an old heartbeat (no op) still parses, as a plain announce
+        let old = r#"{"lancat":1,"device":{"id":"x","name":"n","os":"linux","ver":"0.1.0","port":47820}}"#;
+        let b: Beacon = serde_json::from_str(old).unwrap();
+        assert_eq!(b.op, BeaconOp::Announce);
+        assert_eq!(b.device, d);
+        let s = serde_json::to_string(&Beacon { lancat: 1, op: BeaconOp::Probe, device: d }).unwrap();
+        assert!(s.contains(r#""op":"probe""#));
+        assert_eq!(serde_json::from_str::<Beacon>(&s).unwrap().op, BeaconOp::Probe);
     }
 
     #[test]

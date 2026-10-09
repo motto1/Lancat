@@ -74,7 +74,7 @@ pub struct Settings {
     /// 0 = unlimited.
     pub max_file_mb: u64,
     pub blocked_ips: Vec<String>,
-    /// "ip[:port]" peers probed every heartbeat (networks that block multicast/broadcast).
+    /// "ip[:port]" peers probed on every discovery burst (networks that block multicast/broadcast).
     pub manual_peers: Vec<String>,
     pub theme: String,
     pub recent_emoji: Vec<String>,

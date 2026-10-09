@@ -1,9 +1,10 @@
 //! Headless Lancat peer, for testing and scripting.
 //!
 //! ```text
-//! lancat-cli serve [--port 47820] [--data DIR] [--name NAME] [--recv DIR] [--no-mdns] [--no-udp] [--peer IP:PORT]...
+//! lancat-cli serve [--port 47820] [--udp-port 47820] [--data DIR] [--name NAME] [--recv DIR] [--no-mdns] [--no-udp]
+//!                  [--peer IP:PORT]... [--probe IP:UDPPORT]...
 //!     prints core events as JSON lines; stdin commands:
-//!       peers | text <peer> <msg> | emoji <peer> <codepoint> | file <peer> <path> | clear | quit
+//!       peers | refresh | text <peer> <msg> | emoji <peer> <codepoint> | file <peer> <path> | clear | quit
 //!     (<peer> = id prefix or name)
 //! lancat-cli send --to IP:PORT [--text MSG]... [--file PATH]... [--data DIR] [--timeout SECS]
 //!     one-shot: starts an ephemeral peer, sends, waits for delivery/verification, exits 0 on success
@@ -26,6 +27,8 @@ struct Args {
     mdns: bool,
     udp: bool,
     peers: Vec<String>,
+    udp_port: u16,
+    probes: Vec<std::net::SocketAddr>,
     to: Option<String>,
     texts: Vec<String>,
     files: Vec<PathBuf>,
@@ -44,6 +47,8 @@ fn parse() -> Result<Args> {
         mdns: true,
         udp: true,
         peers: vec![],
+        udp_port: lancat_core::protocol::DEFAULT_PORT,
+        probes: vec![],
         to: None,
         texts: vec![],
         files: vec![],
@@ -59,12 +64,14 @@ fn parse() -> Result<Args> {
             "--no-mdns" => a.mdns = false,
             "--no-udp" => a.udp = false,
             "--peer" => a.peers.push(v()?),
+            "--udp-port" => a.udp_port = v()?.parse()?,
+            "--probe" => a.probes.push(v()?.parse()?),
             "--to" => a.to = Some(v()?),
             "--text" => a.texts.push(v()?),
             "--file" => a.files.push(v()?.into()),
             "--timeout" => a.timeout = v()?.parse()?,
             "-h" | "--help" => {
-                println!("{}", include_str!("lancat-cli.rs").lines().take(12).collect::<Vec<_>>().join("\n"));
+                println!("{}", include_str!("lancat-cli.rs").lines().take(13).collect::<Vec<_>>().join("\n"));
                 std::process::exit(0);
             }
             other => bail!("unknown argument {other}"),
@@ -87,7 +94,8 @@ async fn main() -> Result<()> {
 fn config(a: &Args, default_data: PathBuf) -> NodeConfig {
     let mut cfg = NodeConfig::new(a.data.clone().unwrap_or(default_data));
     cfg.port = a.port;
-    cfg.udp_port = lancat_core::protocol::DEFAULT_PORT;
+    cfg.udp_port = a.udp_port;
+    cfg.extra_probe_targets = a.probes.clone();
     cfg.enable_mdns = a.mdns;
     cfg.enable_udp = a.udp;
     cfg.name_override = a.name.clone();
@@ -133,7 +141,10 @@ async fn serve(a: Args) -> Result<()> {
         }
     }
     node.shutdown();
-    Ok(())
+    // let the bye over the links flush, then exit: the blocking stdin reader would otherwise keep
+    // the runtime (and the process) alive
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    std::process::exit(0)
 }
 
 async fn command(node: &Arc<Node>, l: &str) -> Result<()> {
@@ -149,6 +160,7 @@ async fn command(node: &Arc<Node>, l: &str) -> Result<()> {
                 eprintln!("{} {:<20} {:<8} {}:{} unread={}", if p.online { "●" } else { "○" }, p.name, &p.id[..8.min(p.id.len())], p.addr, p.port, p.unread);
             }
         }
+        "refresh" => node.refresh_peers(),
         "add" => {
             node.add_peer_addr(peer).await?;
         }

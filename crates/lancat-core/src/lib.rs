@@ -1,6 +1,8 @@
 //! Lancat core: zero-config LAN sharing.
 //!
-//! * [`discovery`] — mDNS `_lancat._tcp.local.` + UDP 47820 broadcast heartbeat (5 s / 15 s offline)
+//! * [`discovery`] — event-triggered UDP 47820 probe bursts (start / network change / wake / refresh) on
+//!   every IPv4 interface incl. Tailscale peers, unicast replies, `bye` on exit; mDNS on physical LANs.
+//!   Liveness = the per-peer WebSocket link (ping 30 s, offline after 2 missed)
 //! * [`server`] / [`link`] / [`transfer`] — axum on TCP 47820: WebSocket messages, chunked resumable HTTP file upload
 //! * [`store`] — SQLite devices / conversations / messages / settings
 //! * [`node::Node`] — the facade the desktop app (Tauri) and the CLI drive
