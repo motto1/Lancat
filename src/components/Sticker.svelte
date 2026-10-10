@@ -6,7 +6,16 @@
   import type { EmojiPayload } from "../lib/api";
   import { createPlayer, destroyPlayer, getPoster, lottieData, play, posterKey, savePoster, stop, warmPlayer, type Player } from "../lib/lottie";
 
-  let { emoji, size = 160, mode = "chat" }: { emoji: EmojiPayload; size?: number; mode?: "chat" | "grid" } = $props();
+  // underlay=false: the caller keeps its own placeholder (e.g. the grid glyph) under the sticker and
+  // swaps it out on `onshown`, so the sticker neither draws a fallback glyph of its own (a different
+  // size from the caller's) nor shows an empty canvas while the poster decodes; no fade either.
+  let {
+    emoji,
+    size = 160,
+    mode = "chat",
+    underlay = true,
+    onshown,
+  }: { emoji: EmojiPayload; size?: number; mode?: "chat" | "grid"; underlay?: boolean; onshown?: () => void } = $props();
 
   const FADE_MS = 160;
   let host: HTMLDivElement;
@@ -66,7 +75,10 @@
         if (!poster) savePoster(pkey, size, canvas);
         ready = true;
         if (posterDrawn) placeholder = false;
-        else setTimeout(() => (placeholder = false), FADE_MS + 40);
+        else if (!underlay) {
+          placeholder = false;
+          onshown?.();
+        } else setTimeout(() => (placeholder = false), FADE_MS + 40);
         sync();
       };
       a.addEventListener("load", onReady);
@@ -94,6 +106,7 @@
           if (!ready && !destroyed && canvas) {
             canvas.getContext("2d")?.drawImage(bmp, 0, 0, canvas.width, canvas.height);
             posterDrawn = true;
+            onshown?.();
           }
           bmp.close();
         })
@@ -137,14 +150,14 @@
   <canvas
     class="host"
     class:shown={ready || posterDrawn}
-    class:instant={posterDrawn}
+    class:instant={posterDrawn || !underlay}
     bind:this={canvas}
     width={Math.round(size * pr)}
     height={Math.round(size * pr)}
     style:width="{size}px"
     style:height="{size}px"
   ></canvas>
-  {#if failed || ((!poster || posterFailed) && placeholder)}
+  {#if underlay && (failed || ((!poster || posterFailed) && placeholder))}
     <div class="fallback" style:font-size="{Math.round(size * 0.68)}px">{emoji.alt || "🙂"}</div>
   {/if}
 </div>

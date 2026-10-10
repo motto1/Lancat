@@ -1,4 +1,12 @@
 /* Lancat — macOS-like visual language. Only transform/opacity are ever animated. */
+/* Emoji-grid hover zoom (EmojiPanel .cell): a registered number so the transition runs on the main
+   thread instead of promoting each cell to a compositing layer. 1.0001: see .cell. */
+@property --cell-scale {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 1.0001;
+}
+
 :root {
   --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro", "Segoe UI Variable Text", "Segoe UI Variable",
     "Segoe UI", "PingFang SC", "HarmonyOS Sans SC", "MiSans", "Noto Sans CJK SC", "Microsoft YaHei UI", "Inter",

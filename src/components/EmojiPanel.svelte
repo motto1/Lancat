@@ -13,6 +13,10 @@
   let query = $state("");
   let active = $state("recent");
   let hovered = $state<string | null>(null);
+  // The glyph stays in place under the hovered cell's sticker until the sticker has pixels in its
+  // canvas (poster or frame 0); swapping straight away showed a smaller fallback glyph or an empty
+  // cell for a frame or two.
+  let covered = $state<string | null>(null);
   let stickers = $state<StickerMeta[]>([]);
   let scroller: HTMLDivElement;
   let fileInput: HTMLInputElement;
@@ -117,12 +121,16 @@
     title={e.kw.split(" ")[0]}
     onclick={() => pickEmoji(e)}
     onmouseenter={() => (hovered = e.code)}
-    onmouseleave={() => hovered === e.code && (hovered = null)}
+    onmouseleave={() => {
+      if (hovered === e.code) hovered = null;
+      if (covered === e.code) covered = null;
+    }}
   >
+    <span class="glyph" class:gone={covered === e.code && hovered === e.code}>{e.char}</span>
     {#if hovered === e.code}
-      <Sticker emoji={{ kind: "noto", code: e.code, alt: e.char }} size={30} mode="chat" />
-    {:else}
-      <span class="glyph">{e.char}</span>
+      <span class="over">
+        <Sticker emoji={{ kind: "noto", code: e.code, alt: e.char }} size={30} mode="chat" underlay={false} onshown={() => hovered === e.code && (covered = e.code)} />
+      </span>
     {/if}
   </button>
 {/snippet}
@@ -258,21 +266,39 @@
     grid-template-columns: repeat(auto-fill, minmax(36px, 1fr));
   }
   .cell {
+    position: relative;
     height: 38px;
     display: grid;
     place-items: center;
     border-radius: 9px;
-    /* background used to snap in while the cell was still scaling */
+    /* The hover zoom animates a registered number (global.css) instead of `transform`: a transform
+       transition moves the cell into its own compositing layer for its duration, and at a
+       fractional DPR (1.5) the layer and the page paint the glyph on different device-pixel grids,
+       so it jumped ~1 px when the zoom started and again when it ended. Too many cells to keep them
+       all in layers; a custom-property transition runs on the main thread and never promotes.
+       The rest value is 1.0001, not 1: an identity transform snaps the box to device pixels while
+       any other scale does not, which would put the same jump at the first and last frame. */
+    transform: scale(var(--cell-scale));
     transition:
-      transform var(--dur) var(--ease-spring),
+      --cell-scale var(--dur) var(--ease-spring),
       background-color var(--dur-fast) var(--ease);
   }
   .cell:hover {
     background: var(--hover);
-    transform: scale(1.12);
+    --cell-scale: 1.12;
   }
   .cell:active {
-    transform: scale(0.92);
+    --cell-scale: 0.92;
+  }
+  .over {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    pointer-events: none;
+  }
+  .glyph.gone {
+    visibility: hidden;
   }
   .glyph {
     font-size: 25px;
