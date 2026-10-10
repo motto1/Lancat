@@ -104,6 +104,11 @@ pub fn get_settings(core: State<'_, Core>) -> Settings {
 pub fn set_settings(app: AppHandle, core: State<'_, Core>, settings: Settings) -> R<Settings> {
     let s = core.0.set_settings(settings).map_err(e)?;
     crate::dock::apply_layout(&app);
+    // the native material's tint follows the theme setting
+    #[cfg(windows)]
+    if let Some(p) = tauri::Manager::get_webview_window(&app, "panel") {
+        crate::platform::refresh_material(&p);
+    }
     Ok(s)
 }
 

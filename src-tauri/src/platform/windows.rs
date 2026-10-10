@@ -167,6 +167,19 @@ pub fn setup_panel(win: &WebviewWindow) {
     }
 }
 
+/// Theme setting or system app theme changed: re-apply the accent tint (its colour is also the
+/// opaque fallback when transparency effects are off) without recreating the panel.
+pub fn refresh_material(win: &WebviewWindow) {
+    if !matches!(glass_mode(), Glass::Accent) {
+        return;
+    }
+    let Some(h) = hwnd(win) else { return };
+    let dark = dark_theme(win);
+    if !accent(h, ACCENT_ENABLE_ACRYLICBLURBEHIND, dark) {
+        log::warn!("re-applying the panel accent (dark={dark}) failed");
+    }
+}
+
 // ------------------------------------------------------------------ panel park / reveal
 //
 // Hiding the panel (SW_HIDE) makes WebView2 treat its renderer as hidden; on the next (warm) open

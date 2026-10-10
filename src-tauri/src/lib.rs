@@ -172,6 +172,13 @@ pub fn run() {
                     dock::hide_panel(window.app_handle());
                 }
             }
+            // system light/dark switch: the native material's tint follows ("system" theme)
+            #[cfg(windows)]
+            if let tauri::WindowEvent::ThemeChanged(_) = event {
+                if let Some(p) = window.app_handle().get_webview_window("panel") {
+                    platform::refresh_material(&p);
+                }
+            }
         })
         .setup(|app| {
             let node = start_core(app).map_err(|e| e.to_string())?;
