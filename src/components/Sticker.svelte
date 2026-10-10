@@ -4,14 +4,25 @@
   // Never animates off-screen; at most MAX_PLAYING stickers animate at once (lib/lottie.ts).
   import { onMount } from "svelte";
   import type { EmojiPayload } from "../lib/api";
-  import { createPlayer, destroyPlayer, lottieData, play, stop, type Player } from "../lib/lottie";
+  import { createPlayer, destroyPlayer, getPoster, lottieData, play, posterKey, savePoster, stop, warmPlayer, type Player } from "../lib/lottie";
 
   let { emoji, size = 160, mode = "chat" }: { emoji: EmojiPayload; size?: number; mode?: "chat" | "grid" } = $props();
 
+  const FADE_MS = 160;
   let host: HTMLDivElement;
   let canvas: HTMLCanvasElement;
   let failed = $state(false);
   let ready = $state(false);
+  // Until ThorVG has drawn frame 0 the canvas shows a placeholder: the cached poster of that very
+  // frame, painted into the canvas itself (decoded up front, so it is in the first visible frame),
+  // which the player then overwrites with identical pixels; or, for an emoji never seen before,
+  // the system glyph underneath, crossfaded.
+  const pkey = $derived(posterKey(emoji, size));
+  const poster = $derived(getPoster(pkey));
+  const pr = Math.min(window.devicePixelRatio || 1, 2); // must match createPlayer's devicePixelRatio
+  let posterDrawn = $state(false);
+  let posterFailed = $state(false);
+  let placeholder = $state(true);
   let anim: Player | null = null;
   let visible = false;
   let hovering = false;
@@ -39,6 +50,7 @@
       return;
     }
     loading = true;
+    warmPlayer(); // load the player JS while the JSON is fetched
     try {
       const data = await p;
       if (!canvas || destroyed) return;
@@ -48,15 +60,18 @@
         return;
       }
       anim = a;
-      a.addEventListener("load", () => {
+      // `load` is dispatched after the player has rendered and drawn frame 0 into the canvas.
+      const onReady = () => {
+        if (ready) return;
+        if (!poster) savePoster(pkey, size, canvas);
         ready = true;
+        if (posterDrawn) placeholder = false;
+        else setTimeout(() => (placeholder = false), FADE_MS + 40);
         sync();
-      });
+      };
+      a.addEventListener("load", onReady);
       a.addEventListener("loadError", () => (failed = true));
-      if (a.isLoaded) {
-        ready = true;
-        sync();
-      }
+      if (a.isLoaded) onReady();
       a.addEventListener("loop", () => {
         loops++;
         if (mode === "chat" && loops >= 2 && !hovering && anim) stop(anim, true);
@@ -69,6 +84,21 @@
   }
 
   onMount(() => {
+    if (poster) {
+      // createImageBitmap, not <img>/img.decode(): those decode through the compositor, which a
+      // parked (not yet shown) panel does not run, so the poster arrived one frame after the page.
+      fetch(poster)
+        .then((r) => r.blob())
+        .then((b) => createImageBitmap(b))
+        .then((bmp) => {
+          if (!ready && !destroyed && canvas) {
+            canvas.getContext("2d")?.drawImage(bmp, 0, 0, canvas.width, canvas.height);
+            posterDrawn = true;
+          }
+          bmp.close();
+        })
+        .catch(() => (posterFailed = true));
+    }
     const io = new IntersectionObserver(
       (entries) => {
         visible = entries.some((e) => e.isIntersecting);
@@ -104,8 +134,17 @@
     sync();
   }}
 >
-  <canvas class="host" bind:this={canvas} width={size} height={size} style:width="{size}px" style:height="{size}px"></canvas>
-  {#if failed || !ready}
+  <canvas
+    class="host"
+    class:shown={ready || posterDrawn}
+    class:instant={posterDrawn}
+    bind:this={canvas}
+    width={Math.round(size * pr)}
+    height={Math.round(size * pr)}
+    style:width="{size}px"
+    style:height="{size}px"
+  ></canvas>
+  {#if failed || ((!poster || posterFailed) && placeholder)}
     <div class="fallback" style:font-size="{Math.round(size * 0.68)}px">{emoji.alt || "🙂"}</div>
   {/if}
 </div>
@@ -122,9 +161,14 @@
     opacity: 0;
     transition: opacity 160ms ease;
   }
-  .ready .host {
+  .host.instant {
+    transition: none;
+  }
+  .host.shown {
     opacity: 1;
   }
+  /* The in-flow glyph paints under the positioned canvas and stays fully opaque while the canvas
+     fades in over it (removed afterwards), so coverage never dips. */
   .fallback {
     line-height: 1;
     font-family: "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji", sans-serif;

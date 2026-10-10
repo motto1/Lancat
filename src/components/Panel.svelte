@@ -21,6 +21,8 @@
   let edge = $state("right");
   let anim: Animation | null = null;
   let phase: "hidden" | "opening" | "open" | "closing" = "hidden";
+  let firstShow = true;
+  const afterFrames = (n: number, f: () => void) => requestAnimationFrame(() => (n > 1 ? afterFrames(n - 1, f) : f()));
   let pointerInside = true;
   /** Opened from the tray/shortcut: only auto-collapse after the pointer has visited the panel. */
   let entered = true;
@@ -46,8 +48,11 @@
     uiLog(`panel show (${from}), visibility=${document.visibilityState}`);
     requestAnimationFrame(() => api.panelShown().catch(() => {}));
     // Windows keeps the window transparent until a frame of this open has been painted
-    // (two rAFs: the first runs before that frame, the second after it was produced).
-    if (isWindows) requestAnimationFrame(() => requestAnimationFrame(() => api.panelReady().catch(() => {})));
+    // (two rAFs: the first runs before that frame, the second after it was produced). On the first
+    // show of a cold page the compositor only starts now: the first presented frames held just the
+    // background, then the text without the sticker canvases, so wait a few frames more there.
+    if (isWindows) afterFrames(firstShow ? 5 : 2, () => api.panelReady().catch(() => {}));
+    firstShow = false;
     anim.finished.then(() => (uiLog("panel open animation done"), phase === "opening" && (phase = "open"))).catch(() => {});
     app.markReadIfVisible();
     if (from === "drag") ui.dragging = true;

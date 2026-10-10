@@ -63,6 +63,49 @@ function cached(key: string, load: () => Promise<string>): Promise<string> {
   return p;
 }
 
+/** Starts loading the player JS early (in parallel with fetching the Lottie JSON). */
+export function warmPlayer() {
+  void player();
+}
+
+// ---- posters: frame 0 of each animation, kept across panel restarts (localStorage, small LRU).
+// A cold-opened panel shows the poster until ThorVG has drawn the same frame into the canvas, so
+// the hand-over to the animation is pixel-identical and has no blank or fading frame. Only an
+// emoji never seen before falls back to the system emoji glyph (then crossfades).
+const POSTER = "lancat.poster.v1:";
+// Two LRUs so opening the emoji grid (many tiny cells) cannot evict the chat-size posters.
+const posterClass = (size: number) => (size >= 64 ? { idx: "lancat.poster.v1.big", max: 48 } : { idx: "lancat.poster.v1.small", max: 200 });
+
+export function posterKey(e: EmojiPayload, size: number): string | null {
+  return e.kind === "noto" || e.kind === "sticker" ? `${e.kind}:${e.code}:${size}` : null;
+}
+
+export function getPoster(key: string | null): string | null {
+  if (!key) return null;
+  try {
+    return localStorage.getItem(POSTER + key);
+  } catch {
+    return null;
+  }
+}
+
+/** Stores the canvas' current pixels (call right after `load`, when frame 0 is drawn). */
+export function savePoster(key: string | null, size: number, canvas: HTMLCanvasElement) {
+  if (!key) return;
+  try {
+    const url = canvas.toDataURL("image/webp", 0.92); // WebKitGTK may fall back to PNG: still fine
+    if (url.length < 64) return;
+    const c = posterClass(size);
+    const idx: string[] = JSON.parse(localStorage.getItem(c.idx) || "[]").filter((k: string) => k !== key);
+    idx.push(key);
+    while (idx.length > c.max) localStorage.removeItem(POSTER + idx.shift());
+    localStorage.setItem(POSTER + key, url);
+    localStorage.setItem(c.idx, JSON.stringify(idx));
+  } catch {
+    /* quota or tainted canvas: no poster, the glyph fallback still works */
+  }
+}
+
 /** Resolves Lottie JSON text for a payload (bundled Noto, inline sticker data, or a locally imported sticker). */
 export function lottieData(e: EmojiPayload): Promise<string> | null {
   if (e.kind === "noto") {
