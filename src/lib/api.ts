@@ -147,6 +147,7 @@ export const api = {
         .map((m) => `${m.name}=${Math.round(m.startTime)}`)
         .join(" "),
     }),
+  panelReady: () => invoke<void>("panel_ready"),
   setHold: (hold: boolean) => invoke<void>("set_hold", { hold }),
   openSettings: () => invoke<void>("cmd_open_settings"),
   monitors: () => invoke<MonitorInfo[]>("list_monitors"),

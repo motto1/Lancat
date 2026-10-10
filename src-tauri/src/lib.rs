@@ -158,6 +158,7 @@ pub fn run() {
             dock::set_hold,
             dock::panel_state,
             dock::panel_shown,
+            dock::panel_ready,
             dock::cmd_open_settings,
             dock::list_monitors,
             autostart_enabled,

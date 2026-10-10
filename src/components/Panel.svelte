@@ -10,6 +10,7 @@
   import { edgeOffset, exitTo, springTo } from "../lib/spring";
   import { ui } from "../lib/ui.svelte";
   import { setLottieActive } from "../lib/lottie";
+  import { isWindows } from "../lib/platform";
   import Sidebar from "./Sidebar.svelte";
   import Conversation from "./Conversation.svelte";
   import Composer from "./Composer.svelte";
@@ -40,6 +41,9 @@
     anim = springTo(shell, { ...edgeOffset(edge, 36), scale: 0.94, opacity: 0 }, { x: 0, y: 0, scale: 1, opacity: 1 }, { stiffness: 300, damping: 24 });
     uiLog(`panel show (${from}), visibility=${document.visibilityState}`);
     requestAnimationFrame(() => api.panelShown().catch(() => {}));
+    // Windows keeps the window transparent until a frame of this open has been painted
+    // (two rAFs: the first runs before that frame, the second after it was produced).
+    if (isWindows) requestAnimationFrame(() => requestAnimationFrame(() => api.panelReady().catch(() => {})));
     anim.finished.then(() => (uiLog("panel open animation done"), phase === "opening" && (phase = "open"))).catch(() => {});
     app.markReadIfVisible();
     if (from === "drag") ui.dragging = true;

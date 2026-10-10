@@ -12,17 +12,20 @@
 //! follows the light/dark theme. `LANCAT_WIN_GLASS=accent|backdrop|mica|none` switches the
 //! material for experiments.
 
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::time::Duration;
+
 use tauri::{Manager, Runtime, WebviewWindow, WebviewWindowBuilder};
 use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2_19, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL};
 use windows::core::{s, w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Dwm::{DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DWM_WINDOW_CORNER_PREFERENCE};
+use windows::Win32::Foundation::{COLORREF, HWND};
+use windows::Win32::Graphics::Dwm::{DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DWM_WINDOW_CORNER_PREFERENCE};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
-use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetLayeredWindowAttributes, ShowWindow, LWA_ALPHA, SW_HIDE, SW_SHOWNOACTIVATE};
 use windows_core::Interface;
 
 /// Acrylic/Mica is applied to the whole window, so the shell fills it (no CSS margin).
@@ -143,6 +146,111 @@ pub fn setup_panel(win: &WebviewWindow) {
         let _ = window_vibrancy::apply_mica(win, None);
     }
     round_corners(h);
+    // The page animates the popover itself; DWM's own show/hide transition on top of that made the
+    // first frames after a (warm) open show a half-revealed window. `LANCAT_WIN_DWM_ANIM=1` keeps it.
+    if env("LANCAT_WIN_DWM_ANIM").as_deref() != Some("1") {
+        let off: i32 = 1;
+        unsafe {
+            let _ = DwmSetWindowAttribute(h, DWMWA_TRANSITIONS_FORCEDISABLED, &off as *const _ as *const _, 4);
+        }
+    }
+}
+
+// ------------------------------------------------------------------ panel park / reveal
+//
+// Hiding the panel (SW_HIDE) makes WebView2 treat its renderer as hidden; on the next (warm) open
+// the first ~450 ms showed a black block and then only part of the page while it caught up. So a
+// collapsed panel is *parked* instead: it stays shown (the renderer keeps a current frame) but is
+// click-through (WS_EX_TRANSPARENT, so it never takes hover, clicks or OLE drops) and fully
+// transparent (WS_EX_LAYERED, alpha 0). Both styles come from tao's own "ignore cursor events"
+// flag, so tao's later style rewrites (show, focus, …) keep them. An open shows the window at
+// alpha 0 and waits for the page to report a painted frame (`panel_ready`, with a timeout) before
+// bringing it in; once fully in, the layered style is dropped again so the open panel is an
+// ordinary window (shadow, rounded corners and Acrylic exactly as before).
+// `LANCAT_WIN_PARK=0` restores the old show/hide behaviour.
+
+/// Bumped on every open/close; a pending reveal or fade step only runs if nothing happened since.
+static PANEL_GEN: AtomicU64 = AtomicU64::new(0);
+/// The open waiting for `panel_ready` (0 = none).
+static REVEAL_PENDING: AtomicU64 = AtomicU64::new(0);
+/// Current layered alpha of the panel (255 = opaque / not layered).
+static ALPHA: AtomicU8 = AtomicU8::new(255);
+
+fn park_enabled() -> bool {
+    env("LANCAT_WIN_PARK").as_deref() != Some("0")
+}
+
+fn set_alpha(h: HWND, a: u8) {
+    ALPHA.store(a, Ordering::SeqCst);
+    unsafe {
+        let _ = SetLayeredWindowAttributes(h, COLORREF(0), a, LWA_ALPHA);
+    }
+}
+
+/// Makes the panel visible for an open. Main thread. `cold`: the page may still be loading.
+pub fn panel_open(win: &WebviewWindow, cold: bool) {
+    let Some(h) = hwnd(win).filter(|_| park_enabled()) else {
+        let _ = win.show();
+        return;
+    };
+    let gen = PANEL_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    if !win.is_visible().unwrap_or(false) {
+        // first open of this webview: start invisible and click-through, like a parked panel
+        let _ = win.set_ignore_cursor_events(true);
+        set_alpha(h, 0);
+        let _ = win.show();
+    }
+    REVEAL_PENDING.store(gen, Ordering::SeqCst);
+    // never leave the panel invisible if the page does not answer (e.g. still loading, or crashed)
+    let timeout = Duration::from_millis(if cold { 4000 } else { 350 });
+    let w = win.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(timeout);
+        let w2 = w.clone();
+        let _ = w.run_on_main_thread(move || {
+            if REVEAL_PENDING.compare_exchange(gen, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                log::debug!("panel_ready timed out after {} ms; revealing anyway", timeout.as_millis());
+                reveal(&w2, gen);
+            }
+        });
+    });
+}
+
+/// The page painted its first frame after `panel://show`. Main thread.
+pub fn panel_ready(win: &WebviewWindow) {
+    let gen = REVEAL_PENDING.swap(0, Ordering::SeqCst);
+    if gen != 0 && gen == PANEL_GEN.load(Ordering::SeqCst) {
+        reveal(win, gen);
+    }
+}
+
+fn reveal(win: &WebviewWindow, gen: u64) {
+    if PANEL_GEN.load(Ordering::SeqCst) != gen {
+        return;
+    }
+    let Some(h) = hwnd(win) else { return };
+    set_alpha(h, 255);
+    let _ = win.set_ignore_cursor_events(false); // drops WS_EX_LAYERED | WS_EX_TRANSPARENT
+}
+
+/// Collapses the panel: park it (see above) instead of hiding it. Main thread.
+pub fn panel_close(win: &WebviewWindow) {
+    let Some(h) = hwnd(win).filter(|_| park_enabled()) else {
+        let _ = win.hide();
+        return;
+    };
+    PANEL_GEN.fetch_add(1, Ordering::SeqCst);
+    REVEAL_PENDING.store(0, Ordering::SeqCst);
+    let _ = win.set_ignore_cursor_events(true);
+    set_alpha(h, 0);
+    // An invisible window must not keep the keyboard: hiding it lets Windows activate the next
+    // window, showing it again without activation keeps the renderer warm.
+    unsafe {
+        if GetForegroundWindow() == h {
+            let _ = ShowWindow(h, SW_HIDE);
+            let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+        }
+    }
 }
 
 // ------------------------------------------------------------------ WebView2

@@ -383,7 +383,11 @@ pub fn open_panel(app: &AppHandle, reason: &str) {
             *st.geo.lock().unwrap() = Some(geo);
             place(&panel, geo.panel, &geo);
         }
+        #[cfg(not(windows))]
         let _ = panel.show();
+        // Windows: shown (or un-parked) at alpha 0, brought in once the page reports a frame
+        #[cfg(windows)]
+        platform::panel_open(&panel, st.cold_open.load(Ordering::SeqCst));
         #[cfg(windows)]
         platform::panel_visibility(&panel, true);
         *st.last_inside.lock().unwrap() = Some(true);
@@ -401,7 +405,11 @@ pub fn hide_panel(app: &AppHandle) {
     log::debug!("hide_panel");
     let st = app.state::<DockState>();
     if let Some(panel) = app.get_webview_window("panel") {
+        #[cfg(not(windows))]
         let _ = panel.hide();
+        // Windows: parked (shown, transparent, click-through) so the next open needs no resume
+        #[cfg(windows)]
+        platform::panel_close(&panel);
         #[cfg(windows)]
         platform::panel_visibility(&panel, false);
     }
@@ -568,6 +576,17 @@ pub fn panel_shown(app: AppHandle, page_ms: Option<f64>, marks: Option<String>) 
             marks.unwrap_or_default()
         );
     }
+}
+
+/// Windows: the page painted a frame after `panel://show`, so the parked panel can come in.
+#[tauri::command]
+pub fn panel_ready(app: AppHandle) {
+    #[cfg(windows)]
+    if let Some(p) = app.get_webview_window("panel") {
+        platform::panel_ready(&p);
+    }
+    #[cfg(not(windows))]
+    let _ = app;
 }
 
 #[tauri::command]
