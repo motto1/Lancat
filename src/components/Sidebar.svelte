@@ -137,6 +137,11 @@
     background: linear-gradient(180deg, color-mix(in srgb, var(--c, #888) 82%, white), var(--c, #888));
     box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.4), 0 1px 2px rgba(0, 0, 0, 0.15);
     transition: transform 180ms cubic-bezier(0.2, 0.9, 0.3, 1.4), opacity 160ms ease;
+    /* Keep the avatar on its own compositor layer at rest too. Otherwise the layer is only created
+       when the hover transition starts and dropped when it ends; at fractional DPR (1.25/1.5) the
+       inner icon/initials are pixel-snapped differently in the two paint paths, so the glyph jumped
+       ~1 device px against the circle at hover start/end ("全部" icon out of sync with its disc). */
+    will-change: transform;
   }
   .all-avatar {
     background: var(--hover);
