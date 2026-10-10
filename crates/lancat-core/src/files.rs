@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{anyhow, bail, Result};
@@ -18,18 +18,25 @@ pub const PART_DIR: &str = ".lancat-part";
 pub fn sanitize_rel_path(name: &str) -> PathBuf {
     let mut out = PathBuf::new();
     for part in name.split(['/', '\\']) {
-        let p = Path::new(part);
-        let ok = matches!(p.components().next(), Some(Component::Normal(_)));
-        if !ok || part == "." || part == ".." {
+        if part.is_empty() || part == "." || part == ".." {
             continue;
         }
+        // Replace the characters Windows forbids *before* looking at the path: on Windows
+        // "a:b" parses as a drive prefix and used to be dropped entirely.
         let cleaned: String = part
             .chars()
             .map(|c| if c.is_control() || "<>:\"|?*".contains(c) { '_' } else { c })
             .collect();
-        let cleaned = cleaned.trim_end_matches(['.', ' ']).to_string();
-        if cleaned.is_empty() {
+        let mut cleaned = cleaned.trim_end_matches(['.', ' ']).to_string();
+        if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
             continue;
+        }
+        // Windows reserved device names (CON, NUL, COM1, …) cannot be created as files.
+        let stem = cleaned.split('.').next().unwrap_or("").to_ascii_uppercase();
+        let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || ((stem.starts_with("COM") || stem.starts_with("LPT")) && stem.len() == 4 && stem.as_bytes()[3].is_ascii_digit());
+        if reserved {
+            cleaned.insert(0, '_');
         }
         out.push(cleaned);
     }
@@ -284,6 +291,8 @@ mod tests {
         assert_eq!(sanitize_rel_path("a:b?.txt"), PathBuf::from("a_b_.txt"));
         assert_eq!(sanitize_rel_path(""), PathBuf::from("unnamed"));
         assert_eq!(sanitize_rel_path("trail. "), PathBuf::from("trail"));
+        assert_eq!(sanitize_rel_path("C:\\x.txt"), PathBuf::from("C_").join("x.txt"));
+        assert_eq!(sanitize_rel_path("con.txt"), PathBuf::from("_con.txt"));
     }
 
     #[test]
