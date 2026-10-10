@@ -374,9 +374,12 @@
       background-color var(--dur-fast) var(--ease),
       box-shadow var(--dur-fast) var(--ease);
   }
+  .seg button:not(.on):hover {
+    background: var(--hover);
+  }
   .seg button.on {
-    background: var(--glass-strong);
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+    background: var(--seg-on);
+    box-shadow: var(--seg-on-shadow);
     font-weight: 500;
   }
   .btn {
