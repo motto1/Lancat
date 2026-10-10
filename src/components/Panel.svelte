@@ -130,6 +130,18 @@
         listen<{ inside: boolean }>("panel://cursor", (e) => pointer(e.payload.inside)),
         listen("panel://collapse", () => collapse(true)),
         listen<boolean>("panel://pinned", (e) => (ui.pinned = e.payload)),
+        // Rust hid the window without our collapse (fallback after an unanswered collapse request):
+        // resync so the next panel://show plays the open again.
+        listen<boolean>("panel://visible", (e) => {
+          if (e.payload || phase === "hidden") return;
+          uiLog(`hidden by the shell while phase=${phase}`);
+          clearTimeout(collapseTimer);
+          anim?.cancel();
+          phase = "hidden";
+          app.visible = false;
+          setLottieActive(false);
+          ui.emojiOpen = false;
+        }),
       ]);
       un.push(...ls);
       // the window may have been shown before this webview listened (pre-warmed, then opened)

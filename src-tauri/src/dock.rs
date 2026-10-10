@@ -50,6 +50,9 @@ pub struct DockState {
     /// Bumped on every hover start/end (generic hover-delay timer, macOS).
     hover_gen: AtomicU64,
     hovering: AtomicBool,
+    /// The panel collapsed while the pointer was on the strip: the poller must not hover-open it
+    /// again until the pointer has left the strip once (open on entering, not on resting there).
+    hover_disarmed: AtomicBool,
 }
 
 /// Physical pixels, virtual-desktop coordinates (top-left origin).
@@ -418,6 +421,7 @@ pub fn hide_panel(app: &AppHandle) {
     st.visible.store(false, Ordering::SeqCst);
     st.cold_open.store(false, Ordering::SeqCst);
     *st.hover_since.lock().unwrap() = None;
+    st.hover_disarmed.store(cursor_in_dock(app), Ordering::SeqCst);
     let _ = app.emit("panel://visible", false);
     refresh_visual(app);
     schedule_destroy(app);
@@ -426,6 +430,33 @@ pub fn hide_panel(app: &AppHandle) {
 /// Asks the panel to play its collapse animation (it hides itself afterwards).
 pub fn request_collapse(app: &AppHandle) {
     let _ = app.emit_to(EventTarget::webview_window("panel"), "panel://collapse", ());
+    // The page may not act on it (still loading, listeners not attached yet, or its own state
+    // already says hidden), which left the window on screen after `--hide-panel`. If nothing else
+    // happened meanwhile (no re-open, no hide), hide it from here.
+    let st = app.state::<DockState>();
+    if !st.visible.load(Ordering::SeqCst) {
+        return;
+    }
+    let gen = st.panel_gen.load(Ordering::SeqCst);
+    let a = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1000));
+        let a2 = a.clone();
+        let _ = a.run_on_main_thread(move || {
+            let st = a2.state::<DockState>();
+            if st.visible.load(Ordering::SeqCst) && st.panel_gen.load(Ordering::SeqCst) == gen {
+                log::info!("panel did not collapse itself within 1 s; hiding it");
+                hide_panel(&a2);
+            }
+        });
+    });
+}
+
+/// Pointer currently over the strip (false where the cursor position is unknown, e.g. Wayland).
+fn cursor_in_dock(app: &AppHandle) -> bool {
+    let Ok(cur) = app.cursor_position() else { return false };
+    let geo = *app.state::<DockState>().geo.lock().unwrap();
+    geo.is_some_and(|g| g.dock.contains(cur.x, cur.y, 1.0))
 }
 
 pub fn toggle_panel(app: &AppHandle) {
@@ -481,12 +512,17 @@ fn tick(app: &AppHandle) {
     if !visible {
         if !in_dock {
             *st.hover_since.lock().unwrap() = None;
+            st.hover_disarmed.store(false, Ordering::SeqCst);
             return;
         }
         if platform::left_button_down() {
             // a drag (file being dragged toward the edge): open at once
             let a = app.clone();
             let _ = app.run_on_main_thread(move || open_panel(&a, "drag"));
+            return;
+        }
+        if st.hover_disarmed.load(Ordering::SeqCst) {
+            // collapsed with the pointer resting here: wait until it leaves and comes back
             return;
         }
         let delay = Duration::from_millis(app.state::<Core>().0.settings().hover_delay_ms);
