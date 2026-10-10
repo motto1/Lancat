@@ -228,9 +228,56 @@ fn reveal(win: &WebviewWindow, gen: u64) {
     if PANEL_GEN.load(Ordering::SeqCst) != gen {
         return;
     }
-    let Some(h) = hwnd(win) else { return };
-    set_alpha(h, 255);
-    let _ = win.set_ignore_cursor_events(false); // drops WS_EX_LAYERED | WS_EX_TRANSPARENT
+    // drop WS_EX_LAYERED | WS_EX_TRANSPARENT once fully in
+    fade(win, gen, 255, fade_ms(true), |w| {
+        let _ = w.set_ignore_cursor_events(false);
+    });
+}
+
+/// Whole-window fade durations (the Acrylic material and the page fade together; the page itself
+/// no longer slides on Windows). `LANCAT_WIN_FADE_MS` sets both, 0 = instant.
+fn fade_ms(opening: bool) -> u64 {
+    env("LANCAT_WIN_FADE_MS").and_then(|v| v.parse().ok()).unwrap_or(if opening { 120 } else { 140 })
+}
+
+/// Steps the layered alpha from its current value to `to` over `ms` (~60 Hz, eased), then runs
+/// `done`. Every step runs on the main thread and is dropped once another open/close happened.
+fn fade(win: &WebviewWindow, gen: u64, to: u8, ms: u64, done: fn(&WebviewWindow)) {
+    let from = ALPHA.load(Ordering::SeqCst);
+    if ms == 0 || from == to {
+        if let Some(h) = hwnd(win) {
+            set_alpha(h, to);
+        }
+        done(win);
+        return;
+    }
+    let w = win.clone();
+    std::thread::spawn(move || {
+        let steps = (ms / 16).max(1);
+        for i in 1..=steps {
+            std::thread::sleep(Duration::from_millis(ms / steps));
+            if PANEL_GEN.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            let t = i as f64 / steps as f64;
+            // ease-out when coming in, ease-in when going away
+            let e = if to > from { 1.0 - (1.0 - t) * (1.0 - t) } else { t * t };
+            let a = (from as f64 + (to as f64 - from as f64) * e).round().clamp(0.0, 255.0) as u8;
+            let last = i == steps;
+            let w2 = w.clone();
+            let _ = w.run_on_main_thread(move || {
+                if PANEL_GEN.load(Ordering::SeqCst) != gen {
+                    return;
+                }
+                if let Some(h) = hwnd(&w2) {
+                    set_alpha(h, if last { to } else { a });
+                }
+                if last {
+                    done(&w2);
+                }
+            });
+        }
+    });
 }
 
 /// Collapses the panel: park it (see above) instead of hiding it. Main thread.
@@ -239,18 +286,22 @@ pub fn panel_close(win: &WebviewWindow) {
         let _ = win.hide();
         return;
     };
-    PANEL_GEN.fetch_add(1, Ordering::SeqCst);
+    let gen = PANEL_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     REVEAL_PENDING.store(0, Ordering::SeqCst);
+    // click-through at once; (re)adding WS_EX_LAYERED needs the alpha set again right away
     let _ = win.set_ignore_cursor_events(true);
-    set_alpha(h, 0);
-    // An invisible window must not keep the keyboard: hiding it lets Windows activate the next
-    // window, showing it again without activation keeps the renderer warm.
-    unsafe {
-        if GetForegroundWindow() == h {
-            let _ = ShowWindow(h, SW_HIDE);
-            let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+    set_alpha(h, ALPHA.load(Ordering::SeqCst));
+    fade(win, gen, 0, fade_ms(false), |w| {
+        // An invisible window must not keep the keyboard: hiding it lets Windows activate the
+        // next window, showing it again without activation keeps the renderer warm.
+        let Some(h) = hwnd(w) else { return };
+        unsafe {
+            if GetForegroundWindow() == h {
+                let _ = ShowWindow(h, SW_HIDE);
+                let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+            }
         }
-    }
+    });
 }
 
 // ------------------------------------------------------------------ WebView2

@@ -38,7 +38,11 @@
     if (phase === "open" || phase === "opening") return;
     anim?.cancel();
     phase = "opening";
-    anim = springTo(shell, { ...edgeOffset(edge, 36), scale: 0.94, opacity: 0 }, { x: 0, y: 0, scale: 1, opacity: 1 }, { stiffness: 300, damping: 24 });
+    // Windows: the whole window (native Acrylic included) fades in, so the page must not slide or
+    // fade inside a material that is already there; only a slight settle in scale.
+    anim = isWindows
+      ? shell.animate([{ transform: "scale(0.985)", opacity: 1 }, { transform: "none", opacity: 1 }], { duration: 160, easing: "cubic-bezier(0.2, 0.8, 0.3, 1)", fill: "both" })
+      : springTo(shell, { ...edgeOffset(edge, 36), scale: 0.94, opacity: 0 }, { x: 0, y: 0, scale: 1, opacity: 1 }, { stiffness: 300, damping: 24 });
     uiLog(`panel show (${from}), visibility=${document.visibilityState}`);
     requestAnimationFrame(() => api.panelShown().catch(() => {}));
     // Windows keeps the window transparent until a frame of this open has been painted
@@ -54,14 +58,18 @@
     if (phase === "hidden" || phase === "closing") return;
     if (!force && blocked()) return;
     phase = "closing";
-    anim?.cancel();
-    anim = exitTo(shell, { x: 0, y: 0, scale: 1, opacity: 1 }, { ...edgeOffset(edge, 28), scale: 0.96, opacity: 0 }, 220);
-    try {
-      await anim.finished;
-    } catch {
-      return; // cancelled by a re-open
+    // Windows: Rust fades the whole window out; the page stays as it is (its last frame is also
+    // what a parked panel shows first when it comes back).
+    if (!isWindows) {
+      anim?.cancel();
+      anim = exitTo(shell, { x: 0, y: 0, scale: 1, opacity: 1 }, { ...edgeOffset(edge, 28), scale: 0.96, opacity: 0 }, 220);
+      try {
+        await anim.finished;
+      } catch {
+        return; // cancelled by a re-open
+      }
+      if (phase !== "closing") return;
     }
-    if (phase !== "closing") return;
     phase = "hidden";
     app.visible = false;
     setLottieActive(false); // nothing animates while hidden
