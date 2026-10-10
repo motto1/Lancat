@@ -12,10 +12,8 @@
 //! follows the light/dark theme. `LANCAT_WIN_GLASS=accent|backdrop|mica|none` switches the
 //! material for experiments.
 
-use std::cell::RefCell;
-
 use tauri::{Manager, Runtime, WebviewWindow, WebviewWindowBuilder};
-use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2Environment, ICoreWebView2_19, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL};
+use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2_19, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL};
 use windows::core::{s, w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dwm::{DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DWM_WINDOW_CORNER_PREFERENCE};
@@ -155,26 +153,34 @@ const WV2_DEFAULT_FEATURES: &str = "msWebOOUI,msPdfOOUI,msSmartScreenProtection"
 /// Browser arguments for every webview of the app. All webviews share one user-data folder, and
 /// WebView2 refuses a second environment with different options there, so the settings window
 /// must get exactly the same string as the panel. `LANCAT_WV2_ARGS` replaces it (experiments).
+///
+/// Measured on a Win11 laptop (memprobe, panel expanded, private bytes of the whole tree):
+/// * `--disable-gpu`: the GPU process drops from ~88–98 MB (D3D/driver baseline; raster/tile
+///   flags such as `--disable-gpu-rasterization` or `--force-gpu-mem-available-mb` change
+///   nothing) to ~18 MB. The panel is one small page; the Acrylic material is drawn by DWM
+///   behind the window, so it is unaffected, and dotLottie renders in WASM anyway. Cost: ~+6 %
+///   of one core while a sticker animates; cold-open time is unchanged.
+/// * `NetworkServiceInProcess`: the network utility process (~11 MB) moves into the browser
+///   process (+~2 MB there).
+/// * not used: `--in-process-gpu` (−40 MB with GPU on, but a GPU fault then takes the browser
+///   process down), `--disable-gpu-compositing` (−25 MB), `--enable-low-end-device-mode` and
+///   `--renderer-process-limit=1` (no measurable gain).
 fn browser_args() -> String {
-    env("LANCAT_WV2_ARGS").unwrap_or_else(|| format!("--disable-features={WV2_DEFAULT_FEATURES}"))
-}
-
-thread_local! {
-    /// Environment kept across panel destroy/re-create (only with `LANCAT_WV2_KEEP_ENV=1`).
-    static KEPT_ENV: RefCell<Option<ICoreWebView2Environment>> = const { RefCell::new(None) };
+    env("LANCAT_WV2_ARGS").unwrap_or_else(|| {
+        format!("--disable-features={WV2_DEFAULT_FEATURES} --enable-features=NetworkServiceInProcess,NetworkServiceInProcess2 --disable-gpu")
+    })
 }
 
 /// Applies the Windows-only WebView2 options to a window builder (panel and settings).
 pub fn webview_builder<'a, R: Runtime, M: Manager<R>>(b: WebviewWindowBuilder<'a, R, M>) -> WebviewWindowBuilder<'a, R, M> {
-    let b = b.additional_browser_args(&browser_args());
-    match KEPT_ENV.with(|e| e.borrow().clone()) {
-        Some(env) => b.with_environment(env),
-        None => b,
-    }
+    b.additional_browser_args(&browser_args())
 }
 
-/// Panel shown (true) or collapsed but kept alive (false): steer WebView2's memory target level.
+/// Panel shown (true) or collapsed but kept alive (false): steer WebView2's memory target level
+/// (Low lets the renderer drop caches while hidden).
 pub fn panel_visibility(win: &WebviewWindow, visible: bool) {
+    // Measured while collapsed-but-alive: −17…21 MB with GPU on, but no difference (~125 MB
+    // either way) with the default `--disable-gpu`, so it stays opt-in (`LANCAT_WV2_LOWMEM=1`).
     if env("LANCAT_WV2_LOWMEM").as_deref() != Some("1") {
         return;
     }
@@ -212,17 +218,7 @@ pub fn first_run(app: &tauri::AppHandle) {
 
 pub fn init_app(_app: &mut tauri::App) {}
 
-/// With `LANCAT_WV2_KEEP_ENV=1` the WebView2 environment of the first panel is kept after the
-/// panel is destroyed and reused for the next one (experiment: cold open vs. collapsed memory).
-pub fn tune_webview(win: &WebviewWindow) {
-    if env("LANCAT_WV2_KEEP_ENV").as_deref() != Some("1") || KEPT_ENV.with(|e| e.borrow().is_some()) {
-        return;
-    }
-    let _ = win.with_webview(|wv| {
-        let env = wv.environment();
-        KEPT_ENV.with(|e| *e.borrow_mut() = Some(env));
-    });
-}
+pub fn tune_webview(_win: &WebviewWindow) {}
 
 pub fn use_layer_shell() -> bool {
     false
