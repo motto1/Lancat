@@ -8,7 +8,7 @@
 //! [`crate::dock::open_panel`], [`crate::dock::on_hover_start`] and [`crate::dock::on_hover_end`].
 //!
 //! * Linux: GTK3 window + cairo (layer-shell on Wayland, Dock type hint on X11) — verified on niri.
-//! * Windows: Win32 layered tool window — TODO-verify (not compiled on Windows yet).
+//! * Windows: Win32 layered tool window, per-pixel alpha — verified on Win11 (150 %).
 //! * macOS: borderless non-activating NSPanel + NSView — TODO-verify (not compiled on macOS yet).
 
 use tauri::{AppHandle, Manager};
@@ -26,12 +26,14 @@ pub struct DockVisual {
     pub open: bool,
     /// Accent colour, 0..1 sRGB.
     pub accent: (f64, f64, f64),
+    /// Dark app theme (Windows strip colours; the other backends ignore it).
+    pub dark: bool,
 }
 
 impl Default for DockVisual {
     fn default() -> Self {
         // macOS system blue, same as the CSS --accent default
-        Self { edge: "right".into(), unread: false, open: false, accent: (10.0 / 255.0, 132.0 / 255.0, 1.0) }
+        Self { edge: "right".into(), unread: false, open: false, accent: (10.0 / 255.0, 132.0 / 255.0, 1.0), dark: false }
     }
 }
 

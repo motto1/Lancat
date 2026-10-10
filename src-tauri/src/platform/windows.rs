@@ -110,27 +110,25 @@ fn system_backdrop(h: HWND, kind: i32) -> bool {
 
 /// The app's theme setting, or the system's app theme for "system".
 fn dark_theme(win: &WebviewWindow) -> bool {
-    match win.app_handle().state::<crate::commands::Core>().0.settings().theme.as_str() {
+    theme_is_dark(&win.app_handle().state::<crate::commands::Core>().0.settings().theme)
+}
+
+fn reg_dword(key: PCWSTR, value: PCWSTR) -> Option<u32> {
+    let mut v: u32 = 0;
+    let mut size = 4u32;
+    let r = unsafe { RegGetValueW(HKEY_CURRENT_USER, key, value, RRF_RT_REG_DWORD, None, Some(&mut v as *mut u32 as *mut _), Some(&mut size)) };
+    r.is_ok().then_some(v)
+}
+
+/// A theme setting ("dark" | "light" | "system") resolved against the system's app theme.
+pub fn theme_is_dark(theme: &str) -> bool {
+    match theme {
         "dark" => true,
         "light" => false,
-        _ => {
-            let mut v: u32 = 1;
-            let mut size = 4u32;
-            let r = unsafe {
-                RegGetValueW(
-                    HKEY_CURRENT_USER,
-                    w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
-                    w!("AppsUseLightTheme"),
-                    RRF_RT_REG_DWORD,
-                    None,
-                    Some(&mut v as *mut u32 as *mut _),
-                    Some(&mut size),
-                )
-            };
-            r.is_ok() && v == 0
-        }
+        _ => reg_dword(w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"), w!("AppsUseLightTheme")) == Some(0),
     }
 }
+
 
 pub fn setup_panel(win: &WebviewWindow) {
     let Some(h) = hwnd(win) else { return };
@@ -262,6 +260,8 @@ fn reveal(win: &WebviewWindow, gen: u64) {
         return;
     }
     REVEALED.store(true, Ordering::SeqCst);
+    // the strip switches to its "open" look together with the window fade-in, not at the request
+    crate::dock::refresh_visual(win.app_handle());
     // drop WS_EX_LAYERED | WS_EX_TRANSPARENT once fully in
     fade(win, gen, 255, fade_ms(true), |w| {
         let _ = w.set_ignore_cursor_events(false);
@@ -270,7 +270,7 @@ fn reveal(win: &WebviewWindow, gen: u64) {
 
 /// Whole-window fade durations (the Acrylic material and the page fade together; the page itself
 /// no longer slides on Windows). `LANCAT_WIN_FADE_MS` sets both, 0 = instant.
-fn fade_ms(opening: bool) -> u64 {
+pub(crate) fn fade_ms(opening: bool) -> u64 {
     env("LANCAT_WIN_FADE_MS").and_then(|v| v.parse().ok()).unwrap_or(if opening { 120 } else { 140 })
 }
 

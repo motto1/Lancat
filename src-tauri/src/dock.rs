@@ -102,10 +102,16 @@ fn compute(app: &AppHandle) -> Option<Geo> {
     let s = app.state::<Core>().0.settings();
     let m = pick_monitor(app, s.dock_monitor)?;
     let sc = m.scale_factor();
-    let (mx, my) = (m.position().x as f64, m.position().y as f64);
-    let (mw, mh) = (m.size().width as f64, m.size().height as f64);
     let wa = m.work_area();
     let (ax, ay, aw, ah) = (wa.position.x as f64, wa.position.y as f64, wa.size.width as f64, wa.size.height as f64);
+    // Windows: the strip lives in the work area. On the full monitor rect it sat on (and fought
+    // the z-order with) a taskbar on that edge, and a bottom/top panel opened over the taskbar;
+    // along the edge it could also run into a taskbar on the adjacent edge. Linux keeps the
+    // monitor edge (layer-shell overlay; bars there are the compositor's business).
+    #[cfg(windows)]
+    let (mx, my, mw, mh) = (ax, ay, aw, ah);
+    #[cfg(not(windows))]
+    let (mx, my, mw, mh) = (m.position().x as f64, m.position().y as f64, m.size().width as f64, m.size().height as f64);
 
     let t = (STRIP * sc).round();
     let along = s.dock_offset.clamp(0.0, 1.0);
@@ -350,8 +356,25 @@ fn schedule_destroy(app: &AppHandle) {
 pub fn refresh_visual(app: &AppHandle) {
     let core = &app.state::<Core>().0;
     let unread = core.peers().iter().any(|p| !p.blocked && p.unread > 0);
-    let visual = DockVisual { edge: core.settings().dock_edge, unread, open: app.state::<DockState>().visible.load(Ordering::SeqCst), ..Default::default() };
+    let settings = core.settings();
+    // Windows: "open" once the parked panel actually starts fading in (platform::reveal calls back)
+    let open = app.state::<DockState>().visible.load(Ordering::SeqCst) && platform_revealed();
+    #[allow(unused_mut)]
+    let mut visual = DockVisual { edge: settings.dock_edge.clone(), unread, open, ..Default::default() };
+    // accent stays the default #0a84ff: the page does not use the system accent on Windows
+    // either (WebView2's CSS `AccentColor` is not the Windows accent), so both show the same blue
+    #[cfg(windows)]
+    {
+        visual.dark = platform::theme_is_dark(&settings.theme);
+    }
     native_dock::set_visual(visual);
+}
+
+fn platform_revealed() -> bool {
+    #[cfg(windows)]
+    return platform::panel_revealed();
+    #[cfg(not(windows))]
+    true
 }
 
 /// Re-applies edge / offset / length / monitor from settings.
