@@ -76,6 +76,9 @@ const POSTER = "lancat.poster.v1:";
 // Two LRUs so opening the emoji grid (many tiny cells) cannot evict the chat-size posters.
 const posterClass = (size: number) => (size >= 64 ? { idx: "lancat.poster.v1.big", max: 48 } : { idx: "lancat.poster.v1.small", max: 200 });
 
+/** Poster draws in flight (Sticker mount → canvas): the first reveal of a cold panel waits for them. */
+export const posterLoads = new Set<Promise<unknown>>();
+
 export function posterKey(e: EmojiPayload, size: number): string | null {
   return e.kind === "noto" || e.kind === "sticker" ? `${e.kind}:${e.code}:${size}` : null;
 }

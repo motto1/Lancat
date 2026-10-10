@@ -9,7 +9,7 @@
   import { app } from "../lib/state.svelte";
   import { edgeOffset, exitTo, springTo } from "../lib/spring";
   import { ui } from "../lib/ui.svelte";
-  import { setLottieActive } from "../lib/lottie";
+  import { posterLoads, setLottieActive } from "../lib/lottie";
   import { isWindows } from "../lib/platform";
   import Sidebar from "./Sidebar.svelte";
   import Conversation from "./Conversation.svelte";
@@ -23,6 +23,48 @@
   let phase: "hidden" | "opening" | "open" | "closing" = "hidden";
   let firstShow = true;
   const afterFrames = (n: number, f: () => void) => requestAnimationFrame(() => (n > 1 ? afterFrames(n - 1, f) : f()));
+  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+  /** Resolves once a frame with content has been *presented*: paint timing stamps
+   *  first-contentful-paint with the compositor's presentation feedback and reports it only then.
+   *  Immediately if that already happened. */
+  function contentPresented(): Promise<void> {
+    return new Promise((res) => {
+      if (performance.getEntriesByName("first-contentful-paint").length) return res();
+      try {
+        const po = new PerformanceObserver((l) => {
+          if (l.getEntriesByName("first-contentful-paint").length) {
+            po.disconnect();
+            res();
+          }
+        });
+        po.observe({ type: "paint", buffered: true });
+      } catch {
+        res();
+      }
+    });
+  }
+
+  /** Windows, first show of a cold page: the window is already shown (alpha 0) but WebView2 starts
+   *  producing frames for it only now, and a rAF count is no measure of what reached the screen
+   *  (the first frames are presented with a delay: the reveal then faded in a background-only
+   *  window, then text without the sticker canvases). So reveal only after (1) a frame with
+   *  content was presented, (2) the sticker posters are in their canvases, (3) three more frames
+   *  (the first presented frame can still lack the bubbles and canvases). Measured on a Win11
+   *  laptop, cold: content presented 110–150 ms after show() with and without --disable-gpu,
+   *  where the old fixed 2 rAFs revealed 4–6 frames of bare background first.
+   *  Bounded, and Rust reveals anyway after 4 s. */
+  async function revealWhenPainted() {
+    const t0 = performance.now();
+    await Promise.race([contentPresented(), sleep(1500)]);
+    const t1 = performance.now();
+    await Promise.race([Promise.allSettled([...posterLoads]), sleep(300)]);
+    const t2 = performance.now();
+    afterFrames(3, () => {
+      uiLog(`panel first reveal: presented +${Math.round(t1 - t0)} ms, posters +${Math.round(t2 - t1)} ms, total ${Math.round(performance.now() - t0)} ms`);
+      api.panelReady().catch(() => {});
+    });
+  }
   let pointerInside = true;
   /** Opened from the tray/shortcut: only auto-collapse after the pointer has visited the panel. */
   let entered = true;
@@ -47,11 +89,13 @@
       : springTo(shell, { ...edgeOffset(edge, 36), scale: 0.94, opacity: 0 }, { x: 0, y: 0, scale: 1, opacity: 1 }, { stiffness: 300, damping: 24 });
     uiLog(`panel show (${from}), visibility=${document.visibilityState}`);
     requestAnimationFrame(() => api.panelShown().catch(() => {}));
-    // Windows keeps the window transparent until a frame of this open has been painted
-    // (two rAFs: the first runs before that frame, the second after it was produced). On the first
-    // show of a cold page the compositor only starts now: the first presented frames held just the
-    // background, then the text without the sticker canvases, so wait a few frames more there.
-    if (isWindows) afterFrames(firstShow ? 5 : 2, () => api.panelReady().catch(() => {}));
+    // Windows keeps the window transparent until a frame of this open has been painted. Warm (the
+    // parked renderer kept producing frames): two rAFs, the first runs before that frame, the
+    // second after it was produced. Cold: see revealWhenPainted.
+    if (isWindows) {
+      if (firstShow) void revealWhenPainted();
+      else afterFrames(2, () => api.panelReady().catch(() => {}));
+    }
     firstShow = false;
     anim.finished.then(() => (uiLog("panel open animation done"), phase === "opening" && (phase = "open"))).catch(() => {});
     app.markReadIfVisible();

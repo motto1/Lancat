@@ -4,7 +4,7 @@
   // Never animates off-screen; at most MAX_PLAYING stickers animate at once (lib/lottie.ts).
   import { onMount } from "svelte";
   import type { EmojiPayload } from "../lib/api";
-  import { createPlayer, destroyPlayer, getPoster, lottieData, play, posterKey, savePoster, stop, warmPlayer, type Player } from "../lib/lottie";
+  import { createPlayer, destroyPlayer, getPoster, lottieData, play, posterKey, posterLoads, savePoster, stop, warmPlayer, type Player } from "../lib/lottie";
 
   // underlay=false: the caller keeps its own placeholder (e.g. the grid glyph) under the sticker and
   // swaps it out on `onshown`, so the sticker neither draws a fallback glyph of its own (a different
@@ -99,7 +99,7 @@
     if (poster) {
       // createImageBitmap, not <img>/img.decode(): those decode through the compositor, which a
       // parked (not yet shown) panel does not run, so the poster arrived one frame after the page.
-      fetch(poster)
+      const load = fetch(poster)
         .then((r) => r.blob())
         .then((b) => createImageBitmap(b))
         .then((bmp) => {
@@ -111,6 +111,8 @@
           bmp.close();
         })
         .catch(() => (posterFailed = true));
+      posterLoads.add(load);
+      void load.finally(() => posterLoads.delete(load));
     }
     const io = new IntersectionObserver(
       (entries) => {
