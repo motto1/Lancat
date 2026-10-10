@@ -198,6 +198,8 @@ fn ensure_panel(app: &AppHandle) -> Option<WebviewWindow> {
         .always_on_top(true)
         .skip_taskbar(true)
         .resizable(false)
+        // tao's undecorated shadow adds invisible resize borders around the client area (the
+        // panel would land off its computed rect); Windows gets a DWM shadow in setup_panel instead
         .shadow(false)
         .focused(false)
         .visible_on_all_workspaces(true)

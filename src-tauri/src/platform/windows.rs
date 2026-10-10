@@ -146,6 +146,17 @@ pub fn setup_panel(win: &WebviewWindow) {
         let _ = window_vibrancy::apply_mica(win, None);
     }
     round_corners(h);
+    // Native drop shadow. The window keeps tao's frameless client area (`.shadow(false)`, so its
+    // size and position stay exactly the computed rect, no invisible resize borders); a 1 px frame
+    // extended into the client is enough for DWM to draw its shadow (what the `window-shadows`
+    // crate did). The system backdrop path already extends the whole frame. Corners stay rounded
+    // by the DWMWCP_ROUND preference above. `LANCAT_WIN_SHADOW=0` turns it off.
+    if !matches!(mode, Glass::Backdrop) && env("LANCAT_WIN_SHADOW").as_deref() != Some("0") {
+        let m = MARGINS { cxLeftWidth: 1, cxRightWidth: 1, cyTopHeight: 1, cyBottomHeight: 1 };
+        unsafe {
+            let _ = DwmExtendFrameIntoClientArea(h, &m);
+        }
+    }
     // The page animates the popover itself; DWM's own show/hide transition on top of that made the
     // first frames after a (warm) open show a half-revealed window. `LANCAT_WIN_DWM_ANIM=1` keeps it.
     if env("LANCAT_WIN_DWM_ANIM").as_deref() != Some("1") {
