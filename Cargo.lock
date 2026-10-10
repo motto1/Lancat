@@ -2192,8 +2192,10 @@ dependencies = [
  "tokio",
  "uuid",
  "webkit2gtk",
+ "webview2-com",
  "window-vibrancy 0.6.0",
  "windows 0.61.3",
+ "windows-core 0.62.2",
 ]
 
 [[package]]

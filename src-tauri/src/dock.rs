@@ -187,7 +187,10 @@ fn ensure_panel(app: &AppHandle) -> Option<WebviewWindow> {
         return Some(p);
     }
     let t = Instant::now();
-    let panel = WebviewWindowBuilder::new(app, "panel", WebviewUrl::App("index.html".into()))
+    let builder = WebviewWindowBuilder::new(app, "panel", WebviewUrl::App("index.html".into()));
+    #[cfg(windows)]
+    let builder = platform::webview_builder(builder);
+    let panel = builder
         .initialization_script(boot_script(app))
         .title("Lancat")
         .decorations(false)
@@ -381,6 +384,8 @@ pub fn open_panel(app: &AppHandle, reason: &str) {
             place(&panel, geo.panel, &geo);
         }
         let _ = panel.show();
+        #[cfg(windows)]
+        platform::panel_visibility(&panel, true);
         *st.last_inside.lock().unwrap() = Some(true);
         let _ = app.emit("panel://visible", true);
         refresh_visual(app);
@@ -397,6 +402,8 @@ pub fn hide_panel(app: &AppHandle) {
     let st = app.state::<DockState>();
     if let Some(panel) = app.get_webview_window("panel") {
         let _ = panel.hide();
+        #[cfg(windows)]
+        platform::panel_visibility(&panel, false);
     }
     st.visible.store(false, Ordering::SeqCst);
     st.cold_open.store(false, Ordering::SeqCst);
@@ -426,7 +433,10 @@ pub fn open_settings(app: &AppHandle) -> tauri::Result<()> {
         let _ = w.set_focus();
         return Ok(());
     }
-    let w = WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("index.html".into()))
+    let builder = WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("index.html".into()));
+    #[cfg(windows)]
+    let builder = platform::webview_builder(builder);
+    let w = builder
         .title("Lancat 设置")
         .inner_size(480.0, 620.0)
         .min_inner_size(420.0, 480.0)
