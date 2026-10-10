@@ -154,6 +154,14 @@
           if (st.visible && phase === "hidden") {
             edge = st.edge;
             show(st.reason || "tray");
+          } else if (isWindows && !st.visible && phase !== "hidden") {
+            // hidden by the shell while this page was still loading (e.g. --hide-panel right after
+            // a cold open): the boot state said visible, so resync before the next panel://show
+            uiLog(`hidden before the page was ready (phase=${phase})`);
+            anim?.cancel();
+            phase = "hidden";
+            app.visible = false;
+            setLottieActive(false);
           }
         })
         .catch(() => {});

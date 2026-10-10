@@ -383,6 +383,13 @@ pub fn open_panel(app: &AppHandle, reason: &str) {
         st.visible.store(false, Ordering::SeqCst);
         return;
     };
+    // Windows: creating the WebView2 pumps messages, so a hide queued meanwhile (--hide-panel right
+    // after a cold open) may already have run inside ensure_panel; do not show the panel after it.
+    #[cfg(windows)]
+    if !was_visible && !st.visible.load(Ordering::SeqCst) {
+        log::debug!("panel hidden while it was being created; not showing it");
+        return;
+    }
     if !was_visible {
         if let Some(geo) = compute(app) {
             *st.geo.lock().unwrap() = Some(geo);
@@ -436,6 +443,20 @@ pub fn request_collapse(app: &AppHandle) {
     let st = app.state::<DockState>();
     if !st.visible.load(Ordering::SeqCst) {
         return;
+    }
+    // Windows: an open that has not been revealed yet (cold page still loading, or the webview
+    // still being created: this may run off the main thread meanwhile) has nothing to animate out;
+    // park it as soon as the main thread is free instead of letting it fade in and hiding it 1 s
+    // later. The fallback below still covers a reveal that wins the race.
+    #[cfg(windows)]
+    if !platform::panel_revealed() {
+        let a = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if a.state::<DockState>().visible.load(Ordering::SeqCst) && !platform::panel_revealed() {
+                log::debug!("collapse requested before the panel was revealed; hiding at once");
+                hide_panel(&a);
+            }
+        });
     }
     let gen = st.panel_gen.load(Ordering::SeqCst);
     let a = app.clone();

@@ -12,7 +12,7 @@
 //! follows the light/dark theme. `LANCAT_WIN_GLASS=accent|backdrop|mica|none` switches the
 //! material for experiments.
 
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::Duration;
 
 use tauri::{Manager, Runtime, WebviewWindow, WebviewWindowBuilder};
@@ -199,6 +199,8 @@ static PANEL_GEN: AtomicU64 = AtomicU64::new(0);
 static REVEAL_PENDING: AtomicU64 = AtomicU64::new(0);
 /// Current layered alpha of the panel (255 = opaque / not layered).
 static ALPHA: AtomicU8 = AtomicU8::new(255);
+/// See `panel_revealed`.
+static REVEALED: AtomicBool = AtomicBool::new(false);
 
 fn park_enabled() -> bool {
     env("LANCAT_WIN_PARK").as_deref() != Some("0")
@@ -218,6 +220,7 @@ pub fn panel_open(win: &WebviewWindow, cold: bool) {
         return;
     };
     let gen = PANEL_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    REVEALED.store(false, Ordering::SeqCst);
     if !win.is_visible().unwrap_or(false) {
         // first open of this webview: start invisible and click-through, like a parked panel
         let _ = win.set_ignore_cursor_events(true);
@@ -248,10 +251,17 @@ pub fn panel_ready(win: &WebviewWindow) {
     }
 }
 
+/// The current open has started coming in (false from a close until the next reveal, including
+/// while the webview of a cold open is still being created). Always true without parking.
+pub fn panel_revealed() -> bool {
+    !park_enabled() || REVEALED.load(Ordering::SeqCst)
+}
+
 fn reveal(win: &WebviewWindow, gen: u64) {
     if PANEL_GEN.load(Ordering::SeqCst) != gen {
         return;
     }
+    REVEALED.store(true, Ordering::SeqCst);
     // drop WS_EX_LAYERED | WS_EX_TRANSPARENT once fully in
     fade(win, gen, 255, fade_ms(true), |w| {
         let _ = w.set_ignore_cursor_events(false);
@@ -312,6 +322,7 @@ pub fn panel_close(win: &WebviewWindow) {
     };
     let gen = PANEL_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     REVEAL_PENDING.store(0, Ordering::SeqCst);
+    REVEALED.store(false, Ordering::SeqCst);
     // click-through at once; (re)adding WS_EX_LAYERED needs the alpha set again right away
     let _ = win.set_ignore_cursor_events(true);
     set_alpha(h, ALPHA.load(Ordering::SeqCst));
