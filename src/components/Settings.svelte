@@ -382,17 +382,27 @@
   .btn {
     padding: 4px 11px;
     border-radius: 6px;
-    background: var(--glass-strong);
+    background-color: var(--glass-strong);
     border: 0.5px solid var(--glass-border);
     font-size: 12px;
     box-shadow: 0 0.5px 1px rgba(0, 0, 0, 0.08);
-    transition: transform var(--dur-fast) var(--ease);
+    transition:
+      transform var(--dur-fast) var(--ease),
+      background-color var(--dur-fast) var(--ease);
+  }
+  /* hover: the face darkens (light) / lightens (dark) by about one --hover step */
+  .btn:hover {
+    background-color: color-mix(in srgb, var(--glass-strong), var(--text) 7%);
   }
   .btn:active {
     transform: scale(0.97);
+    background-color: color-mix(in srgb, var(--glass-strong), var(--text) 11%);
   }
   .btn.danger {
     color: var(--danger);
+  }
+  .btn.danger:hover {
+    background-color: color-mix(in srgb, var(--glass-strong), var(--danger) 10%);
   }
   .note {
     font-size: 11.5px;
