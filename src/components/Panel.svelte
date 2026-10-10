@@ -328,7 +328,9 @@
     border: 2px dashed var(--accent);
     opacity: 0;
     transform: scale(0.98);
-    transition: opacity 140ms ease, transform 180ms ease;
+    transition:
+      opacity var(--dur) var(--ease),
+      transform var(--dur) var(--ease);
     pointer-events: none;
   }
   .main.drop-hot::after {

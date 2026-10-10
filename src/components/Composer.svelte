@@ -178,7 +178,7 @@
     max-height: 96px;
     outline: none;
     font-size: 13px;
-    transition: box-shadow 140ms ease;
+    transition: box-shadow var(--dur-fast) var(--ease);
   }
   textarea:focus {
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
@@ -194,10 +194,13 @@
     display: grid;
     place-items: center;
     background: var(--accent);
-    color: #fff;
+    color: var(--accent-contrast);
     opacity: 0.35;
     transform: scale(0.88);
-    transition: opacity 140ms ease, transform 220ms cubic-bezier(0.2, 0.9, 0.3, 1.5);
+    transition:
+      opacity var(--dur) var(--ease),
+      transform var(--dur-slow) var(--ease-spring);
+    will-change: transform;
   }
   .send.ready {
     opacity: 1;
@@ -221,7 +224,7 @@
     flex-direction: column;
     background: var(--glass-strong);
     transform-origin: bottom left;
-    animation: pop-in 180ms cubic-bezier(0.2, 0.9, 0.3, 1.3);
+    animation: pop-in var(--dur) var(--ease-spring);
   }
   .attach-menu button {
     display: flex;
@@ -233,7 +236,7 @@
   }
   .attach-menu button:hover {
     background: var(--accent);
-    color: #fff;
+    color: var(--accent-contrast);
   }
   @keyframes pop-in {
     from {

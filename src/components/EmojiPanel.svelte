@@ -262,7 +262,10 @@
     display: grid;
     place-items: center;
     border-radius: 9px;
-    transition: transform 160ms cubic-bezier(0.2, 0.9, 0.3, 1.5);
+    /* background used to snap in while the cell was still scaling */
+    transition:
+      transform var(--dur) var(--ease-spring),
+      background-color var(--dur-fast) var(--ease);
   }
   .cell:hover {
     background: var(--hover);
@@ -294,6 +297,7 @@
     color: var(--accent);
     padding: 2px 6px;
     border-radius: 5px;
+    transition: background-color var(--dur-fast) var(--ease);
   }
   .import:hover {
     background: var(--hover);
@@ -311,7 +315,10 @@
     display: grid;
     place-items: center;
     color: var(--text-3);
-    transition: color 120ms ease, transform 160ms ease;
+    transition:
+      color var(--dur-fast) var(--ease),
+      background-color var(--dur-fast) var(--ease),
+      transform var(--dur) var(--ease);
   }
   .tab:hover {
     background: var(--hover);

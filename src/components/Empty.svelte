@@ -83,7 +83,7 @@
     border-radius: 50%;
     display: grid;
     place-items: center;
-    color: #fff;
+    color: var(--accent-contrast);
     background: var(--accent);
     box-shadow: 0 4px 14px color-mix(in srgb, var(--accent) 45%, transparent);
   }
@@ -125,7 +125,7 @@
     width: 28px;
     border-radius: 7px;
     background: var(--accent);
-    color: #fff;
+    color: var(--accent-contrast);
     display: grid;
     place-items: center;
   }

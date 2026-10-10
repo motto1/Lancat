@@ -8,6 +8,13 @@
   --accent: #0a84ff;
   --accent-contrast: #fff;
   --radius: 14px;
+  /* Motion tokens: every hover/press/selected transition uses these, so an element and its
+     children (background, icon colour, scale) always move on the same clock. */
+  --dur-fast: 120ms; /* hover/press feedback: colour, background, press scale */
+  --dur: 160ms; /* hover scale, fades, small pop-ins */
+  --dur-slow: 220ms; /* toggles, knobs */
+  --ease: cubic-bezier(0.2, 0.8, 0.3, 1); /* standard ease-out */
+  --ease-spring: cubic-bezier(0.2, 0.9, 0.3, 1.4); /* slight overshoot for scale */
   --radius-sm: 9px;
 
   /* light */
@@ -151,7 +158,13 @@ textarea {
   display: inline-grid;
   place-items: center;
   color: var(--text-2);
-  transition: background-color 120ms ease, transform 120ms ease;
+  /* colour too: the stroke icon (currentColor) used to snap while the background faded */
+  transition:
+    background-color var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease),
+    transform var(--dur-fast) var(--ease);
+  /* own layer at rest as well, so the icon is not re-snapped against the background on press */
+  will-change: transform;
 }
 .icon-btn:hover {
   background: var(--hover);

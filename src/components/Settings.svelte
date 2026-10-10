@@ -370,6 +370,9 @@
     padding: 3px 12px;
     border-radius: 5px;
     font-size: 12px;
+    transition:
+      background-color var(--dur-fast) var(--ease),
+      box-shadow var(--dur-fast) var(--ease);
   }
   .seg button.on {
     background: var(--glass-strong);
@@ -383,6 +386,7 @@
     border: 0.5px solid var(--glass-border);
     font-size: 12px;
     box-shadow: 0 0.5px 1px rgba(0, 0, 0, 0.08);
+    transition: transform var(--dur-fast) var(--ease);
   }
   .btn:active {
     transform: scale(0.97);
@@ -423,7 +427,8 @@
     background: var(--hover);
     position: relative;
     box-shadow: inset 0 0 0 0.5px var(--glass-border);
-    transition: background-color 160ms ease;
+    /* track colour and knob travel share one duration (the track used to finish 60 ms early) */
+    transition: background-color var(--dur-slow) var(--ease);
   }
   .switch i {
     position: absolute;
@@ -434,7 +439,7 @@
     border-radius: 50%;
     background: #fff;
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
-    transition: transform 220ms cubic-bezier(0.2, 0.9, 0.3, 1.3);
+    transition: transform var(--dur-slow) var(--ease-spring);
   }
   .switch.on {
     background: var(--online);
