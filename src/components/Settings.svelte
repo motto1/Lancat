@@ -153,10 +153,10 @@
       </label>
       <label class="row">
         <span>收起后释放面板</span>
-        <input type="range" min="0" max="600" step="10" bind:value={s.panel_keep_alive_s} oninput={() => save()} />
-        <em>{s.panel_keep_alive_s === 0 ? "常驻" : `${s.panel_keep_alive_s}s`}</em>
+        <input type="range" min="0" max="7200" step="60" bind:value={s.panel_keep_alive_s} oninput={() => save()} />
+        <em>{s.panel_keep_alive_s === 0 ? "常驻" : s.panel_keep_alive_s < 60 ? `${s.panel_keep_alive_s}s` : `${Math.round(s.panel_keep_alive_s / 60)} 分钟`}</em>
       </label>
-      <p class="note">面板收起超过这个时间后会销毁网页渲染进程以节省内存（约 100MB），下次弹出时重新创建。设为 0 表示常驻：弹出更快，但内存一直占着。</p>
+      <p class="note">面板收起几秒后会先冻结（不占 CPU，内存交还系统），再次弹出几乎是瞬间；超过这个时间才彻底销毁网页进程，下次弹出要重新创建（约 0.7 秒以上）。设为 0 表示永不销毁。</p>
     </section>
 
     <section>

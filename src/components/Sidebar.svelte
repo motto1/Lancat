@@ -25,6 +25,10 @@
     menu = null;
     ui.menuOpen = false;
   }
+  // the panel collapsed with the menu open (it no longer holds the panel)
+  $effect(() => {
+    if (!ui.menuOpen && menu) menu = null;
+  });
   async function act(kind: "block" | "clear" | "forget") {
     const p = menu!.peer;
     closeMenu();

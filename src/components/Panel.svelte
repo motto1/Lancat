@@ -15,6 +15,8 @@
   import Conversation from "./Conversation.svelte";
   import Composer from "./Composer.svelte";
   import Header from "./Header.svelte";
+  import DropPicker from "./DropPicker.svelte";
+  import { liquid } from "../lib/liquid";
   import Empty from "./Empty.svelte";
 
   let shell: HTMLElement;
@@ -70,12 +72,25 @@
   let entered = true;
   let collapseTimer: ReturnType<typeof setTimeout> | undefined;
 
+  /** What keeps the panel open after the pointer left. Only things that would lose work or that
+   *  live outside the page: pinned, a native file dialog, a drag, a half-typed message. Popovers
+   *  (emoji panel, context menu), a merely focused composer and running transfers used to count
+   *  too; they kept the panel open indefinitely, since nothing released them unless the user went
+   *  back in and closed them. They are closed by the collapse instead. */
+  function holding(): boolean {
+    return ui.pinned || ui.dialogOpen || (ui.composerFocused && ui.draft);
+  }
   function blocked(): boolean {
-    return ui.pinned || ui.composerFocused || ui.emojiOpen || ui.menuOpen || ui.dragging || app.transferring;
+    return holding() || ui.dragging;
   }
 
   function show(from: string) {
     clearTimeout(collapseTimer);
+    // opened from the message toast: go to that conversation
+    if (from.startsWith("toast:")) {
+      const id = from.slice(6);
+      if (app.peers.some((p) => p.id === id)) app.open(id);
+    }
     if (phase === "hidden" || phase === "closing") entered = from === "hover" || from === "drag";
     app.visible = true;
     setLottieActive(true);
@@ -123,6 +138,7 @@
     app.visible = false;
     setLottieActive(false); // nothing animates while hidden
     ui.emojiOpen = false;
+    ui.menuOpen = false;
     await api.hidePanel();
   }
 
@@ -151,7 +167,7 @@
 
   // the Rust side tells us when anything blocks collapsing for a while (e.g. native dialog open)
   $effect(() => {
-    api.setHold(ui.pinned || ui.composerFocused || ui.emojiOpen || ui.menuOpen || app.transferring).catch(() => {});
+    api.setHold(holding()).catch(() => {});
   });
 
   onMount(() => {
@@ -178,6 +194,23 @@
         }),
         listen<{ inside: boolean }>("panel://cursor", (e) => pointer(e.payload.inside)),
         listen("panel://collapse", () => collapse(true)),
+        listen<string>("panel://edge", (e) => (edge = e.payload)),
+        // the mouse button went up: a drag that never reached (or already left) the page is over
+        listen("panel://button-up", () => {
+          setTimeout(() => {
+            if (!ui.dragging) return;
+            uiLog("drag ended outside the page");
+            ui.dragging = false;
+            ui.dropKey = null;
+            if (!pointerInside && phase !== "hidden") scheduleCollapse();
+          }, 300);
+        }),
+        // files released on the dock strip itself go to the current conversation
+        listen<string[]>("panel://strip-drop", (e) => {
+          ui.dragging = false;
+          ui.dropKey = null;
+          dropFiles("conversation", e.payload);
+        }),
         listen<boolean>("panel://pinned", (e) => (ui.pinned = e.payload)),
         // Rust hid the window without our collapse (fallback after an unanswered collapse request):
         // resync so the next panel://show plays the open again.
@@ -286,6 +319,7 @@
   }
 
   async function dropFiles(key: string | null, paths: string[]) {
+    uiLog(`drop: ${paths.length} item(s) on ${key ?? "nothing"}`);
     if (!paths.length || !key) return;
     let targets: string[] = [];
     if (key === "all") targets = app.onlinePeers.map((p) => p.id);
@@ -322,8 +356,11 @@
         {/if}
       </section>
     </div>
+    {#if ui.dragging}
+      <DropPicker />
+    {/if}
     {#if app.toast}
-      <div class="toast">{app.toast}</div>
+      <div class="toast" use:liquid={{ radius: 12, depth: 12, blur: 5 }}>{app.toast}</div>
     {/if}
   </div>
 </div>
@@ -351,6 +388,11 @@
     flex-direction: column;
     opacity: 0;
     will-change: transform, opacity;
+  }
+  .shell.dragging > :global(header),
+  .shell.dragging > .body {
+    transform: scale(0.97);
+    transition: transform 320ms cubic-bezier(0.2, 0.9, 0.3, 1);
   }
   .body {
     flex: 1;
@@ -389,7 +431,10 @@
     max-width: 80%;
     padding: 7px 12px;
     border-radius: 10px;
-    background: rgba(0, 0, 0, 0.72);
+    background: rgba(0, 0, 0, 0.42);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.28),
+      0 6px 18px rgba(0, 0, 0, 0.18);
     color: #fff;
     font-size: 12px;
     white-space: nowrap;

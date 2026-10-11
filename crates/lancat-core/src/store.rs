@@ -18,8 +18,8 @@ pub struct Message {
     pub kind: String,
     /// Kind specific JSON (text: {text}, emoji: EmojiPayload, file: FileBody)
     pub body: serde_json::Value,
-    /// outgoing: pending | sent | delivered | transferring | done | failed
-    /// incoming: received | receiving | done | failed
+    /// outgoing: pending | sent | delivered | transferring | paused | done | failed | cancelled
+    /// incoming: received | receiving | done | failed | cancelled
     pub status: String,
     pub ts: i64,
 }
@@ -297,7 +297,20 @@ impl Store {
         Ok(v)
     }
 
-    /// Outgoing file transfers that failed / were interrupted.
+    /// The file message of a transfer with one peer.
+    pub fn message_by_transfer(&self, peer_id: &str, transfer_id: &str) -> Result<Option<Message>> {
+        Ok(self
+            .c()
+            .query_row(
+                "SELECT id,peer_id,outgoing,kind,body,status,ts FROM messages
+                 WHERE peer_id=?1 AND kind='file' AND json_extract(body,'$.transfer_id')=?2",
+                [peer_id, transfer_id],
+                row_to_msg,
+            )
+            .optional()?)
+    }
+
+    /// Outgoing file transfers that failed / were interrupted (not paused or cancelled ones).
     pub fn unfinished_files(&self, peer_id: &str) -> Result<Vec<Message>> {
         let c = self.c();
         let mut st = c.prepare(

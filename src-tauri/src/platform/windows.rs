@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::Duration;
 
 use tauri::{Manager, Runtime, WebviewWindow, WebviewWindowBuilder};
-use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2_19, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL};
+use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2_19, ICoreWebView2_3, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL};
 use windows::core::{s, w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND};
 use windows::Win32::Graphics::Dwm::{DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DWM_WINDOW_CORNER_PREFERENCE};
@@ -359,9 +359,15 @@ const WV2_DEFAULT_FEATURES: &str = "msWebOOUI,msPdfOOUI,msSmartScreenProtection"
 /// * not used: `--in-process-gpu` (−40 MB with GPU on, but a GPU fault then takes the browser
 ///   process down), `--disable-gpu-compositing` (−25 MB), `--enable-low-end-device-mode` and
 ///   `--renderer-process-limit=1` (no measurable gain).
+///
+/// 2026-10: `--disable-gpu` is no longer the default. Software compositing made every animation,
+/// blur and scroll visibly choppy (the main complaint), and the collapsed panel is now suspended
+/// with its working sets trimmed, so the GPU process costs commit, not resident memory, while
+/// hidden. `LANCAT_WV2_NOGPU=1` brings the old memory-first behaviour back.
 fn browser_args() -> String {
     env("LANCAT_WV2_ARGS").unwrap_or_else(|| {
-        format!("--disable-features={WV2_DEFAULT_FEATURES} --enable-features=NetworkServiceInProcess,NetworkServiceInProcess2 --disable-gpu")
+        let gpu = if env("LANCAT_WV2_NOGPU").as_deref() == Some("1") { " --disable-gpu" } else { "" };
+        format!("--disable-features={WV2_DEFAULT_FEATURES} --enable-features=NetworkServiceInProcess,NetworkServiceInProcess2{gpu}")
     })
 }
 
@@ -386,6 +392,96 @@ pub fn panel_visibility(win: &WebviewWindow, visible: bool) {
             }
         }
     });
+}
+
+/// Collapsed for a while: suspend the page (no timers, no rendering, no CPU) and hand the web
+/// processes' working sets back to the OS. Reopening then costs a resume and some page-ins
+/// (tens of ms) instead of a cold WebView2 start (700+ ms, much more after a long idle when the
+/// browser process and its files have left memory). Main thread only.
+pub fn panel_suspend(win: &WebviewWindow) {
+    let _ = win.with_webview(move |wv| unsafe {
+        let ctl = wv.controller();
+        let Ok(core) = ctl.CoreWebView2() else { return };
+        let _ = ctl.SetIsVisible(false);
+        let mut pid = 0u32;
+        let _ = core.BrowserProcessId(&mut pid);
+        if let Ok(c3) = core.cast::<ICoreWebView2_3>() {
+            let handler = webview2_com::TrySuspendCompletedHandler::create(Box::new(move |_err, ok| {
+                log::debug!("panel webview suspended: {ok}");
+                if pid != 0 {
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(800));
+                        trim_process_tree(pid);
+                    });
+                }
+                Ok(())
+            }));
+            let _ = c3.TrySuspend(&handler);
+        }
+    });
+}
+
+/// Undo `panel_suspend` before the panel is shown again. Main thread only.
+pub fn panel_resume(win: &WebviewWindow) {
+    let _ = win.with_webview(move |wv| unsafe {
+        let ctl = wv.controller();
+        let Ok(core) = ctl.CoreWebView2() else { return };
+        if let Ok(c3) = core.cast::<ICoreWebView2_3>() {
+            let mut suspended = windows_core::BOOL(0);
+            if c3.IsSuspended(&mut suspended).is_ok() && suspended.as_bool() {
+                let _ = c3.Resume();
+                log::debug!("panel webview resumed");
+            }
+        }
+        let _ = ctl.SetIsVisible(true);
+    });
+}
+
+/// EmptyWorkingSet on the WebView2 browser process and all its children (renderer, GPU, utility).
+fn trim_process_tree(root: u32) {
+    use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+    use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA};
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return };
+        let mut pairs = Vec::new();
+        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        if Process32FirstW(snap, &mut e).is_ok() {
+            loop {
+                pairs.push((e.th32ProcessID, e.th32ParentProcessID));
+                if Process32NextW(snap, &mut e).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = windows::Win32::Foundation::CloseHandle(snap);
+        let mut tree = vec![root];
+        let mut i = 0;
+        while i < tree.len() {
+            let p = tree[i];
+            tree.extend(pairs.iter().filter(|(_, pp)| *pp == p).map(|(c, _)| *c));
+            i += 1;
+        }
+        for pid in tree {
+            if let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA, false, pid) {
+                let _ = EmptyWorkingSet(h);
+                let _ = windows::Win32::Foundation::CloseHandle(h);
+            }
+        }
+        log::debug!("trimmed the web processes' working sets");
+    }
+}
+
+/// Shows (`Some`) or hides the invisible drop window over the panel (see native_dock::win_drop).
+pub fn drop_overlay(win: Option<&WebviewWindow>) {
+    match win.and_then(hwnd) {
+        Some(h) => crate::native_dock::overlay_show(h),
+        None => crate::native_dock::overlay_hide(),
+    }
+}
+
+pub fn drop_overlay_shown() -> bool {
+    crate::native_dock::overlay_shown()
 }
 
 /// True while the left mouse button is held anywhere (i.e. an OLE drag is in progress when the

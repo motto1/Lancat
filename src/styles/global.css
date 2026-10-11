@@ -111,6 +111,53 @@
   --glass: rgba(30, 30, 34, 0.38);
 }
 
+/* Windows has no system "liquid glass" and a page cannot sample the desktop to refract it, so on
+   top of the native Acrylic the panel gets the cues that read as glass: a bright specular rim
+   (stronger on the lit top-left), a soft top sheen, and a faint shaded lower edge. */
+:root.native-glass {
+  --sheen: rgba(255, 255, 255, 0.2);
+  --rim-top: rgba(255, 255, 255, 0.85);
+  --rim-side: rgba(255, 255, 255, 0.35);
+  --rim-low: rgba(0, 0, 0, 0.07);
+}
+@media (prefers-color-scheme: dark) {
+  :root.native-glass:not([data-theme="light"]) {
+    --sheen: rgba(255, 255, 255, 0.07);
+    --rim-top: rgba(255, 255, 255, 0.22);
+    --rim-side: rgba(255, 255, 255, 0.09);
+    --rim-low: rgba(0, 0, 0, 0.35);
+  }
+}
+:root.native-glass[data-theme="dark"] {
+  --sheen: rgba(255, 255, 255, 0.07);
+  --rim-top: rgba(255, 255, 255, 0.22);
+  --rim-side: rgba(255, 255, 255, 0.09);
+  --rim-low: rgba(0, 0, 0, 0.35);
+}
+:root.native-glass .glass {
+  /* the native Acrylic behind the page is the blur; a CSS backdrop-filter over the transparent
+     page only cost frames */
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+:root.native-glass .glass::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  border-radius: 8px; /* the DWM window corner */
+  pointer-events: none;
+  background:
+    radial-gradient(90% 55% at 12% 0%, var(--sheen), transparent 70%),
+    linear-gradient(180deg, var(--sheen) 0%, transparent 22%);
+  box-shadow:
+    inset 0 1px 0 var(--rim-top),
+    inset 1px 0 0 var(--rim-side),
+    inset -1px 0 0 var(--rim-side),
+    inset 0 -1px 0 var(--rim-low),
+    inset 0 -18px 30px -24px var(--rim-low);
+}
+
 * {
   box-sizing: border-box;
 }

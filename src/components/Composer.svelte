@@ -13,6 +13,9 @@
   let typingPeer: string | null = null;
 
   let targets = $derived(app.targets());
+  $effect(() => {
+    ui.draft = text.trim().length > 0;
+  });
   let disabled = $derived(targets.length === 0);
   let placeholder = $derived(
     disabled
@@ -76,7 +79,7 @@
   async function attach(directory: boolean) {
     attachMenu = false;
     if (disabled) return;
-    ui.menuOpen = true; // native dialog: do not collapse underneath it
+    ui.dialogOpen = true; // native dialog: do not collapse underneath it
     try {
       const sel = await openDialog({ multiple: true, directory, title: directory ? "选择要发送的文件夹" : "选择要发送的文件" });
       const paths = sel == null ? [] : Array.isArray(sel) ? sel : [sel];
@@ -87,7 +90,7 @@
     } catch (e) {
       app.flash(String(e));
     } finally {
-      ui.menuOpen = false;
+      ui.dialogOpen = false;
     }
   }
 </script>

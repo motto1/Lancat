@@ -44,8 +44,25 @@ impl Node {
         }
     }
 
+    /// Dials a second link at `ip` although one exists (moving it to a better path); the new link
+    /// replaces the old one when its handshake completes.
+    pub(crate) async fn dial_link_at(self: &Arc<Self>, peer_id: &str, ip: IpAddr) {
+        if !self.dialing.lock().unwrap().insert(peer_id.to_string()) {
+            return;
+        }
+        if let Err(e) = self.clone().dial_to(peer_id.to_string(), Some(ip)).await {
+            self.dialing.lock().unwrap().remove(peer_id);
+            log::debug!("dial {peer_id} at {ip} failed: {e}");
+        }
+    }
+
     async fn dial(self: Arc<Self>, peer_id: String) -> anyhow::Result<()> {
+        self.dial_to(peer_id, None).await
+    }
+
+    async fn dial_to(self: Arc<Self>, peer_id: String, at: Option<IpAddr>) -> anyhow::Result<()> {
         let (ip, port) = self.peer_addr(&peer_id).ok_or_else(|| anyhow::anyhow!("no address"))?;
+        let ip = at.unwrap_or(ip);
         let url = format!("ws://{}/ws", fmt_sa(&SocketAddr::new(ip, port)));
         let mut req = url.into_client_request()?;
         req.headers_mut().insert(HEADER_DEVICE_ID, self.me().id.parse()?);

@@ -26,6 +26,10 @@
     return "doc";
   }
 
+  function act(f: (id: string) => Promise<void>) {
+    f(m.id).catch((e) => app.flash(String(e)));
+  }
+
   function statusLabel(): string {
     switch (m.status) {
       case "transferring":
@@ -34,6 +38,10 @@
         return "接收中";
       case "done":
         return m.outgoing ? "已送达" : "已保存";
+      case "paused":
+        return "已暂停";
+      case "cancelled":
+        return m.body?.error ? `已取消：${m.body.error}` : "已取消";
       case "failed":
         return m.body?.error ? `失败：${m.body.error}` : "失败";
       default:
@@ -52,23 +60,30 @@
       <Sticker emoji={{ kind: "noto", code: solo.code, alt: solo.char }} size={160} />
     </div>
   {:else if m.kind === "file"}
-    <div class="file" class:failed={m.status === "failed"}>
+    <div class="file" class:failed={m.status === "failed"} class:cancelled={m.status === "cancelled"}>
       <div class="ficon"><Icon name={fileIcon(m.body?.name ?? "")} size={22} stroke={1.5} /></div>
       <div class="finfo">
         <div class="fname selectable" title={m.body?.name}>{m.body?.name}</div>
         <div class="fmeta">
           {formatSize(m.body?.size ?? 0)}
-          {#if m.status === "transferring" || m.status === "receiving"}
+          {#if m.status === "transferring" || m.status === "receiving" || (m.status === "paused" && prog)}
             · {Math.floor(pct * 100)}%
           {/if}
           · <span class="st">{statusLabel()}</span>
         </div>
-        {#if m.status === "transferring" || m.status === "receiving"}
-          <div class="bar"><div class="fill" style:transform="scaleX({pct})"></div></div>
+        {#if m.status === "transferring" || m.status === "receiving" || (m.status === "paused" && prog)}
+          <div class="bar" class:paused={m.status === "paused"}><div class="fill" style:transform="scaleX({pct})"></div></div>
         {/if}
       </div>
-      {#if m.status === "failed" && m.outgoing}
-        <button class="icon-btn" title="重试（断点续传）" onclick={() => api.retry(m.id)}><Icon name="retry" size={15} /></button>
+      {#if m.outgoing && m.status === "transferring"}
+        <button class="icon-btn" title="暂停" onclick={() => act(api.pauseTransfer)}><Icon name="pause" size={15} /></button>
+      {:else if m.outgoing && m.status === "paused"}
+        <button class="icon-btn" title="继续（断点续传）" onclick={() => act(api.retry)}><Icon name="play" size={14} /></button>
+      {:else if m.outgoing && m.status === "failed"}
+        <button class="icon-btn" title="重试（断点续传）" onclick={() => act(api.retry)}><Icon name="retry" size={15} /></button>
+      {/if}
+      {#if (m.outgoing && ["transferring", "paused", "failed"].includes(m.status)) || (!m.outgoing && ["receiving", "failed"].includes(m.status))}
+        <button class="icon-btn" title="取消传输" onclick={() => act(api.cancelTransfer)}><Icon name="x" size={15} /></button>
       {:else if m.status === "done" && m.body?.path}
         <button class="icon-btn" title="在文件夹中显示" onclick={() => api.reveal(m.body.path).catch((e) => app.flash(String(e)))}>
           <Icon name="reveal" size={15} />
@@ -153,6 +168,12 @@
   }
   .file.failed {
     border-color: color-mix(in srgb, var(--danger) 50%, transparent);
+  }
+  .file.cancelled {
+    opacity: 0.6;
+  }
+  .bar.paused .fill {
+    background: var(--text-2, #8e8e93);
   }
   .ficon {
     width: 34px;

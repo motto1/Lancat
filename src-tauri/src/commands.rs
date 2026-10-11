@@ -86,6 +86,16 @@ pub async fn retry_transfer(core: State<'_, Core>, msg_id: String) -> R<()> {
 }
 
 #[tauri::command]
+pub fn pause_transfer(core: State<'_, Core>, msg_id: String) -> R<()> {
+    core.0.pause_transfer(&msg_id).map_err(e)
+}
+
+#[tauri::command]
+pub fn cancel_transfer(core: State<'_, Core>, msg_id: String) -> R<()> {
+    core.0.cancel_transfer(&msg_id).map_err(e)
+}
+
+#[tauri::command]
 pub fn clear_history(core: State<'_, Core>, peer_id: Option<String>) -> R<()> {
     core.0.clear_history(peer_id.as_deref()).map_err(e)
 }
@@ -93,6 +103,12 @@ pub fn clear_history(core: State<'_, Core>, peer_id: Option<String>) -> R<()> {
 #[tauri::command]
 pub fn delete_message(core: State<'_, Core>, id: String) -> R<()> {
     core.0.delete_message(&id).map_err(e)
+}
+
+/// The left button went down on the panel header: drag to move the dock.
+#[tauri::command]
+pub fn dock_move_start(app: AppHandle) {
+    crate::dock::begin_move(&app, false);
 }
 
 #[tauri::command]

@@ -168,6 +168,22 @@ struct Sidecar {
     have: BTreeSet<u64>,
 }
 
+/// Deletes the partial data of a transfer (`.part` + progress sidecar). False while the part file
+/// is still open (Windows), so callers retry once in-flight chunk writes are done.
+pub fn discard_partial(recv_dir: &Path, transfer_id: &str) -> bool {
+    if transfer_id.is_empty() || !transfer_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return true;
+    }
+    let dir = recv_dir.join(PART_DIR);
+    let gone = |p: PathBuf| match fs::remove_file(&p) {
+        Ok(()) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    };
+    let a = gone(dir.join(format!("{transfer_id}.part")));
+    let b = gone(dir.join(format!("{transfer_id}.json")));
+    a && b
+}
+
 /// Receiver side of a resumable transfer. Data goes to `<recv>/.lancat-part/<tid>.part`
 /// and progress to `<tid>.json`; both survive restarts so the sender can resume.
 pub struct IncomingTransfer {

@@ -47,9 +47,17 @@ mod linux;
 pub use self::linux::{create, place, set_visual, show};
 
 #[cfg(target_os = "windows")]
+mod win_drop;
+#[cfg(target_os = "windows")]
+mod win_toast;
+#[cfg(target_os = "windows")]
+pub use self::win_toast::{dismiss as toast_dismiss, show as toast_show, ToastSpec};
+#[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
 pub use self::windows::{create, place, set_visual, show};
+#[cfg(target_os = "windows")]
+pub use self::win_drop::{overlay_hide, overlay_show, overlay_shown};
 
 #[cfg(target_os = "macos")]
 mod macos;

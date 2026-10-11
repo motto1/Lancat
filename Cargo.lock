@@ -2196,6 +2196,7 @@ dependencies = [
  "window-vibrancy 0.6.0",
  "windows 0.61.3",
  "windows-core 0.62.2",
+ "windows-numerics 0.2.0",
 ]
 
 [[package]]

@@ -121,6 +121,8 @@ export const api = {
   typing: (peerId: string, typing: boolean) => invoke<void>("send_typing", { peerId, typing }),
   markRead: (peerId: string) => invoke<void>("mark_read", { peerId }),
   retry: (msgId: string) => invoke<void>("retry_transfer", { msgId }),
+  pauseTransfer: (msgId: string) => invoke<void>("pause_transfer", { msgId }),
+  cancelTransfer: (msgId: string) => invoke<void>("cancel_transfer", { msgId }),
   clearHistory: (peerId: string | null) => invoke<void>("clear_history", { peerId }),
   deleteMessage: (id: string) => invoke<void>("delete_message", { id }),
   settings: () => invoke<Settings>("get_settings"),
@@ -138,6 +140,7 @@ export const api = {
   openPanel: (reason: string) => invoke<void>("cmd_open_panel", { reason }),
   hidePanel: () => invoke<void>("cmd_hide_panel"),
   setPinned: (pinned: boolean) => invoke<void>("set_pinned", { pinned }),
+  dockMoveStart: () => invoke<void>("dock_move_start"),
   panelState: () => invoke<{ visible: boolean; pinned: boolean; edge: string; reason: string }>("panel_state"),
   panelShown: () =>
     invoke<void>("panel_shown", {

@@ -2,7 +2,8 @@
 //!
 //! * hover: WM_MOUSEMOVE + TrackMouseEvent(TME_LEAVE) + a SetTimer for `hover_delay_ms`;
 //! * file drags: OLE drags do not deliver WM_MOUSEMOVE to other windows, so they are sensed by the
-//!   cursor poller in dock.rs (cursor inside the strip + `GetAsyncKeyState(VK_LBUTTON)`);
+//!   cursor poller in dock.rs (cursor inside the strip + `GetAsyncKeyState(VK_LBUTTON)`); the strip
+//!   is also an OLE drop target (`win_drop`) so the drag shows a copy cursor, not "no entry";
 //! * look: drawn into a premultiplied 32-bit DIB and pushed with `UpdateLayeredWindow` (per-pixel
 //!   alpha), so the rounded ends are anti-aliased at any DPI (a window region is 1-bit: stair-
 //!   stepped corners at 150 %) and fully transparent pixels stay click-through. Same shape as the
@@ -122,6 +123,7 @@ pub fn create(app: &AppHandle) {
             log::warn!("native dock: CreateWindowExW failed");
             return;
         };
+        super::win_drop::register(app, hwnd);
         let idle = Look { thick: IDLE_THICK, alpha: IDLE_ALPHA };
         STATE.with(|s| {
             *s.borrow_mut() =
@@ -146,6 +148,18 @@ pub fn show() {
     with(|s| unsafe {
         render(s);
         let _ = ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
+    });
+}
+
+/// Hidden while the message toast stands in for the strip.
+pub fn set_hidden(hidden: bool) {
+    with(|s| unsafe {
+        if hidden {
+            let _ = ShowWindow(s.hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
+        } else {
+            render(s);
+            let _ = ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
+        }
     });
 }
 
@@ -371,8 +385,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             return LRESULT(0);
         }
         WM_LBUTTONDOWN => {
+            // a click opens the panel, a drag moves the dock (decided by dock::move_tick)
             if let Some(a) = app {
-                crate::dock::open_panel(a, "hover");
+                crate::dock::begin_move(a, true);
             }
             return LRESULT(0);
         }

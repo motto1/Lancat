@@ -87,6 +87,9 @@ pub enum WsMsg {
     Pong,
     /// Clean exit: the sender is going away, mark it offline immediately.
     Bye,
+    /// Either side gave up a file transfer: the sender stops, the receiver drops the partial file.
+    /// Older peers ignore it (unknown messages are skipped on the link).
+    FileCancel { transfer_id: String },
 }
 
 /// POST /files/{transfer_id}

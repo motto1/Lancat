@@ -3,7 +3,7 @@
 use std::fs::File;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,12 +11,60 @@ use anyhow::{anyhow, bail, Result};
 use futures_util::{stream, StreamExt};
 
 use crate::events::CoreEvent;
-use crate::files::{expand_paths, hash_file, read_at};
+use crate::files::{discard_partial, expand_paths, hash_file, read_at};
 use crate::node::{fmt_sa, json_body, Node};
 use crate::protocol::*;
 use crate::store::{FileBody, Message};
 
 pub const PARALLEL_CHUNKS: usize = 4;
+
+const RUN: u8 = 0;
+const PAUSE: u8 = 1;
+const CANCEL: u8 = 2;
+const PEER_CANCEL: u8 = 3;
+
+/// Stop switch of one running outgoing transfer. Stopping drops the transfer future, which aborts
+/// the requests in flight; the receiver keeps what it has, so a paused transfer resumes from there.
+#[derive(Default)]
+pub(crate) struct TransferCtl {
+    state: AtomicU8,
+    notify: tokio::sync::Notify,
+}
+
+impl TransferCtl {
+    fn stop(&self, how: u8) {
+        self.state.store(how, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    fn get(&self) -> u8 {
+        self.state.load(Ordering::SeqCst)
+    }
+
+    async fn stopped(&self) {
+        loop {
+            let n = self.notify.notified();
+            tokio::pin!(n);
+            n.as_mut().enable();
+            if self.get() != RUN {
+                return;
+            }
+            n.await;
+        }
+    }
+}
+
+/// The receiver answered 410: it cancelled this transfer.
+#[derive(Debug)]
+struct PeerCancelled;
+
+impl std::fmt::Display for PeerCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("对方已取消")
+    }
+}
+
+impl std::error::Error for PeerCancelled {}
 
 impl Node {
     /// Sends files and folders (recursively) to each peer. Returns the created messages.
@@ -62,6 +110,10 @@ impl Node {
 
     /// Retries a failed outgoing transfer (resumes where the receiver left off).
     pub async fn retry_transfer(self: &Arc<Self>, msg_id: &str) -> Result<()> {
+        let m = self.store.message(msg_id)?.ok_or_else(|| anyhow!("message gone"))?;
+        if m.status == "paused" {
+            self.set_status(msg_id, "transferring");
+        }
         let node = self.clone();
         let id = msg_id.to_string();
         tokio::spawn(async move { node.run_transfer(id).await });
@@ -73,25 +125,127 @@ impl Node {
         if !self.active_out.lock().unwrap().insert(msg_id.clone()) {
             return;
         }
-        let res = self.transfer_inner(&msg_id).await;
+        let ctl = Arc::new(TransferCtl::default());
+        {
+            // under the lock: a pause/cancel either sees this switch or already parked the message
+            let mut ctls = self.out_ctl.lock().unwrap();
+            let parked = !matches!(self.store.message(&msg_id), Ok(Some(m)) if matches!(m.status.as_str(), "transferring" | "failed" | "pending"));
+            if parked {
+                drop(ctls);
+                self.active_out.lock().unwrap().remove(&msg_id);
+                return;
+            }
+            ctls.insert(msg_id.clone(), ctl.clone());
+        }
+        let res = tokio::select! {
+            r = self.transfer_inner(&msg_id) => r,
+            _ = ctl.stopped() => Err(anyhow!("stopped")),
+        };
+        self.out_ctl.lock().unwrap().remove(&msg_id);
         self.active_out.lock().unwrap().remove(&msg_id);
         let Ok(Some(m)) = self.store.message(&msg_id) else { return };
         let mut body: FileBody = serde_json::from_value(m.body.clone()).unwrap_or_default();
-        match res {
-            Ok(()) => {
-                body.error = None;
-                if let Ok(Some(m)) = self.store.update_message(&msg_id, "done", Some(&serde_json::to_value(&body).unwrap_or_default())) {
-                    self.emit(CoreEvent::MessageUpdate { message: m });
-                }
+        let (status, error) = match res {
+            Ok(()) => ("done", None),
+            Err(_) if ctl.get() == PAUSE => {
+                log::info!("transfer {msg_id} paused");
+                ("paused", None)
+            }
+            Err(_) if ctl.get() == CANCEL => {
+                log::info!("transfer {msg_id} cancelled");
+                self.send_over_link(&m.peer_id, &WsMsg::FileCancel { transfer_id: body.transfer_id.clone() });
+                ("cancelled", None)
+            }
+            Err(e) if ctl.get() == PEER_CANCEL || e.downcast_ref::<PeerCancelled>().is_some() => {
+                log::info!("transfer {msg_id} cancelled by the receiver");
+                ("cancelled", Some(PeerCancelled.to_string()))
             }
             Err(e) => {
                 log::warn!("transfer {msg_id} failed: {e:#}");
-                body.error = Some(e.to_string());
-                if let Ok(Some(m)) = self.store.update_message(&msg_id, "failed", Some(&serde_json::to_value(&body).unwrap_or_default())) {
-                    self.emit(CoreEvent::MessageUpdate { message: m });
-                }
+                ("failed", Some(e.to_string()))
             }
+        };
+        body.error = error;
+        if let Ok(Some(m)) = self.store.update_message(&msg_id, status, Some(&serde_json::to_value(&body).unwrap_or_default())) {
+            self.emit(CoreEvent::MessageUpdate { message: m });
         }
+    }
+
+    /// Pauses an outgoing transfer. A paused one is not resumed on its own (reconnect, restart);
+    /// `retry_transfer` continues it where the receiver left off.
+    pub fn pause_transfer(&self, msg_id: &str) -> Result<()> {
+        let ctls = self.out_ctl.lock().unwrap();
+        if let Some(c) = ctls.get(msg_id) {
+            c.stop(PAUSE);
+            return Ok(());
+        }
+        // not running right now (peer offline, failed): park it so it is not picked up again
+        let m = self.store.message(msg_id)?.ok_or_else(|| anyhow!("message gone"))?;
+        if m.outgoing && m.kind == "file" && matches!(m.status.as_str(), "transferring" | "failed" | "pending") {
+            self.set_status(msg_id, "paused");
+        }
+        Ok(())
+    }
+
+    /// Cancels a transfer in either direction and tells the other side.
+    pub fn cancel_transfer(&self, msg_id: &str) -> Result<()> {
+        let m = self.store.message(msg_id)?.ok_or_else(|| anyhow!("message gone"))?;
+        if m.kind != "file" || matches!(m.status.as_str(), "done" | "cancelled") {
+            return Ok(());
+        }
+        let body: FileBody = serde_json::from_value(m.body.clone()).unwrap_or_default();
+        let ctls = self.out_ctl.lock().unwrap();
+        if m.outgoing {
+            if let Some(c) = ctls.get(msg_id) {
+                c.stop(CANCEL); // run_transfer records it and tells the receiver
+                return Ok(());
+            }
+        } else {
+            self.drop_incoming(&body.transfer_id);
+        }
+        self.set_status(msg_id, "cancelled");
+        drop(ctls);
+        self.send_over_link(&m.peer_id, &WsMsg::FileCancel { transfer_id: body.transfer_id });
+        Ok(())
+    }
+
+    /// The other side cancelled `transfer_id`.
+    pub(crate) fn peer_cancelled(&self, peer_id: &str, transfer_id: &str) {
+        let Ok(Some(m)) = self.store.message_by_transfer(peer_id, transfer_id) else { return };
+        if matches!(m.status.as_str(), "done" | "cancelled") {
+            return;
+        }
+        if m.outgoing {
+            if let Some(c) = self.out_ctl.lock().unwrap().get(&m.id) {
+                c.stop(PEER_CANCEL);
+                return;
+            }
+            let mut body: FileBody = serde_json::from_value(m.body.clone()).unwrap_or_default();
+            body.error = Some(PeerCancelled.to_string());
+            if let Ok(Some(m)) = self.store.update_message(&m.id, "cancelled", Some(&serde_json::to_value(&body).unwrap_or_default())) {
+                self.emit(CoreEvent::MessageUpdate { message: m });
+            }
+        } else {
+            self.drop_incoming(transfer_id);
+            self.set_status(&m.id, "cancelled");
+        }
+    }
+
+    /// Forgets an incoming transfer and deletes its partial data (retried while chunk writes that
+    /// are still in flight keep the part file open).
+    fn drop_incoming(&self, transfer_id: &str) {
+        self.incoming.lock().unwrap().remove(transfer_id);
+        let dir = self.receive_dir();
+        let tid = transfer_id.to_string();
+        self.rt.spawn(async move {
+            for _ in 0..20 {
+                if discard_partial(&dir, &tid) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            log::warn!("could not delete the partial data of transfer {tid}");
+        });
     }
 
     async fn transfer_inner(self: &Arc<Self>, msg_id: &str) -> Result<()> {
@@ -144,6 +298,9 @@ impl Node {
                 .timeout(Duration::from_secs(15))
                 .send()
                 .await?;
+            if resp.status() == reqwest::StatusCode::GONE {
+                return Err(PeerCancelled.into());
+            }
             if !resp.status().is_success() {
                 let code = resp.status();
                 bail!("对方拒绝: {} {}", code, resp.text().await.unwrap_or_default());
@@ -191,6 +348,7 @@ impl Node {
                                     last_err = None;
                                     break;
                                 }
+                                Ok(r) if r.status() == reqwest::StatusCode::GONE => return Err(PeerCancelled.into()),
                                 Ok(r) => last_err = Some(anyhow!("chunk {idx}: HTTP {}", r.status())),
                                 Err(e) => last_err = Some(anyhow!("chunk {idx}: {e}")),
                             }

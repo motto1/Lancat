@@ -101,8 +101,12 @@ pub struct Node {
     pub(crate) peers: RwLock<HashMap<String, PeerState>>,
     pub(crate) links: Mutex<HashMap<String, Link>>,
     pub(crate) dialing: Mutex<HashSet<String>>,
+    /// `peer@ip` -> last attempt to move a link onto that LAN address
+    pub(crate) upgrade_tries: Mutex<HashMap<String, Instant>>,
     pub(crate) incoming: Mutex<HashMap<String, Arc<IncomingTransfer>>>,
     pub(crate) active_out: Mutex<HashSet<String>>,
+    /// Pause / cancel switches of the outgoing transfers that are running right now.
+    pub(crate) out_ctl: Mutex<HashMap<String, Arc<crate::transfer::TransferCtl>>>,
     pub(crate) http: reqwest::Client,
     pub(crate) conn_seq: AtomicU64,
     pub(crate) mdns: Mutex<Option<crate::discovery::Mdns>>,
@@ -158,8 +162,10 @@ impl Node {
             peers: RwLock::new(HashMap::new()),
             links: Mutex::new(HashMap::new()),
             dialing: Mutex::new(HashSet::new()),
+            upgrade_tries: Mutex::new(HashMap::new()),
             incoming: Mutex::new(HashMap::new()),
             active_out: Mutex::new(HashSet::new()),
+            out_ctl: Mutex::new(HashMap::new()),
             http,
             conn_seq: AtomicU64::new(1),
             mdns: Mutex::new(None),
@@ -275,6 +281,7 @@ impl Node {
         if info.id == self.me().id || info.id.is_empty() {
             return;
         }
+        let mut upgrade: Option<(IpAddr, IpAddr)> = None;
         let (changed, came_online) = {
             let mut peers = self.peers.write().unwrap();
             match peers.get_mut(&info.id) {
@@ -285,6 +292,11 @@ impl Node {
                     // interface (a second subnet, a VM bridge) must not move the peer.
                     let linked = self.links.lock().unwrap().contains_key(&info.id);
                     let fresh = p.online && p.last_seen.elapsed() < Duration::from_secs(120);
+                    // ... except that a LAN address of one of our physical networks beats an overlay
+                    // (Tailscale) path even while linked: the link is moved over (`upgrade_link`).
+                    if fresh && linked && addr_rank(&addr) == 0 && addr_rank(&p.addr) > 0 {
+                        upgrade = Some((p.addr, addr));
+                    }
                     let addr = if fresh && (linked || addr_rank(&addr) > addr_rank(&p.addr)) { p.addr } else { addr };
                     let changed = p.info != info || p.addr != addr || !p.online;
                     let came_online = !p.online;
@@ -305,6 +317,9 @@ impl Node {
             let _ = self.store.upsert_device(&info, &addr.to_string(), now_ms());
             self.emit_peer(&info.id);
         }
+        if let Some((from, to)) = upgrade {
+            self.maybe_upgrade_link(&info.id, from, to, info.port);
+        }
         if came_online {
             log::info!("peer online: {} ({}) at {}:{}", info.name, info.id, addr, info.port);
             let node = self.clone();
@@ -320,6 +335,36 @@ impl Node {
                 node.flush_peer(&id).await;
             });
         }
+    }
+
+    /// A linked peer runs over an overlay address (`from`, e.g. Tailscale) but was just heard on a
+    /// LAN address (`to`). If `to` is on one of our physical (non-virtual) networks and answers,
+    /// dial a new link there; it replaces the old one (both ends keep the newest link). Only the
+    /// designated dialer does this, so both ends never race two replacement links.
+    fn maybe_upgrade_link(self: &Arc<Self>, id: &str, from: IpAddr, to: IpAddr, port: u16) {
+        if self.me().id.as_str() >= id || !on_physical_lan(&to) {
+            return;
+        }
+        {
+            let mut tried = self.upgrade_tries.lock().unwrap();
+            let key = format!("{id}@{to}");
+            if tried.get(&key).is_some_and(|t| t.elapsed() < Duration::from_secs(120)) {
+                return;
+            }
+            tried.insert(key, Instant::now());
+        }
+        let node = self.clone();
+        let id = id.to_string();
+        self.rt.spawn(async move {
+            let sa = SocketAddr::new(to, port);
+            let ok = matches!(tokio::time::timeout(Duration::from_millis(1500), tokio::net::TcpStream::connect(sa)).await, Ok(Ok(_)));
+            if !ok {
+                log::debug!("{id}: LAN address {to} not reachable, staying on {from}");
+                return;
+            }
+            log::info!("{id}: moving the link from {from} to LAN {to}");
+            node.dial_link_at(&id, to).await;
+        });
     }
 
     pub(crate) fn set_peer_addr(&self, id: &str, ip: IpAddr) {
@@ -748,6 +793,10 @@ impl Node {
                 self.peer_bye(peer_id, "bye");
                 None
             }
+            WsMsg::FileCancel { transfer_id } => {
+                self.peer_cancelled(peer_id, &transfer_id);
+                None
+            }
         }
     }
 
@@ -804,6 +853,19 @@ impl Node {
 }
 
 /// Path preference when a peer answers on several addresses: LAN < overlay (CGNAT, Tailscale).
+/// `ip` lies in the subnet of one of our physical network interfaces (not Tailscale, VMs,
+/// containers or VPNs).
+fn on_physical_lan(ip: &IpAddr) -> bool {
+    let IpAddr::V4(v4) = ip else { return false };
+    netutil::probe_ifaces().iter().any(|i| {
+        if i.is_tailscale() || netutil::is_virtual_iface(&i.name) || i.prefix == 0 || i.prefix >= 31 {
+            return false;
+        }
+        let mask = u32::MAX << (32 - i.prefix as u32);
+        u32::from(*v4) & mask == u32::from(i.ip) & mask
+    })
+}
+
 fn addr_rank(ip: &IpAddr) -> u8 {
     match ip {
         IpAddr::V4(v4) if netutil::is_cgnat(v4) => 1,

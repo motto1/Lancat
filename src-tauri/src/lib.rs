@@ -128,6 +128,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             commands::ui_log,
+            commands::dock_move_start,
             commands::get_me,
             commands::list_peers,
             commands::refresh_peers,
@@ -138,6 +139,8 @@ pub fn run() {
             commands::send_typing,
             commands::mark_read,
             commands::retry_transfer,
+            commands::pause_transfer,
+            commands::cancel_transfer,
             commands::clear_history,
             commands::delete_message,
             commands::get_settings,
@@ -190,6 +193,10 @@ pub fn run() {
                     match rx.recv().await {
                         Ok(ev) => {
                             let _ = handle.emit(EVENT, &ev);
+                            if let lancat_core::CoreEvent::Message { message } = &ev {
+                                let (h, m) = (handle.clone(), message.clone());
+                                let _ = handle.run_on_main_thread(move || dock::on_incoming(&h, &m));
+                            }
                             if matches!(ev, lancat_core::CoreEvent::Peer { .. } | lancat_core::CoreEvent::HistoryCleared { .. }) {
                                 tray::update_unread(&handle);
                                 let h = handle.clone();

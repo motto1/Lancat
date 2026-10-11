@@ -105,6 +105,11 @@ async fn msg(State(node): St, ConnectInfo(addr): ConnectInfo<SocketAddr>, h: Hea
     }
 }
 
+/// This side cancelled the transfer: the sender must stop instead of retrying.
+fn cancelled_here(node: &Node, from: &str, tid: &str) -> bool {
+    matches!(node.store.message_by_transfer(from, tid), Ok(Some(m)) if m.status == "cancelled")
+}
+
 fn err500(e: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
@@ -113,6 +118,9 @@ async fn file_init(State(node): St, Path(tid): Path<String>, h: HeaderMap, Json(
     let from = sender(&h)?;
     if m.transfer_id != tid || m.from != from {
         return Err((StatusCode::BAD_REQUEST, "manifest mismatch".into()));
+    }
+    if cancelled_here(&node, &from, &tid) {
+        return Err((StatusCode::GONE, "cancelled".into()));
     }
     let max_mb = node.store.settings().max_file_mb;
     if max_mb > 0 && m.size > max_mb * 1024 * 1024 {
@@ -149,7 +157,12 @@ async fn file_status(State(node): St, Path(tid): Path<String>) -> Result<Json<Tr
 
 async fn file_chunk(State(node): St, Path((tid, chunk)): Path<(String, u64)>, h: HeaderMap, body: Bytes) -> Result<StatusCode, (StatusCode, String)> {
     let from = sender(&h)?;
-    let t = node.incoming.lock().unwrap().get(&tid).cloned().ok_or((StatusCode::NOT_FOUND, "unknown transfer".into()))?;
+    let Some(t) = node.incoming.lock().unwrap().get(&tid).cloned() else {
+        if cancelled_here(&node, &from, &tid) {
+            return Err((StatusCode::GONE, "cancelled".into()));
+        }
+        return Err((StatusCode::NOT_FOUND, "unknown transfer".into()));
+    };
     if t.manifest.from != from {
         return Err((StatusCode::FORBIDDEN, "not your transfer".into()));
     }

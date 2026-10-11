@@ -35,14 +35,21 @@
     setTimeout(() => (refreshing = false), 3200);
   }
 
+  // press on the header (not a button) and drag: moves the dock to any edge / position
+  function onPress(e: PointerEvent) {
+    if (e.button !== 0 || (e.target as HTMLElement).closest("button")) return;
+    e.preventDefault();
+    api.dockMoveStart();
+  }
+
   function togglePin() {
     ui.pinned = !ui.pinned;
     api.setPinned(ui.pinned);
   }
 </script>
 
-<header data-tauri-drag-region>
-  <div class="titles" data-tauri-drag-region>
+<header onpointerdown={onPress} title="拖动可移动到屏幕任意边缘">
+  <div class="titles">
     <div class="title">{title}</div>
     <div class="sub" class:typing={subtitle === "正在输入…"}>{subtitle}</div>
   </div>
