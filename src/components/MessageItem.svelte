@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { api, formatSize, type Message } from "../lib/api";
+  import { api, failureInfo, formatSize, type Message } from "../lib/api";
   import { app } from "../lib/state.svelte";
   import { soloEmoji } from "../lib/emoji";
   import { emojiByChar } from "../lib/lottie";
@@ -19,6 +19,8 @@
     return { char: s.char, code: emojiByChar(s.char)?.code ?? s.code };
   });
   let prog = $derived(app.progress[m.id]);
+  /** A failed transfer with a known cause: short reason + what to do. */
+  let failure = $derived(m.kind === "file" && m.status === "failed" ? failureInfo(m.body?.code) : null);
   let pct = $derived(prog && prog.total > 0 ? prog.done / prog.total : m.status === "done" ? 1 : 0);
 
   function fileIcon(name: string): string {
@@ -47,6 +49,7 @@
       case "cancelled":
         return m.body?.error ? `已取消：${m.body.error}` : "已取消";
       case "failed":
+        if (failure) return `失败：${failure.reason}`;
         return m.body?.error ? `失败：${m.body.error}` : "失败";
       default:
         return "";
@@ -73,8 +76,14 @@
           {#if m.status === "transferring" || m.status === "receiving" || (m.status === "paused" && prog)}
             · {Math.floor(pct * 100)}%
           {/if}
-          · <span class="st">{statusLabel()}</span>
+          · <span class="st" title={m.status === "failed" ? (m.body?.error ?? "") : undefined}>{statusLabel()}</span>
         </div>
+        {#if failure && (failure.hint || failure.local)}
+          <div class="why">
+            {failure.hint}
+            {#if failure.local}<button class="fixlink" onclick={() => api.openDiagnostics().catch(() => {})}>去修复</button>{/if}
+          </div>
+        {/if}
         {#if m.status === "transferring" || m.status === "receiving" || (m.status === "paused" && prog)}
           <div class="bar" class:paused={m.status === "paused"}><div class="fill" style:transform="scaleX({pct})"></div></div>
         {/if}
@@ -211,6 +220,24 @@
   }
   .failed .st {
     color: var(--danger);
+  }
+  .why {
+    margin-top: 3px;
+    font-size: 10.5px;
+    line-height: 1.4;
+    color: var(--text-2);
+    white-space: normal;
+    word-break: break-word;
+  }
+  .fixlink {
+    margin-left: 2px;
+    padding: 0;
+    font-size: 10.5px;
+    font-weight: 500;
+    color: var(--accent);
+  }
+  .fixlink:hover {
+    text-decoration: underline;
   }
   .bar {
     margin-top: 5px;

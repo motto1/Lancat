@@ -38,6 +38,8 @@ export interface FileBody {
   path: string;
   hash: string;
   error?: string | null;
+  /** Why it failed, machine-readable (see `failureInfo`). */
+  code?: string | null;
 }
 
 export interface Message {
@@ -75,7 +77,67 @@ export type CoreEvent =
   | { type: "typing"; peer_id: string; typing: boolean }
   | { type: "progress"; msg_id: string; peer_id: string; done: number; total: number; outgoing: boolean }
   | { type: "history_cleared"; peer_id: string | null }
-  | { type: "settings"; settings: Settings };
+  | { type: "settings"; settings: Settings }
+  | { type: "alert"; kind: string; report?: InboundReport | null; detail: string };
+
+export interface InboundReport {
+  peer_id: string;
+  peer_name: string;
+  addr: string;
+  port: number;
+  ts: number;
+}
+
+export type CheckStatus = "ok" | "warn" | "error" | "unknown";
+
+export interface FixInfo {
+  id: string;
+  label: string;
+  admin: boolean;
+  confirm?: string;
+}
+
+export interface DiagCheck {
+  id: string;
+  title: string;
+  status: CheckStatus;
+  summary: string;
+  detail: string[];
+  help?: string;
+  fix?: FixInfo;
+  inbound: boolean;
+}
+
+export interface Diagnostics {
+  os: string;
+  checks: DiagCheck[];
+  problems: number;
+  inbound_problem: boolean;
+  dry_run_forced: boolean;
+  ts: number;
+}
+
+export interface FixResult {
+  ok: boolean;
+  dry_run: boolean;
+  cancelled: boolean;
+  message: string;
+  commands: string[];
+  script?: string;
+  diagnostics?: Diagnostics;
+}
+
+export interface DiagAlert {
+  kind: "inbound_blocked" | "recv_dir";
+  title: string;
+  detail: string;
+  ts: number;
+}
+
+export interface DiagStatus {
+  problems: number;
+  alert: DiagAlert | null;
+}
 
 /** First-frame state injected into a freshly created panel webview (dock.rs `boot_script`). */
 export interface Boot {
@@ -156,7 +218,53 @@ export const api = {
   monitors: () => invoke<MonitorInfo[]>("list_monitors"),
   autostart: () => invoke<boolean>("autostart_enabled"),
   setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),
+  // permissions & diagnostics
+  diagnostics: () => invoke<Diagnostics>("get_diagnostics"),
+  runFix: (id: string, dryRun: boolean) => invoke<FixResult>("run_fix", { id, dryRun }),
+  diagStatus: () => invoke<DiagStatus>("diag_status"),
+  dismissAlert: () => invoke<void>("dismiss_alert"),
+  openDiagnostics: () => invoke<void>("open_diagnostics"),
+  diagTakeGoto: () => invoke<boolean>("diag_take_goto"),
 };
+
+export function onDiag(cb: (s: DiagStatus) => void): Promise<UnlistenFn> {
+  return listen<DiagStatus>("lancat://diag", (e) => cb(e.payload));
+}
+
+/** What a failed transfer's `code` means for the user: a short reason, what to do, and whether
+ *  the fix is on this device (then the card offers "去修复"). */
+export function failureInfo(code: string | null | undefined): { reason: string; hint: string; local?: boolean } | null {
+  switch (code) {
+    case "peer_offline":
+      return { reason: "对方不在线", hint: "等对方上线后点重试，会从断点继续" };
+    case "peer_inbound_blocked":
+      return { reason: "对方的防火墙拦截了连接", hint: "在对方电脑上打开 Lancat 设置 →「权限与诊断」点修复（或把对方的网络设为专用），然后重试" };
+    case "peer_outdated":
+      return { reason: "对方版本较旧且入站被拦", hint: "请对方更新 Lancat，或在对方电脑上放行 Lancat 的防火墙，然后重试" };
+    case "peer_no_response":
+      return { reason: "对方长时间没有回应", hint: "对方可能休眠了或网络断开，恢复后点重试" };
+    case "link_lost":
+      return { reason: "连接中断", hint: "网络恢复后点重试，会从断点继续" };
+    case "peer_dir_unwritable":
+      return { reason: "对方无法保存文件", hint: "对方的接收目录不可写或磁盘已满，请对方在设置里换一个接收目录" };
+    case "peer_too_large":
+      return { reason: "超过对方的单文件上限", hint: "请对方在设置 →「接收」里调大单文件大小上限" };
+    case "peer_rejected":
+      return { reason: "对方拒绝接收", hint: "" };
+    case "local_dir_unwritable":
+      return { reason: "本机接收目录不可写", hint: "换一个可写的接收目录（或恢复默认的下载目录），对方重试即可", local: true };
+    case "source_missing":
+      return { reason: "源文件已不存在", hint: "文件被移动或删除了，请重新拖进来发送" };
+    case "source_unreadable":
+      return { reason: "读取源文件失败", hint: "文件可能正被其他程序占用，稍后重试" };
+    case "verify":
+      return { reason: "文件校验失败", hint: "点重试重新传输" };
+    case "network":
+      return { reason: "网络错误", hint: "检查网络后点重试" };
+    default:
+      return null;
+  }
+}
 
 export function onCore(cb: (e: CoreEvent) => void): Promise<UnlistenFn> {
   return listen<CoreEvent>("lancat://event", (e) => cb(e.payload));

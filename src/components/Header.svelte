@@ -2,6 +2,7 @@
   import { api, osGlyph } from "../lib/api";
   import { app } from "../lib/state.svelte";
   import { ui } from "../lib/ui.svelte";
+  import { diag } from "../lib/diag.svelte";
   import Icon from "./Icon.svelte";
 
   // "typing…" expires at a known time: re-render exactly then instead of ticking every second
@@ -66,8 +67,13 @@
   <button class="icon-btn" class:on={ui.pinned} title={ui.pinned ? "取消钉住" : "钉住（不自动收起）"} onclick={togglePin}>
     <Icon name="pin" size={15} />
   </button>
-  <button class="icon-btn" title="设置" onclick={() => api.openSettings()}>
+  <button
+    class="icon-btn gear"
+    title={diag.problems > 0 ? "设置（权限与诊断发现问题）" : "设置"}
+    onclick={() => (diag.problems > 0 ? api.openDiagnostics() : api.openSettings())}
+  >
     <Icon name="gear" size={15} />
+    {#if diag.problems > 0}<span class="reddot"></span>{/if}
   </button>
 </header>
 
@@ -102,6 +108,20 @@
   }
   .sub.typing {
     color: var(--accent);
+  }
+  .gear {
+    position: relative;
+  }
+  .reddot {
+    position: absolute;
+    top: 3px;
+    right: 3px;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--danger);
+    box-shadow: 0 0 0 1.5px var(--glass-strong);
+    pointer-events: none;
   }
   .icon-btn.spin {
     color: var(--accent);

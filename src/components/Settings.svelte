@@ -6,6 +6,8 @@
   import { api, onCore, osGlyph, type DeviceInfo, type MonitorInfo, type Peer, type Settings } from "../lib/api";
   import { applyTheme } from "../lib/state.svelte";
   import { EMOJI } from "../lib/emoji-catalog";
+  import { listen } from "@tauri-apps/api/event";
+  import DiagSection from "./DiagSection.svelte";
 
   let s = $state<Settings | null>(null);
   let me = $state<DeviceInfo | null>(null);
@@ -17,6 +19,17 @@
   let saved = $state(false);
   let blockedIps = $state("");
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
+  let diagEl = $state<HTMLElement | null>(null);
+  let diagSec = $state<{ recheck: () => Promise<void> } | null>(null);
+
+  /** Opened by the panel's "去修复" / red dot: bring 权限与诊断 into view and check again. */
+  function gotoDiag(recheck: boolean) {
+    requestAnimationFrame(() => diagEl?.scrollIntoView({ behavior: "smooth", block: "start" }));
+    diagEl?.classList.remove("flash");
+    void diagEl?.offsetWidth;
+    diagEl?.classList.add("flash");
+    if (recheck) diagSec?.recheck();
+  }
 
   onMount(() => {
     let un: (() => void) | undefined;
@@ -31,6 +44,11 @@
       ]);
       blockedIps = s!.blocked_ips.join("\n");
       applyTheme(s!.theme);
+      if (await api.diagTakeGoto().catch(() => false)) setTimeout(() => gotoDiag(false), 60);
+      listen("lancat://goto-diag", () => {
+        api.diagTakeGoto().catch(() => {});
+        gotoDiag(true);
+      });
       un = await onCore((e) => {
         if (e.type === "peer") {
           const i = peers.findIndex((p) => p.id === e.peer.id);
@@ -109,6 +127,10 @@
       </label>
       <div class="row info"><span>设备 ID</span><code class="selectable">{me.id}</code></div>
       <div class="row info"><span>服务端口</span><code>TCP/UDP {me.port}</code></div>
+    </section>
+
+    <section class="diag-sec" id="diag" bind:this={diagEl}>
+      <DiagSection bind:this={diagSec} />
     </section>
 
     <section>
@@ -459,6 +481,21 @@
   }
   .switch.on i {
     transform: translateX(16px);
+  }
+  .diag-sec {
+    scroll-margin-top: 12px;
+  }
+  .diag-sec:global(.flash) {
+    animation: sec-flash 1.4s var(--ease);
+  }
+  @keyframes sec-flash {
+    0%,
+    40% {
+      box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent);
+    }
+    100% {
+      box-shadow: 0 0 0 2px transparent;
+    }
   }
   .about p {
     margin: 4px 0;

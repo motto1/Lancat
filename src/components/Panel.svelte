@@ -18,6 +18,8 @@
   import DropPicker from "./DropPicker.svelte";
   import { liquid } from "../lib/liquid";
   import Empty from "./Empty.svelte";
+  import Banner from "./Banner.svelte";
+  import { diag } from "../lib/diag.svelte";
 
   let shell: HTMLElement;
   let edge = $state("right");
@@ -223,6 +225,7 @@
     // open animation right away instead of after several IPC round-trips.
     const boot = window.__LANCAT_BOOT__;
     app.init(boot).then(() => performance.mark("init"));
+    diag.init();
     if (boot?.panel) {
       ui.pinned = boot.panel.pinned;
       if (boot.panel.visible) {
@@ -394,6 +397,7 @@
 <div class="frame">
   <div class="shell glass" bind:this={shell} class:dragging={ui.dragging}>
     <Header />
+    <Banner />
     <div class="body">
       <Sidebar />
       <section class="main" data-drop="conversation" class:drop-hot={ui.dropKey === "conversation"}>
