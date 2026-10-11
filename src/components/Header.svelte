@@ -4,10 +4,17 @@
   import { ui } from "../lib/ui.svelte";
   import Icon from "./Icon.svelte";
 
+  // "typing…" expires at a known time: re-render exactly then instead of ticking every second
+  // for as long as the panel lives.
   let now = $state(Date.now());
   $effect(() => {
-    const t = setInterval(() => (now = Date.now()), 1000);
-    return () => clearInterval(t);
+    const p = app.currentPeer;
+    const until = p ? (app.typing[p.id] ?? 0) : 0;
+    const left = until - Date.now();
+    if (left <= 0) return;
+    now = Date.now();
+    const t = setTimeout(() => (now = Date.now()), left + 20);
+    return () => clearTimeout(t);
   });
 
   let title = $derived.by(() => {
