@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as TMsg;
 
+use crate::errors::ErrCode;
 use crate::node::{fmt_sa, Link, Node};
 use crate::protocol::*;
 
@@ -205,6 +206,17 @@ impl Node {
         self.set_peer_addr(&peer_id, ip);
         drop(guard); // dial finished: allow future reconnects
         log::info!("link up with {peer_id} ({})", if dialer { "dialed" } else { "accepted" });
+        if dialer {
+            // we reached the peer: nothing to check
+        } else {
+            // the peer reached us: our inbound works (clears an old "cannot connect to you")
+            self.note_inbound(&peer_id);
+            // ...and can we reach it? If not, its inbound connections are blocked: tell it, so its
+            // user learns why files to it would have to take the slow path (or fail on old versions).
+            let node = self.clone();
+            let id = peer_id.clone();
+            tokio::spawn(async move { node.check_reachable_back(&id, conn_id).await });
+        }
         {
             let node = self.clone();
             let id = peer_id.clone();
@@ -230,7 +242,7 @@ impl Node {
                     idle = 0;
                     match f {
                         Frame::Text(t) => match serde_json::from_str::<WsMsg>(&t) {
-                            Ok(WsMsg::FileStart { manifest }) => self.link_file_start(&peer_id, manifest, &out_tx),
+                            Ok(WsMsg::FileStart { manifest }) => self.link_file_start(&peer_id, manifest, &out_tx, ip),
                             Ok(WsMsg::FileFinish { transfer_id }) => self.link_file_finish(&peer_id, transfer_id, &out_tx),
                             Ok(w) => {
                                 if let Some(reply) = self.handle_wire(&peer_id, w, Some(ip)).await {
@@ -302,19 +314,28 @@ impl Assembly {
 
 impl Node {
     /// `FileStart` over the link: the same as POST /files; answered with `FileHave`.
-    fn link_file_start(self: &Arc<Self>, peer_id: &str, manifest: FileManifest, out: &mpsc::UnboundedSender<String>) {
+    fn link_file_start(self: &Arc<Self>, peer_id: &str, manifest: FileManifest, out: &mpsc::UnboundedSender<String>, _ip: IpAddr) {
         // the sender only uses the link when it could not connect to us: say why in our log
         log::warn!(
             "{peer_id} could not connect to us on TCP {} and sends {} over the link instead (inbound connections are blocked here: on Windows allow Lancat in the firewall, or set the network to Private)",
             self.me().port,
             manifest.name
         );
+        // the same news as `InboundBlocked` (older senders never send that): warn our user
+        self.inbound_blocked_report(peer_id, String::new(), self.me().port);
         let (node, from, out) = (self.clone(), peer_id.to_string(), out.clone());
         tokio::spawn(async move {
             let transfer_id = manifest.transfer_id.clone();
             let reply = match node.incoming_init(&from, manifest).await {
-                Ok(st) => WsMsg::FileHave { transfer_id, have: st.have, complete: st.complete, error: None, gone: false },
-                Err((code, e)) => WsMsg::FileHave { transfer_id, have: vec![], complete: false, error: Some(e), gone: code == axum::http::StatusCode::GONE },
+                Ok(st) => WsMsg::FileHave { transfer_id, have: st.have, complete: st.complete, error: None, gone: false, code: None },
+                Err((code, e)) => WsMsg::FileHave {
+                    transfer_id,
+                    have: vec![],
+                    complete: false,
+                    error: Some(e),
+                    gone: code == axum::http::StatusCode::GONE,
+                    code: ErrCode::wire_for_status(code.as_u16()).map(String::from),
+                },
             };
             let _ = out.send(serde_json::to_string(&reply).unwrap_or_default());
         });
@@ -338,7 +359,7 @@ impl Node {
         let Some(p) = LinkPiece::decode(frame) else { return };
         let len = p.chunk_len as usize;
         let ack_err = |e: &str| {
-            let a = WsMsg::FileChunkAck { transfer_id: p.transfer_id.clone(), chunk: p.chunk, error: Some(e.into()), gone: false };
+            let a = WsMsg::FileChunkAck { transfer_id: p.transfer_id.clone(), chunk: p.chunk, error: Some(e.into()), gone: false, code: None };
             let _ = out.send(serde_json::to_string(&a).unwrap_or_default());
         };
         let off = p.offset as usize;
@@ -376,8 +397,14 @@ impl Node {
         tokio::spawn(async move {
             let r = node.incoming_chunk(&from, &tid, chunk, a.buf, Some(hash)).await;
             let reply = match r {
-                Ok(()) => WsMsg::FileChunkAck { transfer_id: tid, chunk, error: None, gone: false },
-                Err((code, e)) => WsMsg::FileChunkAck { transfer_id: tid, chunk, error: Some(e), gone: code == axum::http::StatusCode::GONE },
+                Ok(()) => WsMsg::FileChunkAck { transfer_id: tid, chunk, error: None, gone: false, code: None },
+                Err((code, e)) => WsMsg::FileChunkAck {
+                    transfer_id: tid,
+                    chunk,
+                    error: Some(e),
+                    gone: code == axum::http::StatusCode::GONE,
+                    code: ErrCode::wire_for_status(code.as_u16()).map(String::from),
+                },
             };
             let _ = out.send(serde_json::to_string(&reply).unwrap_or_default());
         });

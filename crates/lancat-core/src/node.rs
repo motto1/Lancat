@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::events::{CoreEvent, PeerView};
+use crate::errors::{chain_is_storage_error, ErrCode};
+use crate::events::{CoreEvent, InboundReport, PeerView};
 use crate::files::IncomingTransfer;
 use crate::netutil;
 use crate::protocol::*;
@@ -152,6 +153,14 @@ pub struct Node {
     /// peer -> (address, when) its HTTP server last did not answer there: the next transfers go
     /// straight over the link instead of waiting for another connect timeout each.
     pub(crate) http_unreachable: Mutex<HashMap<String, (IpAddr, Instant)>>,
+    /// Peers that told us they cannot connect to us (`WsMsg::InboundBlocked`), by peer id.
+    inbound_reports: Mutex<HashMap<String, InboundReport>>,
+    /// The last time a peer connected to us (peer id, ms): proof that inbound works.
+    last_inbound: Mutex<Option<(String, i64)>>,
+    /// peer -> when we last told it "I cannot connect to you" (at most every 10 min).
+    told_blocked: Mutex<HashMap<String, Instant>>,
+    /// Last receive-folder alert (rate limit: a failing transfer hits it once per chunk).
+    recv_alert_at: Mutex<Option<Instant>>,
     /// Outgoing transfers allowed to move data at once (see transfer::MAX_ACTIVE_TRANSFERS).
     pub(crate) transfer_slots: tokio::sync::Semaphore,
     /// Incoming chunk bodies buffered / written at once (see server::file_chunk).
@@ -222,6 +231,10 @@ impl Node {
             out_ctl: Mutex::new(HashMap::new()),
             link_waits: Mutex::new(HashMap::new()),
             http_unreachable: Mutex::new(HashMap::new()),
+            inbound_reports: Mutex::new(HashMap::new()),
+            last_inbound: Mutex::new(None),
+            told_blocked: Mutex::new(HashMap::new()),
+            recv_alert_at: Mutex::new(None),
             transfer_slots: tokio::sync::Semaphore::new(crate::transfer::MAX_ACTIVE_TRANSFERS),
             chunk_slots: tokio::sync::Semaphore::new(crate::server::MAX_INCOMING_CHUNKS),
             http,
@@ -333,6 +346,155 @@ impl Node {
             return PathBuf::from(s.receive_dir.trim());
         }
         dirs::download_dir().unwrap_or_else(|| self.cfg.data_dir.join("Downloads"))
+    }
+
+    /// Checks that the receive folder exists (creating it) and a file can be written there.
+    /// Returns the folder, or why it cannot be used.
+    pub fn check_receive_dir(&self) -> std::result::Result<PathBuf, String> {
+        let dir = self.receive_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            return Err(format!("无法创建 {}：{e}", dir.display()));
+        }
+        let probe = dir.join(format!(".lancat-write-test-{}", uuid::Uuid::new_v4().simple()));
+        match std::fs::write(&probe, b"lancat") {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&probe);
+                Ok(dir)
+            }
+            Err(e) => Err(format!("无法写入 {}：{e}", dir.display())),
+        }
+    }
+
+    // ------------------------------------------------------------------ inbound reachability
+    /// A peer connected to us (accepted link, HTTP request): inbound works, at least from it.
+    pub(crate) fn note_inbound(&self, peer_id: &str) {
+        let now = now_ms();
+        *self.last_inbound.lock().unwrap() = Some((peer_id.to_string(), now));
+        let mut r = self.inbound_reports.lock().unwrap();
+        // a report that is a few seconds old is stale once that peer got in after all
+        if r.get(peer_id).is_some_and(|x| now - x.ts > 5_000) {
+            r.remove(peer_id);
+        }
+    }
+
+    /// `peer_id` cannot connect to us at `addr:port` (`addr` empty = unknown): remember it and
+    /// warn the user (the UI shows a banner with a "fix" button).
+    pub(crate) fn inbound_blocked_report(&self, peer_id: &str, addr: String, port: u16) {
+        let peer_name = self.peer_view(peer_id).map(|p| p.name).unwrap_or_else(|| peer_id.chars().take(8).collect());
+        log::warn!("{peer_name} ({peer_id}) cannot connect to us{} (inbound blocked: firewall / Public network?)", if addr.is_empty() { String::new() } else { format!(" at {addr}:{port}") });
+        let report = InboundReport { peer_id: peer_id.to_string(), peer_name, addr, port, ts: now_ms() };
+        self.inbound_reports.lock().unwrap().insert(peer_id.to_string(), report.clone());
+        self.emit(CoreEvent::Alert { kind: "inbound_blocked".into(), report: Some(report), detail: String::new() });
+    }
+
+    /// Peers that reported (within a day) that they cannot connect to us, newest first.
+    pub fn inbound_reports(&self) -> Vec<InboundReport> {
+        let cutoff = now_ms() - 86_400_000;
+        let mut r = self.inbound_reports.lock().unwrap();
+        r.retain(|_, x| x.ts > cutoff);
+        let mut v: Vec<InboundReport> = r.values().cloned().collect();
+        v.sort_by(|a, b| b.ts.cmp(&a.ts));
+        v
+    }
+
+    /// Forgets the reports (after the user fixed the firewall / network type).
+    pub fn clear_inbound_reports(&self) {
+        self.inbound_reports.lock().unwrap().clear();
+    }
+
+    /// Peers whose address did not accept our connections lately: (name, "ip"). Their inbound is
+    /// blocked (their firewall), which only they can fix.
+    pub fn unreachable_peers(&self) -> Vec<(String, String)> {
+        let list: Vec<(String, IpAddr)> = self
+            .http_unreachable
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, (_, t))| t.elapsed() < Duration::from_secs(3600))
+            .map(|(id, (ip, _))| (id.clone(), *ip))
+            .collect();
+        list.into_iter().map(|(id, ip)| (self.peer_view(&id).map(|p| p.name).unwrap_or(id), ip.to_string())).collect()
+    }
+
+    /// The last peer that connected to us (its name) and when (ms).
+    pub fn last_inbound(&self) -> Option<(String, i64)> {
+        let (id, ts) = self.last_inbound.lock().unwrap().clone()?;
+        let name = self.peer_view(&id).map(|p| p.name).unwrap_or(id);
+        Some((name, ts))
+    }
+
+    /// Tells `peer_id` over its link that we cannot connect to it at `ip:port` (at most every 10 min).
+    pub(crate) fn tell_inbound_blocked(&self, peer_id: &str, ip: IpAddr, port: u16) {
+        {
+            let mut t = self.told_blocked.lock().unwrap();
+            if t.get(peer_id).is_some_and(|at| at.elapsed() < Duration::from_secs(600)) {
+                return;
+            }
+            t.insert(peer_id.to_string(), Instant::now());
+        }
+        log::info!("{peer_id}: cannot connect to it at {ip}:{port}, telling it (its inbound is blocked)");
+        self.send_over_link(peer_id, &WsMsg::InboundBlocked { addr: ip.to_string(), port });
+    }
+
+    /// After a peer dialed a link to us: can we connect back? If not, its inbound connections are
+    /// blocked; tell it (newer versions warn their user) and send files over the link right away.
+    pub(crate) async fn check_reachable_back(self: Arc<Self>, peer_id: &str, conn_id: u64) {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let current = || self.links.lock().unwrap().get(peer_id).map(|l| l.conn_id) == Some(conn_id);
+        if !current() {
+            return;
+        }
+        let Some((ip, port)) = self.peer_addr(peer_id) else { return };
+        if self.answers_as(peer_id, ip, port).await {
+            self.http_unreachable.lock().unwrap().remove(peer_id);
+            return;
+        }
+        if !current() {
+            return;
+        }
+        self.http_unreachable.lock().unwrap().insert(peer_id.to_string(), (ip, Instant::now()));
+        self.tell_inbound_blocked(peer_id, ip, port);
+    }
+
+    /// Receiving failed because the receive folder cannot be written: the incoming message is
+    /// marked failed (with the reason) and the user is warned. Returns the HTTP answer (507).
+    /// `any_io`: every I/O error counts (opening a transfer only touches the receive folder).
+    pub(crate) fn incoming_storage_failed(&self, from: &str, m: &FileManifest, e: &anyhow::Error, any_io: bool) -> (axum::http::StatusCode, String) {
+        let io = any_io && e.chain().any(|c| c.downcast_ref::<std::io::Error>().is_some());
+        if !io && !chain_is_storage_error(e) {
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
+        let dir = self.receive_dir();
+        let msg = format!("接收目录不可写（{}）：{e}", dir.display());
+        log::warn!("receiving {} from {from} failed: {msg}", m.name);
+        let body = FileBody {
+            name: m.name.clone(),
+            size: m.size,
+            transfer_id: m.transfer_id.clone(),
+            hash: m.hash.clone(),
+            error: Some(msg.clone()),
+            code: Some(ErrCode::LocalDirUnwritable.as_str().into()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&body).unwrap_or_default();
+        if !matches!(self.store.message(&m.msg_id), Ok(Some(_))) {
+            self.store_incoming(from, &m.msg_id, "file", value.clone(), "failed", m.ts);
+        }
+        if let Ok(Some(u)) = self.store.update_message(&m.msg_id, "failed", Some(&value)) {
+            self.emit(CoreEvent::MessageUpdate { message: u });
+        }
+        let alert = {
+            let mut at = self.recv_alert_at.lock().unwrap();
+            let due = at.map_or(true, |t| t.elapsed() > Duration::from_secs(30));
+            if due {
+                *at = Some(Instant::now());
+            }
+            due
+        };
+        if alert {
+            self.emit(CoreEvent::Alert { kind: "recv_dir".into(), report: None, detail: msg.clone() });
+        }
+        (axum::http::StatusCode::INSUFFICIENT_STORAGE, msg)
     }
 
     // ------------------------------------------------------------------ peers
@@ -919,6 +1081,10 @@ impl Node {
             }
             // handled by the link loop itself (`run_link`); never valid over POST /msg
             WsMsg::FileStart { .. } | WsMsg::FileFinish { .. } => None,
+            WsMsg::InboundBlocked { addr, port } => {
+                self.inbound_blocked_report(peer_id, addr, port);
+                None
+            }
         }
     }
 

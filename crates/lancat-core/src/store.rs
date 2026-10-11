@@ -36,6 +36,10 @@ pub struct FileBody {
     pub hash: String,
     #[serde(default)]
     pub error: Option<String>,
+    /// Why a transfer failed, machine-readable (`crate::errors::ErrCode`), so the UI can explain
+    /// it and suggest a fix. Absent on success and in rows written by older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

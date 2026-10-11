@@ -10,6 +10,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Result};
 use futures_util::{stream, TryStreamExt};
 
+use crate::errors::{classify, terr, ErrCode};
 use crate::events::CoreEvent;
 use crate::files::{discard_partial, expand_paths, hash_file, read_at};
 use crate::netutil;
@@ -89,7 +90,7 @@ impl Node {
                     transfer_id: uuid::Uuid::new_v4().to_string(),
                     path: path.to_string_lossy().to_string(),
                     hash: String::new(),
-                    error: None,
+                    ..Default::default()
                 };
                 let m = Message {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -154,27 +155,29 @@ impl Node {
         self.active_out.lock().unwrap().remove(&msg_id);
         let Ok(Some(m)) = self.store.message(&msg_id) else { return };
         let mut body: FileBody = serde_json::from_value(m.body.clone()).unwrap_or_default();
-        let (status, error) = match res {
-            Ok(()) => ("done", None),
+        let (status, error, code) = match res {
+            Ok(()) => ("done", None, None),
             Err(_) if ctl.get() == PAUSE => {
                 log::info!("transfer {msg_id} paused");
-                ("paused", None)
+                ("paused", None, None)
             }
             Err(_) if ctl.get() == CANCEL => {
                 log::info!("transfer {msg_id} cancelled");
                 self.send_over_link(&m.peer_id, &WsMsg::FileCancel { transfer_id: body.transfer_id.clone() });
-                ("cancelled", None)
+                ("cancelled", None, None)
             }
             Err(e) if ctl.get() == PEER_CANCEL || e.downcast_ref::<PeerCancelled>().is_some() => {
                 log::info!("transfer {msg_id} cancelled by the receiver");
-                ("cancelled", Some(PeerCancelled.to_string()))
+                ("cancelled", Some(PeerCancelled.to_string()), None)
             }
             Err(e) => {
-                log::warn!("transfer {msg_id} failed: {e:#}");
-                ("failed", Some(e.to_string()))
+                let code = classify(&e);
+                log::warn!("transfer {msg_id} failed ({}): {e:#}", code.as_str());
+                ("failed", Some(e.to_string()), Some(code.as_str().to_string()))
             }
         };
         body.error = error;
+        body.code = code;
         if let Ok(Some(m)) = self.store.update_message(&msg_id, status, Some(&serde_json::to_value(&body).unwrap_or_default())) {
             self.emit(CoreEvent::MessageUpdate { message: m });
         }
@@ -271,7 +274,7 @@ impl Node {
         let mut body: FileBody = serde_json::from_value(m.body.clone())?;
         let path = PathBuf::from(&body.path);
         if !path.is_file() {
-            bail!("源文件不存在");
+            return Err(terr(ErrCode::SourceMissing, "源文件不存在"));
         }
         if m.status != "transferring" {
             if let Ok(Some(m)) = self.store.update_message(msg_id, "transferring", None) {
@@ -286,7 +289,7 @@ impl Node {
             self.store.update_message(msg_id, "transferring", Some(&serde_json::to_value(&body)?))?;
         }
         if !self.is_online(&m.peer_id) {
-            bail!("对方不在线");
+            return Err(terr(ErrCode::PeerOffline, "对方不在线"));
         }
         let route = self.pick_route(&m.peer_id).await?;
         let me = self.me().id;
@@ -324,7 +327,8 @@ impl Node {
             }
             if !resp.status().is_success() {
                 let code = resp.status();
-                bail!("对方拒绝: {} {}", code, resp.text().await.unwrap_or_default());
+                let text = resp.text().await.unwrap_or_default();
+                return Err(terr(ErrCode::from_peer(Some(code.as_u16()), None), format!("对方拒绝: {code} {text}")));
             }
             let status: TransferStatus = json_body(resp).await?;
             let have: std::collections::HashSet<u64> = status.have.into_iter().collect();
@@ -373,8 +377,13 @@ impl Node {
                                     break;
                                 }
                                 Ok(r) if r.status() == reqwest::StatusCode::GONE => return Err(PeerCancelled.into()),
-                                Ok(r) => last_err = Some(anyhow!("chunk {idx}: HTTP {}", r.status())),
-                                Err(e) => last_err = Some(anyhow!("chunk {idx}: {e}")),
+                                // the receiver cannot store it: retrying will not help
+                                Ok(r) if r.status() == reqwest::StatusCode::INSUFFICIENT_STORAGE => {
+                                    let text = r.text().await.unwrap_or_default();
+                                    return Err(terr(ErrCode::PeerDirUnwritable, format!("对方无法保存文件: {text}")));
+                                }
+                                Ok(r) => last_err = Some(terr(ErrCode::PeerRejected, format!("chunk {idx}: HTTP {}", r.status()))),
+                                Err(e) => last_err = Some(terr(ErrCode::Network, format!("chunk {idx}: {e}"))),
                             }
                             tokio::time::sleep(Duration::from_millis(300)).await;
                         }
@@ -403,9 +412,12 @@ impl Node {
                 log::warn!("hash mismatch on {}, restarting transfer", manifest.name);
                 continue;
             }
-            bail!("完成失败: {} {}", r.status(), r.text().await.unwrap_or_default());
+            let code = r.status();
+            let text = r.text().await.unwrap_or_default();
+            let ec = if code == reqwest::StatusCode::CONFLICT { ErrCode::Verify } else { ErrCode::from_peer(Some(code.as_u16()), None) };
+            return Err(terr(ec, format!("完成失败: {code} {text}")));
         }
-        bail!("校验失败")
+        Err(terr(ErrCode::Verify, "校验失败"))
     }
 }
 
@@ -423,7 +435,7 @@ impl Node {
     /// address. A receiver whose firewall drops inbound connections still dials us, so its link is
     /// the one path that is sure to exist.
     async fn pick_route(&self, peer_id: &str) -> Result<Route> {
-        let (ip, port) = self.peer_addr(peer_id).ok_or_else(|| anyhow!("对方地址未知"))?;
+        let (ip, port) = self.peer_addr(peer_id).ok_or_else(|| terr(ErrCode::PeerOffline, "对方地址未知"))?;
         let linked = || self.links.lock().unwrap().contains_key(peer_id);
         let known_blocked = matches!(self.http_unreachable.lock().unwrap().get(peer_id), Some((a, t)) if *a == ip && t.elapsed() < Duration::from_secs(60));
         if known_blocked && linked() {
@@ -436,6 +448,8 @@ impl Node {
         self.http_unreachable.lock().unwrap().insert(peer_id.to_string(), (ip, std::time::Instant::now()));
         if linked() {
             log::warn!("{peer_id}: {ip}:{port} does not accept connections (inbound blocked by its firewall?), sending over the link");
+            // and let it know, so its user sees why (newer versions show a "fix" banner)
+            self.tell_inbound_blocked(peer_id, ip, port);
             return Ok(Route::Link);
         }
         if self.cfg.alt_addr_fallback {
@@ -443,7 +457,7 @@ impl Node {
                 return Ok(Route::Http(base));
             }
         }
-        bail!("连不上对方 {ip}:{port}，对方也没有连过来（对方的防火墙可能挡住了 Lancat 的入站连接）")
+        Err(terr(ErrCode::PeerInboundBlocked, format!("连不上对方 {ip}:{port}，对方也没有连过来（对方的防火墙可能挡住了 Lancat 的入站连接）")))
     }
 
     /// Opt-in fallback (`NodeConfig::alt_addr_fallback`): the first other address the peer answers
@@ -463,7 +477,7 @@ impl Node {
     }
 
     /// `GET /info` at ip:port answers with this device id.
-    async fn answers_as(&self, peer_id: &str, ip: IpAddr, port: u16) -> bool {
+    pub(crate) async fn answers_as(&self, peer_id: &str, ip: IpAddr, port: u16) -> bool {
         let r = self.http.get(format!("{}/info", base_url(ip, port))).header(HEADER_DEVICE_ID, self.me().id).timeout(Duration::from_secs(4)).send().await;
         match r {
             Ok(r) if r.status().is_success() => matches!(json_body::<DeviceInfo>(r).await, Ok(d) if d.id == peer_id),
@@ -486,19 +500,19 @@ impl Node {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WsMsg>();
         self.link_waits.lock().unwrap().insert(tid.clone(), tx);
         let _unregister = Unregister(self, tid.clone());
-        let lost = || anyhow!("与对方的连接断开了");
+        let lost = || terr(ErrCode::LinkLost, "与对方的连接断开了");
         'attempt: for attempt in 0..2 {
             if !self.send_over_link(&m.peer_id, &WsMsg::FileStart { manifest: manifest.clone() }) {
                 return Err(lost());
             }
             let have = loop {
-                let w = recv_reply(&mut rx, 15).await.map_err(|_| anyhow!("对方没有回应经连接传文件的请求（对方的 Lancat 可能是旧版本，需要更新；或者在对方电脑上放行 Lancat 的入站连接）"))?;
-                if let WsMsg::FileHave { have, error, gone, .. } = w {
+                let w = recv_reply(&mut rx, 15).await.map_err(|_| terr(ErrCode::PeerOutdated, "对方没有回应经连接传文件的请求（对方的 Lancat 可能是旧版本，需要更新；或者在对方电脑上放行 Lancat 的入站连接）"))?;
+                if let WsMsg::FileHave { have, error, gone, code, .. } = w {
                     if gone {
                         return Err(PeerCancelled.into());
                     }
                     if let Some(e) = error {
-                        bail!("对方拒绝: {e}");
+                        return Err(terr(ErrCode::from_peer(None, code.as_deref()), format!("对方拒绝: {e}")));
                     }
                     break have;
                 }
@@ -533,7 +547,7 @@ impl Node {
                     break;
                 }
                 let w = recv_reply(&mut rx, 60).await?;
-                if let WsMsg::FileChunkAck { chunk, error, gone, .. } = w {
+                if let WsMsg::FileChunkAck { chunk, error, gone, code, .. } = w {
                     if !inflight.remove(&chunk) {
                         continue;
                     }
@@ -541,7 +555,7 @@ impl Node {
                         return Err(PeerCancelled.into());
                     }
                     if let Some(e) = error {
-                        bail!("chunk {chunk}: {e}");
+                        return Err(terr(ErrCode::from_peer(None, code.as_deref()), format!("chunk {chunk}: {e}")));
                     }
                     done += chunk_len(size, chunk);
                     self.touch_peer(&m.peer_id);
@@ -559,12 +573,13 @@ impl Node {
                             log::warn!("hash mismatch on {}, restarting transfer", manifest.name);
                             continue 'attempt;
                         }
-                        Some(e) => bail!("完成失败: {e}"),
+                        Some(e) if conflict => return Err(terr(ErrCode::Verify, format!("完成失败: {e}"))),
+                        Some(e) => return Err(terr(ErrCode::PeerRejected, format!("完成失败: {e}"))),
                     }
                 }
             }
         }
-        bail!("校验失败")
+        Err(terr(ErrCode::Verify, "校验失败"))
     }
 }
 
@@ -572,8 +587,8 @@ impl Node {
 async fn recv_reply(rx: &mut tokio::sync::mpsc::UnboundedReceiver<WsMsg>, secs: u64) -> Result<WsMsg> {
     match tokio::time::timeout(Duration::from_secs(secs), rx.recv()).await {
         Ok(Some(w)) => Ok(w),
-        Ok(None) => bail!("stopped"),
-        Err(_) => bail!("对方 {secs} 秒没有回应"),
+        Ok(None) => Err(terr(ErrCode::LinkLost, "与对方的连接断开了")),
+        Err(_) => Err(terr(ErrCode::PeerNoResponse, format!("对方 {secs} 秒没有回应"))),
     }
 }
 
@@ -660,6 +675,70 @@ mod tests {
         assert!(text_ok || snd.store.message(&t.id).unwrap().unwrap().status == "delivered", "text not delivered");
         let got = std::fs::read(tr.path().join("recv").join("big.bin")).unwrap();
         assert!(got == data, "content differs");
+        // the receiver learned that others cannot connect to it (the sender's "I cannot connect to
+        // you" after the link came up, and the file arriving over the link)
+        let reports = rcv.inbound_reports();
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0].peer_id, snd_id);
+        assert!(snd.inbound_reports().is_empty());
+        snd.shutdown();
+        rcv.shutdown();
+    }
+
+    /// The receiver's folder cannot be written: the sender's message fails with
+    /// `peer_dir_unwritable`, the receiver's with `local_dir_unwritable` plus a `recv_dir` alert.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn receive_dir_unwritable_is_classified() {
+        let ts = tempfile::tempdir().unwrap();
+        let tr = tempfile::tempdir().unwrap();
+        let snd = start(ts.path(), "sender", None).await;
+        // a receive "folder" below a plain file: nothing can be created there
+        std::fs::write(tr.path().join("file"), b"x").unwrap();
+        let mut cfg = NodeConfig::new(tr.path().join("data"));
+        cfg.port = 0;
+        cfg.enable_mdns = false;
+        cfg.enable_udp = false;
+        cfg.name_override = Some("receiver".into());
+        cfg.recv_dir_override = Some(tr.path().join("file").join("sub"));
+        let rcv = Node::start(cfg).await.unwrap();
+        assert!(rcv.check_receive_dir().is_err());
+        assert!(snd.check_receive_dir().is_ok());
+        let rcv_id = rcv.me().id;
+        snd.add_peer_addr(&format!("127.0.0.1:{}", rcv.port())).await.unwrap();
+        let mut er = rcv.subscribe();
+        let src = ts.path().join("a.txt");
+        std::fs::write(&src, b"hello").unwrap();
+        let mut es = snd.subscribe();
+        let ms = snd.send_files(&[rcv_id.clone()], &[src]).await.unwrap();
+        let fid = ms[0].id.clone();
+        let m = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Ok(CoreEvent::MessageUpdate { message }) = es.recv().await {
+                    if message.id == fid && matches!(message.status.as_str(), "done" | "failed") {
+                        return message;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("transfer timed out");
+        assert_eq!(m.status, "failed");
+        let body: FileBody = serde_json::from_value(m.body).unwrap();
+        assert_eq!(body.code.as_deref(), Some("peer_dir_unwritable"), "{:?}", body.error);
+        let got_alert = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(CoreEvent::Alert { kind, .. }) = er.recv().await {
+                    return kind;
+                }
+            }
+        })
+        .await
+        .expect("no alert");
+        assert_eq!(got_alert, "recv_dir");
+        let theirs = rcv.store.message(&fid).unwrap().expect("receiver recorded the file");
+        assert_eq!(theirs.status, "failed");
+        let tb: FileBody = serde_json::from_value(theirs.body).unwrap();
+        assert_eq!(tb.code.as_deref(), Some("local_dir_unwritable"));
         snd.shutdown();
         rcv.shutdown();
     }

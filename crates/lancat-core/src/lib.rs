@@ -10,6 +10,7 @@
 //! The crate has no GUI dependency so it can be tested headless (`cargo test -p lancat-core`).
 
 pub mod discovery;
+pub mod errors;
 pub mod events;
 pub mod files;
 mod link;
@@ -20,7 +21,8 @@ pub mod server;
 pub mod store;
 pub mod transfer;
 
-pub use events::{CoreEvent, PeerView};
+pub use errors::ErrCode;
+pub use events::{CoreEvent, InboundReport, PeerView};
 pub use node::{Node, NodeConfig};
 pub use protocol::{DeviceInfo, EmojiPayload};
 pub use store::{FileBody, Message, Settings};

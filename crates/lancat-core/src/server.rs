@@ -80,6 +80,10 @@ async fn guard(State(node): St, ConnectInfo(addr): ConnectInfo<SocketAddr>, req:
         if node.store.is_blocked(id) {
             return (StatusCode::FORBIDDEN, "blocked").into_response();
         }
+        // a peer got in: inbound connections work (runtime signal for diagnostics)
+        if !id.is_empty() && id != node.me().id {
+            node.note_inbound(id);
+        }
     }
     next.run(req).await
 }
@@ -173,7 +177,11 @@ impl Node {
             _ => {
                 let dir = self.receive_dir();
                 let mc = m.clone();
-                let t = tokio::task::spawn_blocking(move || IncomingTransfer::open(&dir, mc)).await.map_err(err500)?.map_err(err500)?;
+                let t = match tokio::task::spawn_blocking(move || IncomingTransfer::open(&dir, mc)).await.map_err(err500)? {
+                    Ok(t) => t,
+                    // receive folder not writable / disk full: 507, and our side shows why
+                    Err(e) => return Err(self.incoming_storage_failed(from, &m, &e, true)),
+                };
                 let t = Arc::new(t);
                 self.incoming.lock().unwrap().insert(tid.clone(), t.clone());
                 t
@@ -204,10 +212,13 @@ impl Node {
             return Err((StatusCode::FORBIDDEN, "not your transfer".into()));
         }
         let t2 = t.clone();
-        tokio::task::spawn_blocking(move || t2.write_chunk(chunk, &body, hash.as_deref()))
-            .await
-            .map_err(err500)?
-            .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+        let written = tokio::task::spawn_blocking(move || t2.write_chunk(chunk, &body, hash.as_deref())).await.map_err(err500)?;
+        if let Err(e) = written {
+            if crate::errors::chain_is_storage_error(&e) {
+                return Err(self.incoming_storage_failed(from, &t.manifest, &e, false));
+            }
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, e.to_string()));
+        }
         self.touch_peer(from);
         self.emit(CoreEvent::Progress {
             msg_id: t.manifest.msg_id.clone(),
@@ -236,7 +247,7 @@ impl Node {
                     transfer_id: tid.to_string(),
                     path: path.to_string_lossy().to_string(),
                     hash: t.manifest.hash.clone(),
-                    error: None,
+                    ..Default::default()
                 };
                 if let Ok(Some(m)) = self.store.update_message(&t.manifest.msg_id, "done", Some(&serde_json::to_value(&body).unwrap_or_default())) {
                     self.emit(CoreEvent::MessageUpdate { message: m });
@@ -244,6 +255,7 @@ impl Node {
                 log::info!("received {} -> {}", t.manifest.name, path.display());
                 Ok(())
             }
+            Err(e) if crate::errors::chain_is_storage_error(&e) => Err(self.incoming_storage_failed(from, &t.manifest, &e, false)),
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("hash mismatch") {

@@ -108,6 +108,10 @@ pub enum WsMsg {
         /// The receiver cancelled this transfer (HTTP 410).
         #[serde(default)]
         gone: bool,
+        /// Why it refused, machine-readable (`ErrCode::wire_for_status`: "dir_unwritable",
+        /// "too_large"). Optional: older receivers never send it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
     },
     /// receiver -> sender: one chunk (all its pieces) was written, or failed.
     FileChunkAck {
@@ -117,6 +121,8 @@ pub enum WsMsg {
         error: Option<String>,
         #[serde(default)]
         gone: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
     },
     /// sender -> receiver: every chunk was acked, verify and move into place (= POST /finish).
     FileFinish { transfer_id: String },
@@ -129,6 +135,11 @@ pub enum WsMsg {
         #[serde(default)]
         conflict: bool,
     },
+    /// "I cannot connect to you": the peer tried `addr:port` (where we listen, as it knows us)
+    /// and got no answer, so it only reaches us over a link we dialed. Tells this device that its
+    /// own inbound connections are blocked (firewall, "Public" network) so it can warn its user.
+    /// Optional and informational: older peers fail to parse it and skip it.
+    InboundBlocked { addr: String, port: u16 },
 }
 
 impl WsMsg {
@@ -282,8 +293,30 @@ mod tests {
         assert!(LinkPiece::decode(b"LCF1").is_none());
         assert!(LinkPiece::decode(&f[..20]).is_none());
         // an old peer's parser: the new link messages are just unknown and skipped
-        let s = serde_json::to_string(&WsMsg::FileChunkAck { transfer_id: "t".into(), chunk: 1, error: None, gone: false }).unwrap();
+        let s = serde_json::to_string(&WsMsg::FileChunkAck { transfer_id: "t".into(), chunk: 1, error: None, gone: false, code: None }).unwrap();
+        assert!(!s.contains("code"));
         assert_eq!(serde_json::from_str::<WsMsg>(&s).unwrap().link_reply_tid(), Some("t"));
+        // an ack from an older receiver (no `code`) still parses
+        let old = r#"{"type":"file_have","transfer_id":"t","have":[1],"complete":false}"#;
+        assert!(matches!(serde_json::from_str::<WsMsg>(old).unwrap(), WsMsg::FileHave { code: None, .. }));
+    }
+
+    /// "I cannot connect to you" round-trips; to an older peer it is an unknown type, which its
+    /// link loop skips (serde fails, the frame is ignored), never a protocol error.
+    #[test]
+    fn inbound_blocked_msg() {
+        let m = WsMsg::InboundBlocked { addr: "192.168.3.214".into(), port: 47820 };
+        let s = serde_json::to_string(&m).unwrap();
+        assert_eq!(s, r#"{"type":"inbound_blocked","addr":"192.168.3.214","port":47820}"#);
+        assert_eq!(serde_json::from_str::<WsMsg>(&s).unwrap(), m);
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum OldWsMsg {
+            Ping,
+            Pong,
+        }
+        assert!(serde_json::from_str::<OldWsMsg>(&s).is_err());
     }
 
     #[test]
