@@ -25,9 +25,25 @@
         : `发给 ${app.peers.find((p) => p.id === targets[0])?.name ?? ""}…`,
   );
 
+  // Growing with the text: `field-sizing: content` (Chromium / WebView2 123+) lets layout do it.
+  // Elsewhere measure at most once per frame, and only shrink-measure ("height: auto" + read
+  // scrollHeight, a forced synchronous reflow) when text was removed; typing used to force that
+  // reflow on every keystroke.
+  const nativeSizing = typeof CSS !== "undefined" && CSS.supports("field-sizing", "content");
+  let sizeQueued = false;
+  let lastLen = 0;
   function autosize() {
-    area.style.height = "auto";
-    area.style.height = Math.min(area.scrollHeight, 96) + "px";
+    if (nativeSizing || !area || sizeQueued) return;
+    sizeQueued = true;
+    requestAnimationFrame(() => {
+      sizeQueued = false;
+      const len = area.value.length;
+      const shrunk = len < lastLen;
+      lastLen = len;
+      if (shrunk) area.style.height = "auto";
+      else if (area.scrollHeight <= area.clientHeight) return; // still fits
+      area.style.height = Math.min(area.scrollHeight, 96) + "px";
+    });
   }
 
   function onInput() {
@@ -179,6 +195,7 @@
     padding: 6px 11px;
     line-height: 17px;
     max-height: 96px;
+    field-sizing: content;
     outline: none;
     font-size: 13px;
     transition: box-shadow var(--dur-fast) var(--ease);
