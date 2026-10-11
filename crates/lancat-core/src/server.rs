@@ -144,7 +144,9 @@ async fn file_init(State(node): St, Path(tid): Path<String>, h: HeaderMap, Json(
     };
     // make sure the conversation shows the file even if the offer never arrived
     let body = FileBody { name: m.name.clone(), size: m.size, transfer_id: tid.clone(), hash: m.hash.clone(), ..Default::default() };
-    node.store_incoming(&from, &m.msg_id, "file", serde_json::to_value(&body).unwrap_or_default(), "receiving", m.ts);
+    if !node.store_incoming(&from, &m.msg_id, "file", serde_json::to_value(&body).unwrap_or_default(), "receiving", m.ts) {
+        return Err(err500("could not record the transfer"));
+    }
     if let Ok(Some(msg)) = node.store.message(&m.msg_id) {
         if msg.status != "receiving" {
             node.set_status(&m.msg_id, "receiving");

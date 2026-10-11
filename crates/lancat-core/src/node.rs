@@ -763,9 +763,11 @@ impl Node {
                 }
                 None
             }
+            // Ack only what is safely stored: the sender then stops resending. A message that
+            // could not be written (disk full, database locked …) stays unacked on the sender,
+            // which retries it on the next flush.
             WsMsg::Text { id, text, ts } => {
-                self.store_incoming(peer_id, &id, "text", serde_json::json!({ "text": text }), "received", ts);
-                Some(WsMsg::Ack { id })
+                self.store_incoming(peer_id, &id, "text", serde_json::json!({ "text": text }), "received", ts).then_some(WsMsg::Ack { id })
             }
             WsMsg::Emoji { id, emoji, ts } => {
                 // custom stickers are capped at 1 MiB of Lottie JSON
@@ -773,8 +775,7 @@ impl Node {
                     return Some(WsMsg::Ack { id });
                 }
                 let body = serde_json::to_value(&emoji).unwrap_or_default();
-                self.store_incoming(peer_id, &id, "emoji", body, "received", ts);
-                Some(WsMsg::Ack { id })
+                self.store_incoming(peer_id, &id, "emoji", body, "received", ts).then_some(WsMsg::Ack { id })
             }
             WsMsg::FileOffer { id, transfer_id, name, size, ts } => {
                 let body = FileBody { name, size, transfer_id, ..Default::default() };
@@ -806,7 +807,9 @@ impl Node {
         }
     }
 
-    pub(crate) fn store_incoming(&self, peer_id: &str, id: &str, kind: &str, body: serde_json::Value, status: &str, ts: i64) {
+    /// Stores an incoming message (idempotent on its id). True when it is in the database now
+    /// (new or already there), false when the write failed.
+    pub(crate) fn store_incoming(&self, peer_id: &str, id: &str, kind: &str, body: serde_json::Value, status: &str, ts: i64) -> bool {
         let m = Message {
             id: id.into(),
             peer_id: peer_id.into(),
@@ -822,9 +825,17 @@ impl Node {
             let info = DeviceInfo { id: peer_id.into(), name: "Unknown".into(), os: String::new(), ver: String::new(), port: DEFAULT_PORT };
             let _ = self.store.upsert_device(&info, "", now_ms());
         }
-        if let Ok(true) = self.store.insert_message(&m, true) {
-            self.emit(CoreEvent::Message { message: m });
-            self.emit_peer(peer_id);
+        match self.store.insert_message(&m, true) {
+            Ok(true) => {
+                self.emit(CoreEvent::Message { message: m });
+                self.emit_peer(peer_id);
+                true
+            }
+            Ok(false) => true, // a resend of something we already have
+            Err(e) => {
+                log::warn!("storing message {id} from {peer_id} failed: {e:#}");
+                false
+            }
         }
     }
 
