@@ -9,14 +9,15 @@
 
   let list = $derived<Message[]>(app.current ? (app.messages[app.current] ?? []) : []);
 
-  // time separators when the gap is > 5 min
+  // time separators when the gap is > 5 min. Keyed by the message they precede: the label alone
+  // ("10月11日 12:00") repeats across years and duplicate keys break the keyed each.
   let rows = $derived.by(() => {
-    const out: Array<{ sep?: string; m?: Message; first?: boolean }> = [];
+    const out: Array<{ key: string; sep?: string; m?: Message; first?: boolean }> = [];
     let prev: Message | null = null;
     for (const m of list) {
-      if (!prev || m.ts - prev.ts > 5 * 60_000) out.push({ sep: formatTime(m.ts) });
+      if (!prev || m.ts - prev.ts > 5 * 60_000) out.push({ key: `sep:${m.id}`, sep: formatTime(m.ts) });
       const first = !prev || prev.outgoing !== m.outgoing || m.ts - prev.ts > 60_000;
-      out.push({ m, first });
+      out.push({ key: m.id, m, first });
       prev = m;
     }
     return out;
@@ -24,24 +25,34 @@
 
   function onScroll() {
     stick = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 40;
-    if (scroller.scrollTop < 30 && app.current) {
+    const peer = app.current;
+    if (scroller.scrollTop < 30 && peer) {
       const h = scroller.scrollHeight;
-      app.loadOlder(app.current).then(async () => {
+      // loadOlder ignores re-entrant calls; only keep the position when it really prepended
+      app.loadOlder(peer).then(async (added) => {
+        if (!added || app.current !== peer) return;
         await tick();
-        scroller.scrollTop = scroller.scrollHeight - h;
+        scroller.scrollTop += scroller.scrollHeight - h;
       });
     }
   }
 
   // follow new messages / conversation switches
   let lastKey = "";
+  /** Switched to a conversation whose history was not loaded yet: the switch itself saw an empty
+   *  list, so the bottom must still be forced when the history arrives (the old `stick` of the
+   *  previous conversation decided otherwise and left it scrolled to the top). */
+  let bottomPending = false;
   $effect(() => {
     const key = `${app.current}:${list.length}:${list[list.length - 1]?.id ?? ""}`;
     const switched = !lastKey.startsWith(`${app.current}:`);
+    if (switched) bottomPending = true;
     if (key !== lastKey) {
       lastKey = key;
       const last = list[list.length - 1];
-      if (switched || stick || last?.outgoing) {
+      if (bottomPending || stick || last?.outgoing) {
+        if (list.length) bottomPending = false;
+        stick = true;
         tick().then(() => scroller && (scroller.scrollTop = scroller.scrollHeight));
       }
     }
@@ -61,7 +72,7 @@
     </div>
   {/if}
   {#if !app.broadcast}
-    {#each rows as r (r.m?.id ?? `sep-${r.sep}`)}
+    {#each rows as r (r.key)}
       {#if r.sep}
         <div class="sep">{r.sep}</div>
       {:else if r.m}

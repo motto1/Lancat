@@ -7,6 +7,10 @@
   import Sticker from "./Sticker.svelte";
 
   let { m, first }: { m: Message; first: boolean } = $props();
+  // Only a message that just arrived plays the entry animation; history (opening a conversation,
+  // a cold panel, loading older messages) used to animate every row at once.
+  // svelte-ignore state_referenced_locally
+  const enter = app.takeArrival(m.id);
 
   let solo = $derived.by(() => {
     if (m.kind !== "text") return null;
@@ -50,7 +54,7 @@
   }
 </script>
 
-<div class="row" class:out={m.outgoing} class:first>
+<div class="row" class:out={m.outgoing} class:first class:enter>
   {#if m.kind === "emoji"}
     <div class="sticker-wrap" title={m.body?.alt ?? ""}>
       <Sticker emoji={m.body} size={160} />
@@ -109,6 +113,8 @@
     align-items: flex-end;
     gap: 4px;
     margin-top: 2px;
+  }
+  .row.enter {
     animation: msg-in 320ms cubic-bezier(0.2, 0.9, 0.3, 1.15);
   }
   .row.first {
@@ -212,6 +218,10 @@
     border-radius: 2px;
     background: var(--sep);
     overflow: hidden;
+  }
+  /* global .icon-btn keeps its own compositor layer (pixel-snap fix); not worth one per message */
+  .file .icon-btn {
+    will-change: auto;
   }
   .fill {
     height: 100%;
