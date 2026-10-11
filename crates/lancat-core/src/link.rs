@@ -6,6 +6,7 @@
 //! 2 intervals is dropped and the peer marked offline (60–90 s after it went silent). A closed
 //! connection triggers an immediate re-probe; `bye` marks the peer offline at once.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -70,11 +71,18 @@ impl Node {
         // waiting up to ~40 ms for Nagle/delayed-ACK to coalesce them
         let (ws, _) = tokio::time::timeout(Duration::from_secs(5), tokio_tungstenite::connect_async_with_config(req, None, true)).await??;
         let (mut sink, mut stream) = ws.split();
-        let (in_tx, in_rx) = mpsc::unbounded_channel::<String>();
+        let (in_tx, in_rx) = mpsc::unbounded_channel::<Frame>();
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(DATA_QUEUE);
         let writer = tokio::spawn(async move {
-            while let Some(s) = out_rx.recv().await {
-                if sink.send(TMsg::Text(s.into())).await.is_err() {
+            loop {
+                // text frames (messages, acks, pings) always go before queued file pieces
+                let m = tokio::select! {
+                    biased;
+                    s = out_rx.recv() => match s { Some(s) => TMsg::Text(s.into()), None => break },
+                    b = data_rx.recv() => match b { Some(b) => TMsg::Binary(b.into()), None => break },
+                };
+                if sink.send(m).await.is_err() {
                     break;
                 }
             }
@@ -82,19 +90,19 @@ impl Node {
         });
         let reader = tokio::spawn(async move {
             while let Some(Ok(m)) = stream.next().await {
-                match m {
-                    TMsg::Text(t) => {
-                        if in_tx.send(t.as_str().to_string()).is_err() {
-                            break;
-                        }
-                    }
+                let f = match m {
+                    TMsg::Text(t) => Frame::Text(t.as_str().to_string()),
+                    TMsg::Binary(b) => Frame::Bin(b.to_vec()),
                     TMsg::Close(_) => break,
-                    _ => {}
+                    _ => continue,
+                };
+                if in_tx.send(f).is_err() {
+                    break;
                 }
             }
         });
         tokio::spawn(async move {
-            self.run_link(Some(peer_id), ip, in_rx, out_tx, true).await;
+            self.run_link(Some(peer_id), ip, in_rx, out_tx, data_tx, true).await;
             end_io(reader, writer).await;
         });
         Ok(())
@@ -104,11 +112,17 @@ impl Node {
     pub(crate) async fn accept_ws(self: Arc<Self>, socket: axum::extract::ws::WebSocket, ip: IpAddr) {
         use axum::extract::ws::Message as AMsg;
         let (mut sink, mut stream) = socket.split();
-        let (in_tx, in_rx) = mpsc::unbounded_channel::<String>();
+        let (in_tx, in_rx) = mpsc::unbounded_channel::<Frame>();
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(DATA_QUEUE);
         let writer = tokio::spawn(async move {
-            while let Some(s) = out_rx.recv().await {
-                if sink.send(AMsg::Text(s.into())).await.is_err() {
+            loop {
+                let m = tokio::select! {
+                    biased;
+                    s = out_rx.recv() => match s { Some(s) => AMsg::Text(s.into()), None => break },
+                    b = data_rx.recv() => match b { Some(b) => AMsg::Binary(b.into()), None => break },
+                };
+                if sink.send(m).await.is_err() {
                     break;
                 }
             }
@@ -116,18 +130,18 @@ impl Node {
         });
         let reader = tokio::spawn(async move {
             while let Some(Ok(m)) = stream.next().await {
-                match m {
-                    AMsg::Text(t) => {
-                        if in_tx.send(t.as_str().to_string()).is_err() {
-                            break;
-                        }
-                    }
+                let f = match m {
+                    AMsg::Text(t) => Frame::Text(t.as_str().to_string()),
+                    AMsg::Binary(b) => Frame::Bin(b.to_vec()),
                     AMsg::Close(_) => break,
-                    _ => {}
+                    _ => continue,
+                };
+                if in_tx.send(f).is_err() {
+                    break;
                 }
             }
         });
-        self.run_link(None, ip, in_rx, out_tx, false).await;
+        self.run_link(None, ip, in_rx, out_tx, data_tx, false).await;
         end_io(reader, writer).await;
     }
 
@@ -136,8 +150,9 @@ impl Node {
         self: Arc<Self>,
         expected: Option<String>,
         ip: IpAddr,
-        mut in_rx: mpsc::UnboundedReceiver<String>,
+        mut in_rx: mpsc::UnboundedReceiver<Frame>,
         out_tx: mpsc::UnboundedSender<String>,
+        data_tx: mpsc::Sender<Vec<u8>>,
         dialer: bool,
     ) {
         // whatever happens below, a dial attempt to `expected` is over when this returns or registers
@@ -156,7 +171,7 @@ impl Node {
             return;
         }
         let device = match tokio::time::timeout(Duration::from_secs(5), in_rx.recv()).await {
-            Ok(Some(t)) => match serde_json::from_str::<WsMsg>(&t) {
+            Ok(Some(Frame::Text(t))) => match serde_json::from_str::<WsMsg>(&t) {
                 Ok(WsMsg::Hello { device }) => device,
                 _ => return,
             },
@@ -184,7 +199,7 @@ impl Node {
                 log::debug!("link with {peer_id}: keeping the connection dialed by the smaller id, dropping this one");
                 return;
             }
-            links.insert(peer_id.clone(), Link { tx: out_tx.clone(), conn_id, preferred });
+            links.insert(peer_id.clone(), Link { tx: out_tx.clone(), data: data_tx.clone(), conn_id, preferred });
         }
         // the address a working link runs over is the one to dial next time
         self.set_peer_addr(&peer_id, ip);
@@ -206,15 +221,25 @@ impl Node {
         // why the loop ended: decides whether the peer goes offline
         let mut timed_out = false;
         let mut closed = false;
+        // chunks of incoming link transfers being assembled from their pieces (this link only)
+        let mut asm: HashMap<(String, u64), Assembly> = HashMap::new();
         loop {
             tokio::select! {
                 m = in_rx.recv() => {
-                    let Some(t) = m else { closed = true; break };
+                    let Some(f) = m else { closed = true; break };
                     idle = 0;
-                    if let Ok(w) = serde_json::from_str::<WsMsg>(&t) {
-                        if let Some(reply) = self.handle_wire(&peer_id, w, Some(ip)).await {
-                            let _ = out_tx.send(serde_json::to_string(&reply).unwrap_or_default());
-                        }
+                    match f {
+                        Frame::Text(t) => match serde_json::from_str::<WsMsg>(&t) {
+                            Ok(WsMsg::FileStart { manifest }) => self.link_file_start(&peer_id, manifest, &out_tx),
+                            Ok(WsMsg::FileFinish { transfer_id }) => self.link_file_finish(&peer_id, transfer_id, &out_tx),
+                            Ok(w) => {
+                                if let Some(reply) = self.handle_wire(&peer_id, w, Some(ip)).await {
+                                    let _ = out_tx.send(serde_json::to_string(&reply).unwrap_or_default());
+                                }
+                            }
+                            Err(_) => {}
+                        },
+                        Frame::Bin(b) => self.link_piece(&peer_id, &b, &mut asm, &out_tx),
                     }
                 }
                 _ = tick.tick() => {
@@ -245,6 +270,117 @@ impl Node {
         if ours {
             self.kick_housekeeping();
         }
+    }
+}
+
+/// One frame read from a link socket.
+pub(crate) enum Frame {
+    Text(String),
+    Bin(Vec<u8>),
+}
+
+/// File pieces queued per link: a few pieces, so a transfer waits instead of buffering.
+const DATA_QUEUE: usize = 4;
+/// Chunks assembled at once per link (bounds the receiver's memory: each is up to 4 MiB).
+const MAX_ASSEMBLING: usize = (crate::transfer::MAX_ACTIVE_TRANSFERS * LINK_WINDOW_CHUNKS) + 2;
+
+/// A chunk of an incoming link transfer, filled piece by piece.
+pub(crate) struct Assembly {
+    buf: Vec<u8>,
+    /// Which pieces arrived (a resumed chunk may resend pieces that are already here).
+    have: Vec<bool>,
+    missing: usize,
+    hash: [u8; 32],
+}
+
+impl Assembly {
+    fn new(len: usize, hash: [u8; 32]) -> Self {
+        let n = len.div_ceil(LINK_PIECE).max(1);
+        Assembly { buf: vec![0u8; len], have: vec![false; n], missing: n, hash }
+    }
+}
+
+impl Node {
+    /// `FileStart` over the link: the same as POST /files; answered with `FileHave`.
+    fn link_file_start(self: &Arc<Self>, peer_id: &str, manifest: FileManifest, out: &mpsc::UnboundedSender<String>) {
+        // the sender only uses the link when it could not connect to us: say why in our log
+        log::warn!(
+            "{peer_id} could not connect to us on TCP {} and sends {} over the link instead (inbound connections are blocked here: on Windows allow Lancat in the firewall, or set the network to Private)",
+            self.me().port,
+            manifest.name
+        );
+        let (node, from, out) = (self.clone(), peer_id.to_string(), out.clone());
+        tokio::spawn(async move {
+            let transfer_id = manifest.transfer_id.clone();
+            let reply = match node.incoming_init(&from, manifest).await {
+                Ok(st) => WsMsg::FileHave { transfer_id, have: st.have, complete: st.complete, error: None, gone: false },
+                Err((code, e)) => WsMsg::FileHave { transfer_id, have: vec![], complete: false, error: Some(e), gone: code == axum::http::StatusCode::GONE },
+            };
+            let _ = out.send(serde_json::to_string(&reply).unwrap_or_default());
+        });
+    }
+
+    /// `FileFinish` over the link: the same as POST /finish; answered with `FileDone`.
+    fn link_file_finish(self: &Arc<Self>, peer_id: &str, transfer_id: String, out: &mpsc::UnboundedSender<String>) {
+        let (node, from, out) = (self.clone(), peer_id.to_string(), out.clone());
+        tokio::spawn(async move {
+            let reply = match node.incoming_finish(&from, &transfer_id).await {
+                Ok(()) => WsMsg::FileDone { transfer_id, error: None, conflict: false },
+                Err((code, e)) => WsMsg::FileDone { transfer_id, error: Some(e), conflict: code == axum::http::StatusCode::CONFLICT },
+            };
+            let _ = out.send(serde_json::to_string(&reply).unwrap_or_default());
+        });
+    }
+
+    /// A binary frame: one piece of a chunk. A complete chunk is written like PUT /files/{tid}/{n}
+    /// (off the link loop) and answered with `FileChunkAck`.
+    fn link_piece(self: &Arc<Self>, peer_id: &str, frame: &[u8], asm: &mut HashMap<(String, u64), Assembly>, out: &mpsc::UnboundedSender<String>) {
+        let Some(p) = LinkPiece::decode(frame) else { return };
+        let len = p.chunk_len as usize;
+        let ack_err = |e: &str| {
+            let a = WsMsg::FileChunkAck { transfer_id: p.transfer_id.clone(), chunk: p.chunk, error: Some(e.into()), gone: false };
+            let _ = out.send(serde_json::to_string(&a).unwrap_or_default());
+        };
+        let off = p.offset as usize;
+        let expect = LINK_PIECE.min(len.saturating_sub(off));
+        if len as u64 > CHUNK_SIZE || off % LINK_PIECE != 0 || p.data.len() != expect || (len > 0 && off >= len) {
+            ack_err("bad piece");
+            return;
+        }
+        let key = (p.transfer_id.clone(), p.chunk);
+        if !asm.contains_key(&key) {
+            if asm.len() >= MAX_ASSEMBLING {
+                ack_err("too many chunks in flight");
+                return;
+            }
+            asm.insert(key.clone(), Assembly::new(len, p.hash));
+        }
+        let a = asm.get_mut(&key).unwrap();
+        if a.buf.len() != len || a.hash != p.hash {
+            // the file changed under this chunk: start it over
+            *a = Assembly::new(len, p.hash);
+        }
+        let k = off / LINK_PIECE;
+        a.buf[off..off + p.data.len()].copy_from_slice(&p.data);
+        if !a.have[k] {
+            a.have[k] = true;
+            a.missing -= 1;
+        }
+        if a.missing > 0 {
+            return;
+        }
+        let a = asm.remove(&key).unwrap();
+        let (node, from, out) = (self.clone(), peer_id.to_string(), out.clone());
+        let (tid, chunk) = key;
+        let hash = a.hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        tokio::spawn(async move {
+            let r = node.incoming_chunk(&from, &tid, chunk, a.buf, Some(hash)).await;
+            let reply = match r {
+                Ok(()) => WsMsg::FileChunkAck { transfer_id: tid, chunk, error: None, gone: false },
+                Err((code, e)) => WsMsg::FileChunkAck { transfer_id: tid, chunk, error: Some(e), gone: code == axum::http::StatusCode::GONE },
+            };
+            let _ = out.send(serde_json::to_string(&reply).unwrap_or_default());
+        });
     }
 }
 

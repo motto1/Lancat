@@ -125,40 +125,10 @@ fn err500(e: impl std::fmt::Display) -> (StatusCode, String) {
 
 async fn file_init(State(node): St, Path(tid): Path<String>, h: HeaderMap, Json(m): Json<FileManifest>) -> Result<Json<TransferStatus>, (StatusCode, String)> {
     let from = sender(&h)?;
-    if m.transfer_id != tid || m.from != from {
+    if m.transfer_id != tid {
         return Err((StatusCode::BAD_REQUEST, "manifest mismatch".into()));
     }
-    if cancelled_here(&node, &from, &tid) {
-        return Err((StatusCode::GONE, "cancelled".into()));
-    }
-    let max_mb = node.store.settings().max_file_mb;
-    if max_mb > 0 && m.size > max_mb * 1024 * 1024 {
-        return Err((StatusCode::PAYLOAD_TOO_LARGE, format!("file exceeds {max_mb} MB")));
-    }
-    let existing = node.incoming.lock().unwrap().get(&tid).cloned();
-    let t = match existing {
-        Some(t) if t.manifest.hash == m.hash => t,
-        _ => {
-            let dir = node.receive_dir();
-            let mc = m.clone();
-            let t = tokio::task::spawn_blocking(move || IncomingTransfer::open(&dir, mc)).await.map_err(err500)?.map_err(err500)?;
-            let t = Arc::new(t);
-            node.incoming.lock().unwrap().insert(tid.clone(), t.clone());
-            t
-        }
-    };
-    // make sure the conversation shows the file even if the offer never arrived
-    let body = FileBody { name: m.name.clone(), size: m.size, transfer_id: tid.clone(), hash: m.hash.clone(), ..Default::default() };
-    if !node.store_incoming(&from, &m.msg_id, "file", serde_json::to_value(&body).unwrap_or_default(), "receiving", m.ts) {
-        return Err(err500("could not record the transfer"));
-    }
-    if let Ok(Some(msg)) = node.store.message(&m.msg_id) {
-        if msg.status != "receiving" {
-            node.set_status(&m.msg_id, "receiving");
-        }
-    }
-    // zero-length files: nothing to upload
-    Ok(Json(TransferStatus { have: t.have(), complete: t.is_complete() }))
+    node.incoming_init(&from, m).await.map(Json)
 }
 
 async fn file_status(State(node): St, Path(tid): Path<String>) -> Result<Json<TransferStatus>, StatusCode> {
@@ -171,64 +141,116 @@ async fn file_chunk(State(node): St, Path((tid, chunk)): Path<(String, u64)>, h:
     // take a slot before reading the body, so waiting uploads are not held in memory
     let _slot = node.chunk_slots.acquire().await.map_err(err500)?;
     let body = axum::body::to_bytes(body, (CHUNK_SIZE as usize) * 2).await.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let Some(t) = node.incoming.lock().unwrap().get(&tid).cloned() else {
-        if cancelled_here(&node, &from, &tid) {
-            return Err((StatusCode::GONE, "cancelled".into()));
-        }
-        return Err((StatusCode::NOT_FOUND, "unknown transfer".into()));
-    };
-    if t.manifest.from != from {
-        return Err((StatusCode::FORBIDDEN, "not your transfer".into()));
-    }
     let hash = h.get(HEADER_CHUNK_HASH).and_then(|v| v.to_str().ok()).map(String::from);
-    let t2 = t.clone();
-    tokio::task::spawn_blocking(move || t2.write_chunk(chunk, &body, hash.as_deref()))
-        .await
-        .map_err(err500)?
-        .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-    node.touch_peer(&from);
-    node.emit(CoreEvent::Progress {
-        msg_id: t.manifest.msg_id.clone(),
-        peer_id: from,
-        done: t.received_bytes(),
-        total: t.manifest.size,
-        outgoing: false,
-    });
+    node.incoming_chunk(&from, &tid, chunk, body.to_vec(), hash).await?;
     Ok(StatusCode::OK)
 }
 
 async fn file_finish(State(node): St, Path(tid): Path<String>, h: HeaderMap) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let from = sender(&h)?;
-    let t = node.incoming.lock().unwrap().get(&tid).cloned().ok_or((StatusCode::NOT_FOUND, "unknown transfer".into()))?;
-    if t.manifest.from != from {
-        return Err((StatusCode::FORBIDDEN, "not your transfer".into()));
-    }
-    let dir = node.receive_dir();
-    let t2 = t.clone();
-    let res = tokio::task::spawn_blocking(move || t2.finish(&dir)).await.map_err(err500)?;
-    match res {
-        Ok(path) => {
-            node.incoming.lock().unwrap().remove(&tid);
-            let body = FileBody {
-                name: t.manifest.name.clone(),
-                size: t.manifest.size,
-                transfer_id: tid,
-                path: path.to_string_lossy().to_string(),
-                hash: t.manifest.hash.clone(),
-                error: None,
-            };
-            if let Ok(Some(m)) = node.store.update_message(&t.manifest.msg_id, "done", Some(&serde_json::to_value(&body).unwrap_or_default())) {
-                node.emit(CoreEvent::MessageUpdate { message: m });
-            }
-            log::info!("received {} -> {}", t.manifest.name, path.display());
-            Ok(Json(serde_json::json!({ "ok": true })))
+    node.incoming_finish(&from, &tid).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// The receiving side of a transfer, shared by the HTTP routes and the link (`WsMsg::FileStart`
+/// / binary pieces / `FileFinish`). Errors carry the HTTP status the route answers with.
+impl Node {
+    pub(crate) async fn incoming_init(self: &Arc<Self>, from: &str, m: FileManifest) -> Result<TransferStatus, (StatusCode, String)> {
+        let tid = m.transfer_id.clone();
+        if m.from != from {
+            return Err((StatusCode::BAD_REQUEST, "manifest mismatch".into()));
         }
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("hash mismatch") {
-                Err((StatusCode::CONFLICT, msg))
-            } else {
-                Err((StatusCode::UNPROCESSABLE_ENTITY, msg))
+        if cancelled_here(self, from, &tid) {
+            return Err((StatusCode::GONE, "cancelled".into()));
+        }
+        let max_mb = self.store.settings().max_file_mb;
+        if max_mb > 0 && m.size > max_mb * 1024 * 1024 {
+            return Err((StatusCode::PAYLOAD_TOO_LARGE, format!("file exceeds {max_mb} MB")));
+        }
+        let existing = self.incoming.lock().unwrap().get(&tid).cloned();
+        let t = match existing {
+            Some(t) if t.manifest.hash == m.hash => t,
+            _ => {
+                let dir = self.receive_dir();
+                let mc = m.clone();
+                let t = tokio::task::spawn_blocking(move || IncomingTransfer::open(&dir, mc)).await.map_err(err500)?.map_err(err500)?;
+                let t = Arc::new(t);
+                self.incoming.lock().unwrap().insert(tid.clone(), t.clone());
+                t
+            }
+        };
+        // make sure the conversation shows the file even if the offer never arrived
+        let body = FileBody { name: m.name.clone(), size: m.size, transfer_id: tid.clone(), hash: m.hash.clone(), ..Default::default() };
+        if !self.store_incoming(from, &m.msg_id, "file", serde_json::to_value(&body).unwrap_or_default(), "receiving", m.ts) {
+            return Err(err500("could not record the transfer"));
+        }
+        if let Ok(Some(msg)) = self.store.message(&m.msg_id) {
+            if msg.status != "receiving" {
+                self.set_status(&m.msg_id, "receiving");
+            }
+        }
+        // zero-length files: nothing to upload
+        Ok(TransferStatus { have: t.have(), complete: t.is_complete() })
+    }
+
+    pub(crate) async fn incoming_chunk(&self, from: &str, tid: &str, chunk: u64, body: Vec<u8>, hash: Option<String>) -> Result<(), (StatusCode, String)> {
+        let Some(t) = self.incoming.lock().unwrap().get(tid).cloned() else {
+            if cancelled_here(self, from, tid) {
+                return Err((StatusCode::GONE, "cancelled".into()));
+            }
+            return Err((StatusCode::NOT_FOUND, "unknown transfer".into()));
+        };
+        if t.manifest.from != from {
+            return Err((StatusCode::FORBIDDEN, "not your transfer".into()));
+        }
+        let t2 = t.clone();
+        tokio::task::spawn_blocking(move || t2.write_chunk(chunk, &body, hash.as_deref()))
+            .await
+            .map_err(err500)?
+            .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+        self.touch_peer(from);
+        self.emit(CoreEvent::Progress {
+            msg_id: t.manifest.msg_id.clone(),
+            peer_id: from.to_string(),
+            done: t.received_bytes(),
+            total: t.manifest.size,
+            outgoing: false,
+        });
+        Ok(())
+    }
+
+    pub(crate) async fn incoming_finish(&self, from: &str, tid: &str) -> Result<(), (StatusCode, String)> {
+        let t = self.incoming.lock().unwrap().get(tid).cloned().ok_or((StatusCode::NOT_FOUND, "unknown transfer".to_string()))?;
+        if t.manifest.from != from {
+            return Err((StatusCode::FORBIDDEN, "not your transfer".into()));
+        }
+        let dir = self.receive_dir();
+        let t2 = t.clone();
+        let res = tokio::task::spawn_blocking(move || t2.finish(&dir)).await.map_err(err500)?;
+        match res {
+            Ok(path) => {
+                self.incoming.lock().unwrap().remove(tid);
+                let body = FileBody {
+                    name: t.manifest.name.clone(),
+                    size: t.manifest.size,
+                    transfer_id: tid.to_string(),
+                    path: path.to_string_lossy().to_string(),
+                    hash: t.manifest.hash.clone(),
+                    error: None,
+                };
+                if let Ok(Some(m)) = self.store.update_message(&t.manifest.msg_id, "done", Some(&serde_json::to_value(&body).unwrap_or_default())) {
+                    self.emit(CoreEvent::MessageUpdate { message: m });
+                }
+                log::info!("received {} -> {}", t.manifest.name, path.display());
+                Ok(())
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("hash mismatch") {
+                    Err((StatusCode::CONFLICT, msg))
+                } else {
+                    Err((StatusCode::UNPROCESSABLE_ENTITY, msg))
+                }
             }
         }
     }

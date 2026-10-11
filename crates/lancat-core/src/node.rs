@@ -32,6 +32,14 @@ pub struct NodeConfig {
     pub recv_dir_override: Option<PathBuf>,
     /// Extra unicast probe targets (ip:udp_port), e.g. LANCAT_PROBE=127.0.0.1:47821 for tests.
     pub extra_probe_targets: Vec<SocketAddr>,
+    /// Listen on this address only instead of every interface (LANCAT_BIND_IP). Mainly for tests:
+    /// a peer that listens on one address but dials out from another is unreachable inbound.
+    pub bind_ip: Option<IpAddr>,
+    /// When the receiver's address does not answer, also try other addresses it was heard on and
+    /// our online Tailscale peers (LANCAT_ALT_ADDR=1). Off by default: the default fallback is the
+    /// link the receiver dialed, which needs no other path; an overlay path may run through a
+    /// relay on the internet and would hide the real problem (the receiver's firewall).
+    pub alt_addr_fallback: bool,
 }
 
 impl NodeConfig {
@@ -45,6 +53,8 @@ impl NodeConfig {
             name_override: None,
             recv_dir_override: None,
             extra_probe_targets: vec![],
+            bind_ip: None,
+            alt_addr_fallback: false,
         }
     }
 
@@ -72,6 +82,12 @@ impl NodeConfig {
         }
         if let Some(r) = env("LANCAT_RECV_DIR") {
             self.recv_dir_override = Some(r.into());
+        }
+        if let Some(ip) = env("LANCAT_BIND_IP").and_then(|p| p.parse().ok()) {
+            self.bind_ip = Some(ip);
+        }
+        if env("LANCAT_ALT_ADDR").is_some_and(|v| v != "0") {
+            self.alt_addr_fallback = true;
         }
         if let Some(p) = env("LANCAT_PROBE") {
             self.extra_probe_targets.extend(p.split(',').filter_map(|a| a.trim().parse::<SocketAddr>().ok()));
@@ -109,6 +125,9 @@ impl PeerState {
 
 pub(crate) struct Link {
     pub tx: mpsc::UnboundedSender<String>,
+    /// Binary frames (file pieces over the link). Bounded: a sender waits instead of queueing a
+    /// whole file in memory; the writer always sends queued text frames (`tx`) first.
+    pub data: mpsc::Sender<Vec<u8>>,
     pub conn_id: u64,
     /// Dialed by the device with the smaller id (wins over a simultaneous second connection).
     pub preferred: bool,
@@ -128,6 +147,11 @@ pub struct Node {
     pub(crate) active_out: Mutex<HashSet<String>>,
     /// Pause / cancel switches of the outgoing transfers that are running right now.
     pub(crate) out_ctl: Mutex<HashMap<String, Arc<crate::transfer::TransferCtl>>>,
+    /// Outgoing transfers running over the link: transfer id -> where their replies go.
+    pub(crate) link_waits: Mutex<HashMap<String, mpsc::UnboundedSender<WsMsg>>>,
+    /// peer -> (address, when) its HTTP server last did not answer there: the next transfers go
+    /// straight over the link instead of waiting for another connect timeout each.
+    pub(crate) http_unreachable: Mutex<HashMap<String, (IpAddr, Instant)>>,
     /// Outgoing transfers allowed to move data at once (see transfer::MAX_ACTIVE_TRANSFERS).
     pub(crate) transfer_slots: tokio::sync::Semaphore,
     /// Incoming chunk bodies buffered / written at once (see server::file_chunk).
@@ -169,7 +193,7 @@ impl Node {
             .or_else(|| Some(settings.device_name.clone()).filter(|n| !n.is_empty()))
             .unwrap_or_else(netutil::host_name);
 
-        let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, cfg.port)))
+        let listener = tokio::net::TcpListener::bind(SocketAddr::new(cfg.bind_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), cfg.port))
             .await
             .with_context(|| format!("bind TCP port {}", cfg.port))?;
         let port = listener.local_addr()?.port();
@@ -196,6 +220,8 @@ impl Node {
             incoming: Mutex::new(HashMap::new()),
             active_out: Mutex::new(HashSet::new()),
             out_ctl: Mutex::new(HashMap::new()),
+            link_waits: Mutex::new(HashMap::new()),
+            http_unreachable: Mutex::new(HashMap::new()),
             transfer_slots: tokio::sync::Semaphore::new(crate::transfer::MAX_ACTIVE_TRANSFERS),
             chunk_slots: tokio::sync::Semaphore::new(crate::server::MAX_INCOMING_CHUNKS),
             http,
@@ -883,6 +909,16 @@ impl Node {
                 self.peer_cancelled(peer_id, &transfer_id);
                 None
             }
+            // replies for an outgoing transfer running over the link
+            w @ (WsMsg::FileHave { .. } | WsMsg::FileChunkAck { .. } | WsMsg::FileDone { .. }) => {
+                let tid = w.link_reply_tid().unwrap_or_default().to_string();
+                if let Some(tx) = self.link_waits.lock().unwrap().get(&tid) {
+                    let _ = tx.send(w);
+                }
+                None
+            }
+            // handled by the link loop itself (`run_link`); never valid over POST /msg
+            WsMsg::FileStart { .. } | WsMsg::FileFinish { .. } => None,
         }
     }
 

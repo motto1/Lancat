@@ -90,6 +90,108 @@ pub enum WsMsg {
     /// Either side gave up a file transfer: the sender stops, the receiver drops the partial file.
     /// Older peers ignore it (unknown messages are skipped on the link).
     FileCancel { transfer_id: String },
+    // ---- file transfer over the link itself, for when the receiver cannot be reached by HTTP
+    // (its firewall drops inbound connections, but it dialed this link). Same steps as the HTTP
+    // routes: start (= POST /files) -> chunks as binary frames (see `LinkPiece`) acked one by one
+    // -> finish. Older peers ignore these (no `FileHave` comes back: the sender gives up).
+    /// sender -> receiver: start / resume a transfer.
+    FileStart { manifest: FileManifest },
+    /// receiver -> sender: answer to `FileStart`.
+    FileHave {
+        transfer_id: String,
+        #[serde(default)]
+        have: Vec<u64>,
+        #[serde(default)]
+        complete: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        /// The receiver cancelled this transfer (HTTP 410).
+        #[serde(default)]
+        gone: bool,
+    },
+    /// receiver -> sender: one chunk (all its pieces) was written, or failed.
+    FileChunkAck {
+        transfer_id: String,
+        chunk: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        #[serde(default)]
+        gone: bool,
+    },
+    /// sender -> receiver: every chunk was acked, verify and move into place (= POST /finish).
+    FileFinish { transfer_id: String },
+    /// receiver -> sender: answer to `FileFinish`.
+    FileDone {
+        transfer_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        /// Whole-file hash mismatch (HTTP 409): the sender starts over once.
+        #[serde(default)]
+        conflict: bool,
+    },
+}
+
+impl WsMsg {
+    /// The transfer a link-transfer reply belongs to (routed to the waiting sender).
+    pub fn link_reply_tid(&self) -> Option<&str> {
+        match self {
+            WsMsg::FileHave { transfer_id, .. } | WsMsg::FileChunkAck { transfer_id, .. } | WsMsg::FileDone { transfer_id, .. } => Some(transfer_id),
+            _ => None,
+        }
+    }
+}
+
+/// Size of one binary frame's payload when a chunk travels over the link: small enough that a
+/// text / ack / ping queued behind it waits only for one piece, not for a whole 4 MiB chunk.
+pub const LINK_PIECE: usize = 256 * 1024;
+/// Chunks of one transfer sent over the link before the first of them is acked (flow control).
+pub const LINK_WINDOW_CHUNKS: usize = 2;
+const PIECE_MAGIC: &[u8; 4] = b"LCF1";
+
+/// One binary link frame: a piece of a chunk. Every piece carries the chunk's length and BLAKE3
+/// hash, so pieces need no separate announcement and the receiver can verify the whole chunk.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkPiece {
+    pub transfer_id: String,
+    pub chunk: u64,
+    pub chunk_len: u32,
+    pub offset: u32,
+    pub hash: [u8; 32],
+    pub data: Vec<u8>,
+}
+
+impl LinkPiece {
+    /// magic(4) | tid_len(1) | tid | chunk(u64 BE) | chunk_len(u32 BE) | offset(u32 BE) | hash(32) | data
+    pub fn encode_header(transfer_id: &str, chunk: u64, chunk_len: u32, offset: u32, hash: &[u8; 32], data_len: usize) -> Vec<u8> {
+        let t = transfer_id.as_bytes();
+        let mut v = Vec::with_capacity(4 + 1 + t.len() + 8 + 4 + 4 + 32 + data_len);
+        v.extend_from_slice(PIECE_MAGIC);
+        v.push(t.len().min(255) as u8);
+        v.extend_from_slice(&t[..t.len().min(255)]);
+        v.extend_from_slice(&chunk.to_be_bytes());
+        v.extend_from_slice(&chunk_len.to_be_bytes());
+        v.extend_from_slice(&offset.to_be_bytes());
+        v.extend_from_slice(hash);
+        v
+    }
+
+    pub fn decode(b: &[u8]) -> Option<LinkPiece> {
+        if b.len() < 5 || &b[..4] != PIECE_MAGIC {
+            return None;
+        }
+        let tl = b[4] as usize;
+        let rest = b.get(5..)?;
+        let tid = std::str::from_utf8(rest.get(..tl)?).ok()?.to_string();
+        let r = rest.get(tl..)?;
+        if r.len() < 8 + 4 + 4 + 32 {
+            return None;
+        }
+        let chunk = u64::from_be_bytes(r[0..8].try_into().ok()?);
+        let chunk_len = u32::from_be_bytes(r[8..12].try_into().ok()?);
+        let offset = u32::from_be_bytes(r[12..16].try_into().ok()?);
+        let hash: [u8; 32] = r[16..48].try_into().ok()?;
+        Some(LinkPiece { transfer_id: tid, chunk, chunk_len, offset, hash, data: r[48..].to_vec() })
+    }
 }
 
 /// POST /files/{transfer_id}
@@ -168,6 +270,20 @@ mod tests {
         let s = serde_json::to_string(&Beacon { lancat: 1, op: BeaconOp::Probe, device: d }).unwrap();
         assert!(s.contains(r#""op":"probe""#));
         assert_eq!(serde_json::from_str::<Beacon>(&s).unwrap().op, BeaconOp::Probe);
+    }
+
+    #[test]
+    fn link_piece_roundtrip() {
+        let h = [7u8; 32];
+        let mut f = LinkPiece::encode_header("tid-1", 3, 1000, 256, &h, 4);
+        f.extend_from_slice(b"abcd");
+        let p = LinkPiece::decode(&f).unwrap();
+        assert_eq!(p, LinkPiece { transfer_id: "tid-1".into(), chunk: 3, chunk_len: 1000, offset: 256, hash: h, data: b"abcd".to_vec() });
+        assert!(LinkPiece::decode(b"LCF1").is_none());
+        assert!(LinkPiece::decode(&f[..20]).is_none());
+        // an old peer's parser: the new link messages are just unknown and skipped
+        let s = serde_json::to_string(&WsMsg::FileChunkAck { transfer_id: "t".into(), chunk: 1, error: None, gone: false }).unwrap();
+        assert_eq!(serde_json::from_str::<WsMsg>(&s).unwrap().link_reply_tid(), Some("t"));
     }
 
     #[test]

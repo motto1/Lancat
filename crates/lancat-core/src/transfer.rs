@@ -288,7 +288,7 @@ impl Node {
         if !self.is_online(&m.peer_id) {
             bail!("对方不在线");
         }
-        let base = self.reachable_base(&m.peer_id).await?;
+        let route = self.pick_route(&m.peer_id).await?;
         let me = self.me().id;
 
         // announce, so the receiver's UI shows it right away
@@ -304,6 +304,10 @@ impl Node {
             chunk_size: CHUNK_SIZE,
             hash: body.hash.clone(),
             ts: m.ts,
+        };
+        let base = match route {
+            Route::Http(base) => base,
+            Route::Link => return self.link_transfer(&m, &manifest, &path).await,
         };
         for attempt in 0..2 {
             let resp = self
@@ -405,32 +409,57 @@ impl Node {
     }
 }
 
+/// How an outgoing transfer reaches the receiver.
+enum Route {
+    /// HTTP chunk uploads to this base URL (the receiver accepts connections): the fast path.
+    Http(String),
+    /// Over the link the receiver dialed (it cannot be reached inbound).
+    Link,
+}
+
 impl Node {
-    /// Base URL of the first address the peer answers on (`GET /info` with its own id), current
-    /// address first. Text can still arrive over a link the peer dialed, so a peer whose firewall
-    /// drops inbound connections on the address we know looks online and chats fine, while
-    /// uploads to that address fail; another address it was heard on (Tailscale ...) may work.
-    async fn reachable_base(&self, peer_id: &str) -> Result<String> {
-        let mut cands = self.peer_dial_addrs(peer_id);
-        let Some(&(first, port)) = cands.first() else { bail!("对方地址未知") };
-        if self.answers_as(peer_id, first, port).await {
-            return Ok(base_url(first, port));
+    /// HTTP when the receiver answers on its address; else the link, which works whenever either
+    /// side could connect (texts arrive over it too); else, only with `alt_addr_fallback`, another
+    /// address. A receiver whose firewall drops inbound connections still dials us, so its link is
+    /// the one path that is sure to exist.
+    async fn pick_route(&self, peer_id: &str) -> Result<Route> {
+        let (ip, port) = self.peer_addr(peer_id).ok_or_else(|| anyhow!("对方地址未知"))?;
+        let linked = || self.links.lock().unwrap().contains_key(peer_id);
+        let known_blocked = matches!(self.http_unreachable.lock().unwrap().get(peer_id), Some((a, t)) if *a == ip && t.elapsed() < Duration::from_secs(60));
+        if known_blocked && linked() {
+            return Ok(Route::Link);
         }
-        // Fallbacks, checked at once: other addresses it was heard on, then our online Tailscale
-        // peers (one of them may be this device; it is heard on the LAN only while linked there).
+        if self.answers_as(peer_id, ip, port).await {
+            self.http_unreachable.lock().unwrap().remove(peer_id);
+            return Ok(Route::Http(base_url(ip, port)));
+        }
+        self.http_unreachable.lock().unwrap().insert(peer_id.to_string(), (ip, std::time::Instant::now()));
+        if linked() {
+            log::warn!("{peer_id}: {ip}:{port} does not accept connections (inbound blocked by its firewall?), sending over the link");
+            return Ok(Route::Link);
+        }
+        if self.cfg.alt_addr_fallback {
+            if let Some(base) = self.alt_base(peer_id, ip, port).await {
+                return Ok(Route::Http(base));
+            }
+        }
+        bail!("连不上对方 {ip}:{port}，对方也没有连过来（对方的防火墙可能挡住了 Lancat 的入站连接）")
+    }
+
+    /// Opt-in fallback (`NodeConfig::alt_addr_fallback`): the first other address the peer answers
+    /// on: addresses it was heard on (newest first), then our online Tailscale peers.
+    async fn alt_base(&self, peer_id: &str, first: IpAddr, port: u16) -> Option<String> {
+        let mut cands: Vec<(IpAddr, u16)> = self.peer_dial_addrs(peer_id).into_iter().filter(|(ip, _)| *ip != first).collect();
         for ip in netutil::tailscale_peers().await.into_iter().take(32) {
             let ip = IpAddr::V4(ip);
-            if !cands.iter().any(|(c, _)| *c == ip) {
+            if ip != first && !cands.iter().any(|(c, _)| *c == ip) {
                 cands.push((ip, port));
             }
         }
-        let rest = &cands[1..];
-        let ok = futures_util::future::join_all(rest.iter().map(|(ip, p)| self.answers_as(peer_id, *ip, *p))).await;
-        if let Some((ip, p)) = rest.iter().zip(ok).find(|(_, ok)| *ok).map(|(c, _)| *c) {
-            log::warn!("{peer_id}: {first}:{port} not reachable (inbound blocked by its firewall?), sending via {ip}:{p}");
-            return Ok(base_url(ip, p));
-        }
-        bail!("连不上对方 {first}:{port}（对方能连我们所以文字可达，但对方的防火墙挡住了 Lancat 的入站连接，文件发不过去）")
+        let ok = futures_util::future::join_all(cands.iter().map(|(ip, p)| self.answers_as(peer_id, *ip, *p))).await;
+        let (ip, p) = cands.iter().zip(ok).find(|(_, ok)| *ok).map(|(c, _)| *c)?;
+        log::warn!("{peer_id}: {first}:{port} not reachable, sending via {ip}:{p} (alternate address fallback)");
+        Some(base_url(ip, p))
     }
 
     /// `GET /info` at ip:port answers with this device id.
@@ -440,6 +469,111 @@ impl Node {
             Ok(r) if r.status().is_success() => matches!(json_body::<DeviceInfo>(r).await, Ok(d) if d.id == peer_id),
             _ => false,
         }
+    }
+
+    /// Sends the file over the link: `FileStart` -> pieces (binary frames, at most
+    /// `LINK_WINDOW_CHUNKS` chunks unacked) -> `FileFinish`. Resumable like the HTTP path (the
+    /// receiver keeps what it has). Queued text frames always go out before the next piece.
+    async fn link_transfer(self: &Arc<Self>, m: &Message, manifest: &FileManifest, path: &std::path::Path) -> Result<()> {
+        struct Unregister<'a>(&'a Node, String);
+        impl Drop for Unregister<'_> {
+            fn drop(&mut self) {
+                self.0.link_waits.lock().unwrap().remove(&self.1);
+            }
+        }
+        let tid = manifest.transfer_id.clone();
+        let size = manifest.size;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WsMsg>();
+        self.link_waits.lock().unwrap().insert(tid.clone(), tx);
+        let _unregister = Unregister(self, tid.clone());
+        let lost = || anyhow!("与对方的连接断开了");
+        'attempt: for attempt in 0..2 {
+            if !self.send_over_link(&m.peer_id, &WsMsg::FileStart { manifest: manifest.clone() }) {
+                return Err(lost());
+            }
+            let have = loop {
+                let w = recv_reply(&mut rx, 15).await.map_err(|_| anyhow!("对方没有回应经连接传文件的请求（对方的 Lancat 可能是旧版本，需要更新；或者在对方电脑上放行 Lancat 的入站连接）"))?;
+                if let WsMsg::FileHave { have, error, gone, .. } = w {
+                    if gone {
+                        return Err(PeerCancelled.into());
+                    }
+                    if let Some(e) = error {
+                        bail!("对方拒绝: {e}");
+                    }
+                    break have;
+                }
+            };
+            let have: std::collections::HashSet<u64> = have.into_iter().collect();
+            let mut done: u64 = have.iter().map(|&i| chunk_len(size, i)).sum();
+            self.emit(CoreEvent::Progress { msg_id: m.id.clone(), peer_id: m.peer_id.clone(), done, total: size, outgoing: true });
+            let data = self.links.lock().unwrap().get(&m.peer_id).map(|l| l.data.clone()).ok_or_else(lost)?;
+            let file = Arc::new(File::open(path)?);
+            let mut next = (0..manifest.chunk_count()).filter(|i| !have.contains(i));
+            let mut inflight = std::collections::HashSet::new();
+            loop {
+                while inflight.len() < LINK_WINDOW_CHUNKS {
+                    let Some(idx) = next.next() else { break };
+                    let len = chunk_len(size, idx) as usize;
+                    let f = file.clone();
+                    let buf = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+                        let mut buf = vec![0u8; len];
+                        read_at(&f, &mut buf, idx * CHUNK_SIZE)?;
+                        Ok(buf)
+                    })
+                    .await??;
+                    let hash: [u8; 32] = *blake3::hash(&buf).as_bytes();
+                    for (k, piece) in buf.chunks(LINK_PIECE).enumerate() {
+                        let mut frame = LinkPiece::encode_header(&tid, idx, len as u32, (k * LINK_PIECE) as u32, &hash, piece.len());
+                        frame.extend_from_slice(piece);
+                        data.send(frame).await.map_err(|_| lost())?;
+                    }
+                    inflight.insert(idx);
+                }
+                if inflight.is_empty() {
+                    break;
+                }
+                let w = recv_reply(&mut rx, 60).await?;
+                if let WsMsg::FileChunkAck { chunk, error, gone, .. } = w {
+                    if !inflight.remove(&chunk) {
+                        continue;
+                    }
+                    if gone {
+                        return Err(PeerCancelled.into());
+                    }
+                    if let Some(e) = error {
+                        bail!("chunk {chunk}: {e}");
+                    }
+                    done += chunk_len(size, chunk);
+                    self.touch_peer(&m.peer_id);
+                    self.emit(CoreEvent::Progress { msg_id: m.id.clone(), peer_id: m.peer_id.clone(), done, total: size, outgoing: true });
+                }
+            }
+            if !self.send_over_link(&m.peer_id, &WsMsg::FileFinish { transfer_id: tid.clone() }) {
+                return Err(lost());
+            }
+            loop {
+                if let WsMsg::FileDone { error, conflict, .. } = recv_reply(&mut rx, 120).await? {
+                    match error {
+                        None => return Ok(()),
+                        Some(_) if conflict && attempt == 0 => {
+                            log::warn!("hash mismatch on {}, restarting transfer", manifest.name);
+                            continue 'attempt;
+                        }
+                        Some(e) => bail!("完成失败: {e}"),
+                    }
+                }
+            }
+        }
+        bail!("校验失败")
+    }
+}
+
+/// Next reply for a link transfer, or an error after `secs` of silence.
+async fn recv_reply(rx: &mut tokio::sync::mpsc::UnboundedReceiver<WsMsg>, secs: u64) -> Result<WsMsg> {
+    match tokio::time::timeout(Duration::from_secs(secs), rx.recv()).await {
+        Ok(Some(w)) => Ok(w),
+        Ok(None) => bail!("stopped"),
+        Err(_) => bail!("对方 {secs} 秒没有回应"),
     }
 }
 
@@ -457,8 +591,9 @@ mod tests {
     use super::*;
     use crate::NodeConfig;
 
-    async fn start(dir: &std::path::Path, name: &str) -> Arc<Node> {
+    async fn start(dir: &std::path::Path, name: &str, bind: Option<std::net::IpAddr>) -> Arc<Node> {
         let mut cfg = NodeConfig::new(dir.join("data"));
+        cfg.bind_ip = bind;
         cfg.port = 0;
         cfg.enable_mdns = false;
         cfg.enable_udp = false;
@@ -467,40 +602,65 @@ mod tests {
         Node::start(cfg).await.unwrap()
     }
 
-    /// The address we know the peer by drops connections (its firewall), but it was also heard on
-    /// another one: the file goes there instead of failing.
+    /// The receiver cannot be reached inbound (it listens on 127.0.0.2 but dials out from
+    /// 127.0.0.1, which is all the sender knows of it), but it dialed the link: the file goes over
+    /// the link, and a text sent meanwhile is not stuck behind the file.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn file_falls_back_to_another_address() {
-        let ta = tempfile::tempdir().unwrap();
-        let tb = tempfile::tempdir().unwrap();
-        let a = start(ta.path(), "alpha").await;
-        let b = start(tb.path(), "bravo").await;
-        let pb = a.add_peer_addr(&format!("127.0.0.1:{}", b.port())).await.unwrap();
-        // the "LAN address" that is blackholed (TEST-NET-1: never answers)
-        let dead: IpAddr = "192.0.2.1".parse().unwrap();
-        a.set_peer_addr(&pb.id, dead);
-        assert_eq!(a.peer_addr(&pb.id).unwrap().0, dead);
-        assert_eq!(a.peer_dial_addrs(&pb.id).iter().map(|x| x.0).collect::<Vec<_>>(), vec![dead, "127.0.0.1".parse::<IpAddr>().unwrap()]);
+    async fn file_over_link_when_receiver_unreachable() {
+        let ts = tempfile::tempdir().unwrap();
+        let tr = tempfile::tempdir().unwrap();
+        let snd = start(ts.path(), "sender", None).await;
+        let rcv = start(tr.path(), "receiver", Some("127.0.0.2".parse().unwrap())).await;
+        let rcv_id = rcv.me().id;
+        let snd_id = snd.me().id;
+        rcv.add_peer_addr(&format!("127.0.0.1:{}", snd.port())).await.unwrap();
+        // the sender only knows the receiver by 127.0.0.1 (where nothing listens)
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !snd.is_online(&rcv_id) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("sender hears the receiver");
+        assert_eq!(snd.peer_addr(&rcv_id).unwrap().0.to_string(), "127.0.0.1");
+        rcv.dial_link(&snd_id, true).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !snd.links.lock().unwrap().contains_key(&rcv_id) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("link up");
 
-        let src = ta.path().join("fb.bin");
-        std::fs::write(&src, vec![7u8; 5 * 1024 * 1024 + 3]).unwrap();
-        let mut ea = a.subscribe();
-        let ms = a.send_files(&[pb.id.clone()], &[src]).await.unwrap();
-        let id = ms[0].id.clone();
+        let size = 3 * CHUNK_SIZE as usize + 12345;
+        let data: Vec<u8> = (0..size).map(|i| (i * 7 % 251) as u8).collect();
+        let src = ts.path().join("big.bin");
+        std::fs::write(&src, &data).unwrap();
+        let mut es = snd.subscribe();
+        let ms = snd.send_files(&[rcv_id.clone()], &[src]).await.unwrap();
+        let fid = ms[0].id.clone();
+        // a text while the file is on its way
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let t = snd.send_text(&rcv_id, "插队的消息").await.unwrap();
+        let mut text_ok = t.status == "delivered";
         let fut = async {
             loop {
-                if let Ok(CoreEvent::MessageUpdate { message }) = ea.recv().await {
-                    if message.id == id && matches!(message.status.as_str(), "done" | "failed") {
+                if let Ok(CoreEvent::MessageUpdate { message }) = es.recv().await {
+                    if message.id == t.id && message.status == "delivered" {
+                        text_ok = true;
+                    }
+                    if message.id == fid && matches!(message.status.as_str(), "done" | "failed") {
                         return message;
                     }
                 }
             }
         };
-        let m = tokio::time::timeout(Duration::from_secs(30), fut).await.expect("transfer timed out");
+        let m = tokio::time::timeout(Duration::from_secs(60), fut).await.expect("transfer timed out");
         assert_eq!(m.status, "done", "{:?}", m.body);
-        let got = std::fs::read(tb.path().join("recv").join("fb.bin")).unwrap();
-        assert_eq!(got.len(), 5 * 1024 * 1024 + 3);
-        a.shutdown();
-        b.shutdown();
+        assert!(text_ok || snd.store.message(&t.id).unwrap().unwrap().status == "delivered", "text not delivered");
+        let got = std::fs::read(tr.path().join("recv").join("big.bin")).unwrap();
+        assert!(got == data, "content differs");
+        snd.shutdown();
+        rcv.shutdown();
     }
 }
