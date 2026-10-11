@@ -49,6 +49,11 @@ pub(crate) fn router(node: Arc<Node>) -> Router {
 pub(crate) fn spawn(node: Arc<Node>, listener: tokio::net::TcpListener) {
     let mut stop = node.shutdown_rx();
     let app = router(node);
+    // TCP_NODELAY on accepted connections too (WebSocket frames, small HTTP replies)
+    use axum::serve::ListenerExt;
+    let listener = listener.tap_io(|tcp| {
+        let _ = tcp.set_nodelay(true);
+    });
     tokio::spawn(async move {
         let svc = app.into_make_service_with_connect_info::<SocketAddr>();
         let res = axum::serve(listener, svc)

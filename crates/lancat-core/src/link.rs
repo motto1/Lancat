@@ -66,11 +66,13 @@ impl Node {
         let url = format!("ws://{}/ws", fmt_sa(&SocketAddr::new(ip, port)));
         let mut req = url.into_client_request()?;
         req.headers_mut().insert(HEADER_DEVICE_ID, self.me().id.parse()?);
-        let (ws, _) = tokio::time::timeout(Duration::from_secs(5), tokio_tungstenite::connect_async(req)).await??;
+        // disable_nagle: small frames (text, typing, acks, pings) go out at once instead of
+        // waiting up to ~40 ms for Nagle/delayed-ACK to coalesce them
+        let (ws, _) = tokio::time::timeout(Duration::from_secs(5), tokio_tungstenite::connect_async_with_config(req, None, true)).await??;
         let (mut sink, mut stream) = ws.split();
         let (in_tx, in_rx) = mpsc::unbounded_channel::<String>();
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
-        tokio::spawn(async move {
+        let writer = tokio::spawn(async move {
             while let Some(s) = out_rx.recv().await {
                 if sink.send(TMsg::Text(s.into())).await.is_err() {
                     break;
@@ -78,7 +80,7 @@ impl Node {
             }
             let _ = sink.close().await;
         });
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             while let Some(Ok(m)) = stream.next().await {
                 match m {
                     TMsg::Text(t) => {
@@ -91,7 +93,10 @@ impl Node {
                 }
             }
         });
-        tokio::spawn(self.run_link(Some(peer_id), ip, in_rx, out_tx, true));
+        tokio::spawn(async move {
+            self.run_link(Some(peer_id), ip, in_rx, out_tx, true).await;
+            end_io(reader, writer).await;
+        });
         Ok(())
     }
 
@@ -101,7 +106,7 @@ impl Node {
         let (mut sink, mut stream) = socket.split();
         let (in_tx, in_rx) = mpsc::unbounded_channel::<String>();
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
-        tokio::spawn(async move {
+        let writer = tokio::spawn(async move {
             while let Some(s) = out_rx.recv().await {
                 if sink.send(AMsg::Text(s.into())).await.is_err() {
                     break;
@@ -109,7 +114,7 @@ impl Node {
             }
             let _ = sink.close().await;
         });
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             while let Some(Ok(m)) = stream.next().await {
                 match m {
                     AMsg::Text(t) => {
@@ -123,6 +128,7 @@ impl Node {
             }
         });
         self.run_link(None, ip, in_rx, out_tx, false).await;
+        end_io(reader, writer).await;
     }
 
     /// Transport-independent link loop: hello handshake, registration, keepalive, dispatch.
@@ -144,6 +150,7 @@ impl Node {
             }
         }
         let guard = DialGuard(&self, if dialer { expected.clone() } else { None });
+        let me_id = self.me().id;
         let hello = serde_json::to_string(&WsMsg::Hello { device: self.me() }).unwrap_or_default();
         if dialer && out_tx.send(hello.clone()).is_err() {
             return;
@@ -155,16 +162,30 @@ impl Node {
             },
             _ => return,
         };
-        if device.id == self.me().id || expected.as_ref().is_some_and(|e| *e != device.id) || self.store.is_blocked(&device.id) {
+        if device.id == me_id || expected.as_ref().is_some_and(|e| *e != device.id) || self.store.is_blocked(&device.id) {
             return;
         }
         if !dialer && out_tx.send(hello).is_err() {
             return;
         }
         let peer_id = device.id.clone();
+        // Simultaneous dials (both ends dialing at once: a forced dial from the non-designated
+        // side, a path upgrade racing a reconnect) used to end with each side keeping a different
+        // connection — the newest it registered — and closing the other, i.e. the one its peer
+        // kept: both links died and the pair reconnected over and over. Both ends now apply the
+        // same rule: the connection dialed by the smaller device id wins; between two equally
+        // ranked ones the newer replaces the older (path upgrades).
         self.peer_seen(device, ip);
+        let preferred = if dialer { me_id.as_str() < peer_id.as_str() } else { peer_id.as_str() < me_id.as_str() };
         let conn_id = self.conn_seq.fetch_add(1, Ordering::Relaxed);
-        self.links.lock().unwrap().insert(peer_id.clone(), Link { tx: out_tx.clone(), conn_id });
+        {
+            let mut links = self.links.lock().unwrap();
+            if links.get(&peer_id).is_some_and(|l| l.preferred && !preferred) {
+                log::debug!("link with {peer_id}: keeping the connection dialed by the smaller id, dropping this one");
+                return;
+            }
+            links.insert(peer_id.clone(), Link { tx: out_tx.clone(), conn_id, preferred });
+        }
         // the address a working link runs over is the one to dial next time
         self.set_peer_addr(&peer_id, ip);
         drop(guard); // dial finished: allow future reconnects
@@ -221,5 +242,71 @@ impl Node {
         if ours && (timed_out || closed) {
             self.link_lost(&peer_id, timed_out);
         }
+        if ours {
+            self.kick_housekeeping();
+        }
+    }
+}
+
+/// A link loop ended: stop its socket tasks. The reader used to outlive the link until the remote
+/// closed the socket, forever after a ping timeout (peer gone, no FIN): one task + socket leaked
+/// per lost link. The writer gets a moment to flush what is queued (bye, last acks) and close.
+async fn end_io(reader: tokio::task::JoinHandle<()>, writer: tokio::task::JoinHandle<()>) {
+    reader.abort();
+    let w = writer.abort_handle();
+    if tokio::time::timeout(Duration::from_secs(3), writer).await.is_err() {
+        w.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::{Node, NodeConfig};
+
+    async fn start(dir: &std::path::Path, name: &str) -> Arc<Node> {
+        let mut cfg = NodeConfig::new(dir.join("data"));
+        cfg.port = 0;
+        cfg.enable_mdns = false;
+        cfg.enable_udp = false;
+        cfg.name_override = Some(name.into());
+        cfg.recv_dir_override = Some(dir.join("recv"));
+        Node::start(cfg).await.expect("start node")
+    }
+
+    /// Both ends dial each other at the same moment (twice over): afterwards they must agree on
+    /// one connection, i.e. the link stays up without a gap and without reconnecting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn simultaneous_dials_converge() {
+        let (ta, tb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let a = start(ta.path(), "alpha").await;
+        let b = start(tb.path(), "bravo").await;
+        a.add_peer_addr(&format!("127.0.0.1:{}", b.port())).await.unwrap();
+        let (aid, bid) = (a.me().id, b.me().id);
+        let linked = |n: &Arc<Node>, id: &str| n.links.lock().unwrap().contains_key(id);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !(linked(&a, &bid) && linked(&b, &aid)) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("initial link");
+        let lo: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        for _ in 0..2 {
+            let (a2, b2, aid2, bid2) = (a.clone(), b.clone(), aid.clone(), bid.clone());
+            tokio::join!(a2.dial_link_at(&bid2, lo), b2.dial_link_at(&aid2, lo));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        let ids = |n: &Arc<Node>, id: &str| n.links.lock().unwrap().get(id).map(|l| l.conn_id);
+        let (ca, cb) = (ids(&a, &bid), ids(&b, &aid));
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(linked(&a, &bid) && linked(&b, &aid), "link dropped after simultaneous dials");
+        }
+        assert_eq!((ca, cb), (ids(&a, &bid), ids(&b, &aid)), "links kept changing");
+        a.shutdown();
+        b.shutdown();
     }
 }

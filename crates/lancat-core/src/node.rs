@@ -91,6 +91,8 @@ pub(crate) struct PeerState {
 pub(crate) struct Link {
     pub tx: mpsc::UnboundedSender<String>,
     pub conn_id: u64,
+    /// Dialed by the device with the smaller id (wins over a simultaneous second connection).
+    pub preferred: bool,
 }
 
 pub struct Node {
@@ -116,6 +118,10 @@ pub struct Node {
     pub(crate) mdns: Mutex<Option<crate::discovery::Mdns>>,
     /// Kicks a discovery probe burst (start, network change, wake, manual refresh).
     pub(crate) probe_kick: tokio::sync::Notify,
+    /// Wakes housekeeping early (a peer came online without a link, a link went down).
+    hk_kick: tokio::sync::Notify,
+    /// Peers whose queue is being flushed right now -> "flush again when done" flag.
+    flushing: Mutex<HashMap<String, bool>>,
     pub(crate) udp: OnceLock<Arc<tokio::net::UdpSocket>>,
     stopped: AtomicBool,
     shutdown_tx: watch::Sender<bool>,
@@ -156,6 +162,7 @@ impl Node {
             .no_proxy()
             .connect_timeout(Duration::from_secs(4))
             .pool_idle_timeout(Duration::from_secs(30))
+            .tcp_nodelay(true)
             .build()?;
 
         let node = Arc::new(Node {
@@ -176,6 +183,8 @@ impl Node {
             conn_seq: AtomicU64::new(1),
             mdns: Mutex::new(None),
             probe_kick: tokio::sync::Notify::new(),
+            hk_kick: tokio::sync::Notify::new(),
+            flushing: Mutex::new(HashMap::new()),
             udp: OnceLock::new(),
             stopped: AtomicBool::new(false),
             shutdown_tx,
@@ -327,6 +336,7 @@ impl Node {
             self.maybe_upgrade_link(&info.id, from, to, info.port);
         }
         if came_online {
+            self.kick_housekeeping();
             log::info!("peer online: {} ({}) at {}:{}", info.name, info.id, addr, info.port);
             let node = self.clone();
             let id = info.id.clone();
@@ -441,6 +451,11 @@ impl Node {
                 crate::discovery::probe_addr(self, ip);
             }
         }
+        self.kick_housekeeping();
+    }
+
+    pub(crate) fn kick_housekeeping(&self) {
+        self.hk_kick.notify_one();
     }
 
     /// Refreshes liveness without other changes (pings, chunk traffic).
@@ -572,19 +587,23 @@ impl Node {
     }
 
     // ------------------------------------------------------------------ housekeeping
+    /// Offline detection and reconnects for peers that are online without a link. Event driven:
+    /// it used to wake every second for the whole life of the app; now it only ticks (every 3 s,
+    /// the reconnect cadence) while such a peer exists and otherwise sleeps until kicked (a peer
+    /// came online, a link went down), with a long safety interval.
     fn spawn_housekeeping(self: Arc<Self>) {
         let mut stop = self.shutdown_rx();
         let node = self;
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(1));
-            let mut n: u64 = 0;
+            const BUSY: Duration = Duration::from_secs(3);
+            const IDLE: Duration = Duration::from_secs(60);
+            let mut wait = BUSY;
             loop {
                 tokio::select! {
-                    _ = tick.tick() => {}
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = node.hk_kick.notified() => {}
                     _ = stop.changed() => break,
                 }
-                n += 1;
-                // offline detection
                 let mut gone = vec![];
                 let mut need_link = vec![];
                 {
@@ -612,12 +631,11 @@ impl Node {
                     node.links.lock().unwrap().remove(&id);
                     node.emit_peer(&id);
                 }
-                // reconnect every 3s (local work only; nothing is sent to peers we have not found)
-                if n % 3 == 0 {
-                    for (id, force) in need_link {
-                        let node = node.clone();
-                        tokio::spawn(async move { node.dial_link(&id, force).await });
-                    }
+                // reconnect (local work only; nothing is sent to peers we have not found)
+                wait = if need_link.is_empty() { IDLE } else { BUSY };
+                for (id, force) in need_link {
+                    let node = node.clone();
+                    tokio::spawn(async move { node.dial_link(&id, force).await });
                 }
             }
         });
@@ -735,16 +753,36 @@ impl Node {
     }
 
     /// Resend queued messages and resume interrupted outgoing transfers.
+    ///
+    /// A peer coming back triggers several flushes within a few hundred ms (peer online, link up,
+    /// manual add); run concurrently they each sent every queued message again. One flush per
+    /// peer at a time: a request while one runs makes it go round once more instead.
     pub(crate) async fn flush_peer(self: &Arc<Self>, peer_id: &str) {
-        if !self.is_online(peer_id) {
-            return;
+        {
+            let mut f = self.flushing.lock().unwrap();
+            if let Some(again) = f.get_mut(peer_id) {
+                *again = true;
+                return;
+            }
+            f.insert(peer_id.to_string(), false);
         }
-        for m in self.store.unacked_outgoing(peer_id).unwrap_or_default() {
-            self.deliver(&m).await;
-        }
-        for m in self.store.unfinished_files(peer_id).unwrap_or_default() {
-            let node = self.clone();
-            tokio::spawn(async move { node.run_transfer(m.id).await });
+        loop {
+            if self.is_online(peer_id) {
+                for m in self.store.unacked_outgoing(peer_id).unwrap_or_default() {
+                    self.deliver(&m).await;
+                }
+                for m in self.store.unfinished_files(peer_id).unwrap_or_default() {
+                    let node = self.clone();
+                    tokio::spawn(async move { node.run_transfer(m.id).await });
+                }
+            }
+            let mut f = self.flushing.lock().unwrap();
+            if f.get(peer_id) == Some(&true) {
+                f.insert(peer_id.to_string(), false);
+                continue;
+            }
+            f.remove(peer_id);
+            break;
         }
     }
 
