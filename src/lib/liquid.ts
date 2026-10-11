@@ -18,6 +18,20 @@ function root(): SVGSVGElement {
   return svgRoot;
 }
 
+/** Displacement maps by size/shape: a per-pixel JS loop + PNG encode (tens of ms for a toast-
+ *  sized element) used to run again for every toast / picker hint, although they come in a few
+ *  sizes only. Small LRU. */
+const mapCache = new Map<string, string>();
+function cachedMap(w: number, h: number, r: number, bevel: number): string {
+  const key = `${w}x${h}:${r}:${bevel}`;
+  let url = mapCache.get(key);
+  if (url) mapCache.delete(key);
+  else url = displacementMap(w, h, r, bevel);
+  mapCache.set(key, url);
+  while (mapCache.size > 16) mapCache.delete(mapCache.keys().next().value!);
+  return url;
+}
+
 /** R = x shift, G = y shift (128 = none), strongest at the rim, fading over `bevel` px. */
 function displacementMap(w: number, h: number, r: number, bevel: number): string {
   const c = document.createElement("canvas");
@@ -93,16 +107,16 @@ export function liquid(node: HTMLElement, opts: LiquidOpts = {}) {
 
   let o = opts;
   let lastKey = "";
+  let size = { w: 0, h: 0 };
   const update = () => {
-    const w = Math.round(node.offsetWidth),
-      h = Math.round(node.offsetHeight);
+    const { w, h } = size;
     if (!w || !h) return;
     const radius = o.radius ?? 14;
     const bevel = o.bevel ?? Math.min(14, h / 2);
     const key = `${w}x${h}:${radius}:${bevel}`;
     if (key === lastKey) return;
     lastKey = key;
-    fe.setAttribute("href", displacementMap(w, h, radius, bevel));
+    fe.setAttribute("href", cachedMap(w, h, radius, bevel));
     fe.setAttribute("width", String(w));
     fe.setAttribute("height", String(h));
     disp.setAttribute("scale", String((o.depth ?? 18) * 2));
@@ -110,12 +124,20 @@ export function liquid(node: HTMLElement, opts: LiquidOpts = {}) {
     node.style.setProperty("backdrop-filter", f);
     node.style.setProperty("-webkit-backdrop-filter", f);
   };
-  const ro = new ResizeObserver(update);
+  // sizes come from the observer (its first callback arrives before the first paint), so mounting
+  // does not force a synchronous layout with offsetWidth/offsetHeight
+  const ro = new ResizeObserver((entries) => {
+    const b = entries[entries.length - 1].borderBoxSize?.[0];
+    size = b ? { w: Math.round(b.inlineSize), h: Math.round(b.blockSize) } : { w: Math.round(node.offsetWidth), h: Math.round(node.offsetHeight) };
+    update();
+  });
   ro.observe(node);
-  update();
   return {
     update(n: LiquidOpts) {
-      o = n ?? {};
+      const next = n ?? {};
+      // the template passes a fresh object literal on every update: only redo on real changes
+      if (next.radius === o.radius && next.bevel === o.bevel && next.depth === o.depth && next.blur === o.blur) return;
+      o = next;
       lastKey = "";
       update();
     },
