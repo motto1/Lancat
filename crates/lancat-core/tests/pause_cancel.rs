@@ -70,8 +70,9 @@ async fn pause_resume_and_cancel() {
     assert_eq!(std::fs::read(got.body["path"].as_str().unwrap()).unwrap(), data);
 
     // ---- sender cancels: both sides end up cancelled (or the receiver never heard of it)
+    // cancel right away: on a fast machine a 48 MB loopback transfer is done within ~150 ms, and a
+    // cancel after "done" is a no-op (the old 150 ms wait made this flaky)
     let id = a.send_files(&[b_id.clone()], &[src.clone()]).await.unwrap()[0].id.clone();
-    tokio::time::sleep(Duration::from_millis(150)).await;
     a.cancel_transfer(&id).unwrap();
     eventually(|| a.store.message(&id).unwrap().unwrap().status == "cancelled").await;
     eventually(|| b.store.message(&id).unwrap().map_or(true, |m| m.status == "cancelled")).await;
@@ -82,7 +83,8 @@ async fn pause_resume_and_cancel() {
 
     // ---- receiver cancels while receiving: the sender stops
     let id = a.send_files(&[b_id.clone()], &[src.clone()]).await.unwrap()[0].id.clone();
-    eventually(|| b.store.message(&id).unwrap().is_some_and(|m| m.status == "receiving")).await;
+    // (a fast loopback may already be done before the receiver is polled in "receiving")
+    eventually(|| b.store.message(&id).unwrap().is_some_and(|m| m.status == "receiving" || m.status == "done")).await;
     b.cancel_transfer(&id).unwrap();
     let st = status_is(&mut ea, &id, &["cancelled", "done", "failed"]).await;
     // loopback may finish before the cancel lands; anything but a failure is fine

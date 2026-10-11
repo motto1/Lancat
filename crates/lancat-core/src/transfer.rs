@@ -234,12 +234,21 @@ impl Node {
     /// Forgets an incoming transfer and deletes its partial data (retried while chunk writes that
     /// are still in flight keep the part file open).
     fn drop_incoming(&self, transfer_id: &str) {
-        self.incoming.lock().unwrap().remove(transfer_id);
+        // Close the sidecar gate first: a chunk write still in flight would otherwise re-create
+        // the progress file after it was deleted (left behind in .lancat-part for good).
+        let gate = self.incoming.lock().unwrap().remove(transfer_id).map(|t| {
+            t.gate.close();
+            t.gate.clone()
+        });
         let dir = self.receive_dir();
         let tid = transfer_id.to_string();
         self.rt.spawn(async move {
             for _ in 0..20 {
-                if discard_partial(&dir, &tid) {
+                let done = match &gate {
+                    Some(g) => g.exclusive(|| discard_partial(&dir, &tid)),
+                    None => discard_partial(&dir, &tid),
+                };
+                if done {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;

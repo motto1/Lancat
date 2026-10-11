@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
@@ -181,7 +181,37 @@ pub fn discard_partial(recv_dir: &Path, transfer_id: &str) -> bool {
     };
     let a = gone(dir.join(format!("{transfer_id}.part")));
     let b = gone(dir.join(format!("{transfer_id}.json")));
+    let _ = gone(dir.join(format!("{transfer_id}.json.tmp")));
     a && b
+}
+
+/// Serialises every write of one transfer's progress sidecar, and stops them for good once the
+/// transfer was dropped (cancelled): a chunk write still in flight must not re-create the sidecar
+/// after its partial data was deleted. Shared with the deleter (which must not hold the transfer
+/// itself: on Windows its open part file cannot be deleted).
+#[derive(Default)]
+pub struct SidecarGate(Mutex<bool>);
+
+impl SidecarGate {
+    /// No sidecar writes from now on.
+    pub fn close(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+
+    /// Runs `f` unless closed, with no sidecar write running concurrently.
+    pub fn run<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
+        let g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if *g {
+            return None;
+        }
+        Some(f())
+    }
+
+    /// Runs `f` with no sidecar write running concurrently (whether closed or not).
+    pub fn exclusive<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _g = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
 }
 
 /// Receiver side of a resumable transfer. Data goes to `<recv>/.lancat-part/<tid>.part`
@@ -192,6 +222,7 @@ pub struct IncomingTransfer {
     sidecar_path: PathBuf,
     file: File,
     have: Mutex<BTreeSet<u64>>,
+    pub gate: Arc<SidecarGate>,
 }
 
 impl IncomingTransfer {
@@ -216,16 +247,26 @@ impl IncomingTransfer {
         }
         let file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&part_path)?;
         file.set_len(manifest.size)?;
-        let t = Self { manifest, part_path, sidecar_path, file, have: Mutex::new(have) };
+        let t = Self { manifest, part_path, sidecar_path, file, have: Mutex::new(have), gate: Arc::default() };
         t.persist()?;
         Ok(t)
     }
 
+    /// Writes the progress sidecar. Chunk writes run concurrently (one blocking task each): the
+    /// writes are serialised and atomic (temp file + rename), and the snapshot is taken inside the
+    /// lock, so an older snapshot can never overwrite a newer one and a crash never leaves a
+    /// truncated / interleaved file (which used to throw the whole resume state away).
     fn persist(&self) -> Result<()> {
-        let have = self.have.lock().unwrap().clone();
-        let sc = Sidecar { manifest: self.manifest.clone(), have };
-        fs::write(&self.sidecar_path, serde_json::to_vec(&sc)?)?;
-        Ok(())
+        self.gate
+            .run(|| -> Result<()> {
+                let have = self.have.lock().unwrap().clone();
+                let sc = Sidecar { manifest: self.manifest.clone(), have };
+                let tmp = self.sidecar_path.with_extension("json.tmp");
+                fs::write(&tmp, serde_json::to_vec(&sc)?)?;
+                fs::rename(&tmp, &self.sidecar_path)?;
+                Ok(())
+            })
+            .unwrap_or(Ok(()))
     }
 
     pub fn have(&self) -> Vec<u64> {
@@ -286,7 +327,8 @@ impl IncomingTransfer {
         }
         fs::rename(&self.part_path, &target).or_else(|_| fs::copy(&self.part_path, &target).map(|_| ()).and_then(|_| fs::remove_file(&self.part_path)))?;
         strip_exec(&target);
-        let _ = fs::remove_file(&self.sidecar_path);
+        self.gate.close();
+        self.gate.exclusive(|| fs::remove_file(&self.sidecar_path)).ok();
         if let Some(dir) = self.sidecar_path.parent() {
             let _ = fs::remove_dir(dir); // only succeeds when no other transfer is pending
         }
@@ -357,6 +399,44 @@ mod tests {
         let out = t.finish(d.path()).unwrap();
         assert_eq!(out, d.path().join("dir").join("out.bin"));
         assert_eq!(fs::read(&out).unwrap(), data);
+    }
+
+    #[test]
+    fn sidecar_concurrent_and_gate() {
+        let d = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let m = FileManifest {
+            transfer_id: "t-2".into(),
+            msg_id: "m".into(),
+            from: "peer".into(),
+            name: "c.bin".into(),
+            size: data.len() as u64,
+            chunk_size: 1024,
+            hash: blake3::hash(&data).to_hex().to_string(),
+            ts: 0,
+        };
+        let t = Arc::new(IncomingTransfer::open(d.path(), m.clone()).unwrap());
+        std::thread::scope(|sc| {
+            for k in 0..8u64 {
+                let (t, data) = (t.clone(), &data);
+                sc.spawn(move || {
+                    for i in (k..64).step_by(8) {
+                        let s = (i * 1024) as usize;
+                        t.write_chunk(i, &data[s..s + 1024], None).unwrap();
+                    }
+                });
+            }
+        });
+        // the sidecar holds the full, newest state
+        let t2 = IncomingTransfer::open(d.path(), m.clone()).unwrap();
+        assert_eq!(t2.have().len(), 64);
+        drop(t2);
+        // once the gate is closed (cancelled), a late chunk write does not re-create the sidecar
+        t.gate.close();
+        let side = d.path().join(PART_DIR).join("t-2.json");
+        t.gate.exclusive(|| fs::remove_file(&side)).unwrap();
+        t.write_chunk(0, &data[..1024], None).unwrap();
+        assert!(!side.exists());
     }
 
     #[test]
