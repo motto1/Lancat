@@ -86,6 +86,26 @@ pub(crate) struct PeerState {
     pub addr: IpAddr,
     pub last_seen: Instant,
     pub online: bool,
+    /// Every address the peer was heard on lately (primary included), newest last. A peer that can
+    /// dial us is not always reachable on the address it dials from (its firewall drops inbound
+    /// connections on that network, e.g. a Windows "Public" Wi-Fi), so outgoing HTTP (file
+    /// transfers) falls back to another one of these (Tailscale ...).
+    pub seen_at: Vec<(IpAddr, Instant)>,
+}
+
+/// How long an address in `PeerState::seen_at` stays a dial candidate.
+const SEEN_ADDR_TTL: Duration = Duration::from_secs(600);
+const SEEN_ADDR_MAX: usize = 6;
+
+impl PeerState {
+    fn note_addr(&mut self, ip: IpAddr) {
+        self.seen_at.retain(|(a, t)| *a != ip && t.elapsed() < SEEN_ADDR_TTL);
+        self.seen_at.push((ip, Instant::now()));
+        if self.seen_at.len() > SEEN_ADDR_MAX {
+            let extra = self.seen_at.len() - SEEN_ADDR_MAX;
+            self.seen_at.drain(..extra);
+        }
+    }
 }
 
 pub(crate) struct Link {
@@ -299,6 +319,7 @@ impl Node {
         let mut upgrade: Option<(IpAddr, IpAddr)> = None;
         let (changed, came_online) = {
             let mut peers = self.peers.write().unwrap();
+            let heard = addr;
             match peers.get_mut(&info.id) {
                 Some(p) => {
                     // A peer reachable on both the LAN and an overlay (Tailscale ...) answers on
@@ -313,6 +334,7 @@ impl Node {
                         upgrade = Some((p.addr, addr));
                     }
                     let addr = if fresh && (linked || addr_rank(&addr) > addr_rank(&p.addr)) { p.addr } else { addr };
+                    p.note_addr(heard);
                     let changed = p.info != info || p.addr != addr || !p.online;
                     let came_online = !p.online;
                     p.info = info.clone();
@@ -322,7 +344,10 @@ impl Node {
                     (changed, came_online)
                 }
                 None => {
-                    peers.insert(info.id.clone(), PeerState { info: info.clone(), addr, last_seen: Instant::now(), online: true });
+                    peers.insert(
+                        info.id.clone(),
+                        PeerState { info: info.clone(), addr, last_seen: Instant::now(), online: true, seen_at: vec![(addr, Instant::now())] },
+                    );
                     (true, true)
                 }
             }
@@ -389,6 +414,7 @@ impl Node {
             match peers.get_mut(id) {
                 Some(p) if p.addr != ip => {
                     p.addr = ip;
+                    p.note_addr(ip);
                     Some(p.info.clone())
                 }
                 _ => None,
@@ -471,6 +497,22 @@ impl Node {
         }
         let d = self.store.device(id)?;
         Some((d.last_addr.parse().ok()?, d.port))
+    }
+
+    /// Addresses to dial the peer at, best first: the current address, then the other addresses it
+    /// was heard on lately (newest first; IPv6 link-local skipped, it would need a scope id).
+    pub(crate) fn peer_dial_addrs(&self, id: &str) -> Vec<(IpAddr, u16)> {
+        let Some((ip, port)) = self.peer_addr(id) else { return vec![] };
+        let mut out = vec![(ip, port)];
+        if let Some(p) = self.peers.read().unwrap().get(id) {
+            for (a, t) in p.seen_at.iter().rev() {
+                let ll6 = matches!(a, IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfe80);
+                if t.elapsed() < SEEN_ADDR_TTL && !ll6 && !out.iter().any(|(o, _)| o == a) {
+                    out.push((*a, port));
+                }
+            }
+        }
+        out
     }
 
     pub fn is_online(&self, id: &str) -> bool {

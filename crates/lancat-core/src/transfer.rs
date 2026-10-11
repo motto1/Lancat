@@ -287,8 +287,7 @@ impl Node {
         if !self.is_online(&m.peer_id) {
             bail!("对方不在线");
         }
-        let (ip, port) = self.peer_addr(&m.peer_id).ok_or_else(|| anyhow!("对方地址未知"))?;
-        let base = format!("http://{}", fmt_sa(&SocketAddr::new(ip, port)));
+        let base = self.reachable_base(&m.peer_id).await?;
         let me = self.me().id;
 
         // announce, so the receiver's UI shows it right away
@@ -405,7 +404,88 @@ impl Node {
     }
 }
 
+impl Node {
+    /// Base URL of the first address the peer answers on (`GET /info` with its own id), current
+    /// address first. Text can still arrive over a link the peer dialed, so a peer whose firewall
+    /// drops inbound connections on the address we know looks online and chats fine, while
+    /// uploads to that address fail; another address it was heard on (Tailscale ...) may work.
+    async fn reachable_base(&self, peer_id: &str) -> Result<String> {
+        let cands = self.peer_dial_addrs(peer_id);
+        let Some(&(first, port)) = cands.first() else { bail!("对方地址未知") };
+        for (i, (ip, port)) in cands.iter().enumerate() {
+            let base = format!("http://{}", fmt_sa(&SocketAddr::new(*ip, *port)));
+            let r = self.http.get(format!("{base}/info")).header(HEADER_DEVICE_ID, self.me().id).timeout(Duration::from_secs(4)).send().await;
+            let ok = match r {
+                Ok(r) if r.status().is_success() => matches!(json_body::<DeviceInfo>(r).await, Ok(d) if d.id == peer_id),
+                _ => false,
+            };
+            if ok {
+                if i > 0 {
+                    log::warn!("{peer_id}: {first}:{port} not reachable (inbound blocked by its firewall?), sending via {ip}");
+                }
+                return Ok(base);
+            }
+            log::debug!("{peer_id}: {ip}:{port} not reachable");
+        }
+        bail!("连不上对方 {first}:{port}（对方能连我们所以文字可达，但对方的防火墙挡住了 Lancat 的入站连接，文件发不过去）")
+    }
+}
+
 fn chunk_len(size: u64, idx: u64) -> u64 {
     CHUNK_SIZE.min(size.saturating_sub(idx * CHUNK_SIZE))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::NodeConfig;
+    use std::net::IpAddr;
+
+    async fn start(dir: &std::path::Path, name: &str) -> Arc<Node> {
+        let mut cfg = NodeConfig::new(dir.join("data"));
+        cfg.port = 0;
+        cfg.enable_mdns = false;
+        cfg.enable_udp = false;
+        cfg.name_override = Some(name.into());
+        cfg.recv_dir_override = Some(dir.join("recv"));
+        Node::start(cfg).await.unwrap()
+    }
+
+    /// The address we know the peer by drops connections (its firewall), but it was also heard on
+    /// another one: the file goes there instead of failing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn file_falls_back_to_another_address() {
+        let ta = tempfile::tempdir().unwrap();
+        let tb = tempfile::tempdir().unwrap();
+        let a = start(ta.path(), "alpha").await;
+        let b = start(tb.path(), "bravo").await;
+        let pb = a.add_peer_addr(&format!("127.0.0.1:{}", b.port())).await.unwrap();
+        // the "LAN address" that is blackholed (TEST-NET-1: never answers)
+        let dead: IpAddr = "192.0.2.1".parse().unwrap();
+        a.set_peer_addr(&pb.id, dead);
+        assert_eq!(a.peer_addr(&pb.id).unwrap().0, dead);
+        assert_eq!(a.peer_dial_addrs(&pb.id).iter().map(|x| x.0).collect::<Vec<_>>(), vec![dead, "127.0.0.1".parse::<IpAddr>().unwrap()]);
+
+        let src = ta.path().join("fb.bin");
+        std::fs::write(&src, vec![7u8; 5 * 1024 * 1024 + 3]).unwrap();
+        let mut ea = a.subscribe();
+        let ms = a.send_files(&[pb.id.clone()], &[src]).await.unwrap();
+        let id = ms[0].id.clone();
+        let fut = async {
+            loop {
+                if let Ok(CoreEvent::MessageUpdate { message }) = ea.recv().await {
+                    if message.id == id && matches!(message.status.as_str(), "done" | "failed") {
+                        return message;
+                    }
+                }
+            }
+        };
+        let m = tokio::time::timeout(Duration::from_secs(30), fut).await.expect("transfer timed out");
+        assert_eq!(m.status, "done", "{:?}", m.body);
+        let got = std::fs::read(tb.path().join("recv").join("fb.bin")).unwrap();
+        assert_eq!(got.len(), 5 * 1024 * 1024 + 3);
+        a.shutdown();
+        b.shutdown();
+    }
+}
