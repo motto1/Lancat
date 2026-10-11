@@ -4,7 +4,7 @@
   // Never animates off-screen; at most MAX_PLAYING stickers animate at once (lib/lottie.ts).
   import { onMount } from "svelte";
   import type { EmojiPayload } from "../lib/api";
-  import { createPlayer, destroyPlayer, getPoster, lottieData, play, posterKey, posterLoads, savePoster, stop, warmPlayer, type Player } from "../lib/lottie";
+  import { createPlayer, destroyPlayer, getPoster, lottieData, play, PLAYER_DPR, posterKey, posterLoads, savePoster, stop, warmPlayer, type Player } from "../lib/lottie";
 
   // underlay=false: the caller keeps its own placeholder (e.g. the grid glyph) under the sticker and
   // swaps it out on `onshown`, so the sticker neither draws a fallback glyph of its own (a different
@@ -28,7 +28,7 @@
   // the system glyph underneath, crossfaded.
   const pkey = $derived(posterKey(emoji, size));
   const poster = $derived(getPoster(pkey));
-  const pr = Math.min(window.devicePixelRatio || 1, 2); // must match createPlayer's devicePixelRatio
+  const pr = PLAYER_DPR; // must match createPlayer's devicePixelRatio
   let posterDrawn = $state(false);
   let posterFailed = $state(false);
   let placeholder = $state(true);

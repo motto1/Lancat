@@ -3,10 +3,133 @@
   import { onMount, tick } from "svelte";
   import { api, type EmojiPayload, type StickerMeta } from "../lib/api";
   import { CATEGORIES, EMOJI, type EmojiEntry } from "../lib/emoji-catalog";
-  import { emojiByCode, readStickerFile } from "../lib/lottie";
+  import {
+    createPlayer,
+    destroyPlayer,
+    emojiByCode,
+    getPoster,
+    lottieData,
+    play,
+    PLAYER_DPR,
+    posterKey,
+    readStickerFile,
+    reloadPlayer,
+    savePoster,
+    stop,
+    warmPlayer,
+    type Player,
+  } from "../lib/lottie";
   import { app } from "../lib/state.svelte";
   import Icon from "./Icon.svelte";
   import Sticker from "./Sticker.svelte";
+
+  // ---- hover preview: ONE canvas + ONE player for the whole grid. The canvas is moved into the
+  // hovered cell and the player loads the new animation; it used to mount a Sticker per hover
+  // (new canvas, new ThorVG instance, WASM init, destroy on leave) for every cell the pointer
+  // crossed.
+  const HOVER = 30;
+  let hoverCanvas: HTMLCanvasElement | null = null;
+  let hoverPlayer: Player | null = null;
+  let hoverLoaded: string | null = null; // code the player has drawn
+  let hoverWant: string | null = null; // code requested last
+  let hoverTok = 0;
+
+  function hoverCanvasEl(): HTMLCanvasElement {
+    if (hoverCanvas) return hoverCanvas;
+    const c = document.createElement("canvas");
+    c.width = c.height = Math.round(HOVER * PLAYER_DPR);
+    c.style.width = c.style.height = `${HOVER}px`;
+    hoverCanvas = c;
+    return c;
+  }
+
+  function showHover(code: string) {
+    if (hoverCanvas) hoverCanvas.style.visibility = "visible";
+    if (hovered === code) covered = code;
+  }
+
+  async function startHover(code: string) {
+    const tok = ++hoverTok;
+    hoverWant = code;
+    const c = hoverCanvasEl();
+    const payload: EmojiPayload = { kind: "noto", code, alt: "" };
+    if (hoverPlayer && hoverLoaded === code) {
+      showHover(code);
+      play(hoverPlayer);
+      return;
+    }
+    c.style.visibility = "hidden"; // still shows the previous emoji
+    const pkey = posterKey(payload, HOVER);
+    const poster = getPoster(pkey);
+    if (poster) {
+      fetch(poster)
+        .then((r) => r.blob())
+        .then((b) => createImageBitmap(b))
+        .then((bmp) => {
+          if (tok === hoverTok && hoverLoaded !== code) {
+            const ctx = c.getContext("2d");
+            ctx?.clearRect(0, 0, c.width, c.height);
+            ctx?.drawImage(bmp, 0, 0, c.width, c.height);
+            showHover(code);
+          }
+          bmp.close();
+        })
+        .catch(() => {});
+    }
+    const p = lottieData(payload);
+    if (!p) return;
+    warmPlayer();
+    let data: string;
+    try {
+      data = await p;
+    } catch {
+      return;
+    }
+    if (tok !== hoverTok) return;
+    hoverLoaded = null;
+    const onLoad = () => {
+      if (hoverWant !== code || tok !== hoverTok || !hoverPlayer) return;
+      hoverLoaded = code;
+      if (!poster) savePoster(pkey, HOVER, c);
+      showHover(code);
+      play(hoverPlayer);
+    };
+    if (!hoverPlayer) {
+      hoverPlayer = await createPlayer(c, data, true);
+      if (destroyed) {
+        destroyPlayer(hoverPlayer);
+        hoverPlayer = null;
+        return;
+      }
+    } else {
+      reloadPlayer(hoverPlayer, data);
+    }
+    hoverPlayer.addEventListener("load", onLoad);
+    if (hoverPlayer.isLoaded) onLoad();
+    // one-shot: drop the listener once this load is over (or superseded)
+    const pl = hoverPlayer;
+    setTimeout(() => pl.removeEventListener("load", onLoad), 3000);
+  }
+
+  function stopHover() {
+    hoverTok++;
+    hoverWant = null;
+    if (hoverPlayer) stop(hoverPlayer, true);
+  }
+
+  /** Puts the shared hover canvas into this cell for as long as it is hovered. */
+  function hoverHost(node: HTMLElement, code: string) {
+    const c = hoverCanvasEl();
+    node.appendChild(c);
+    void startHover(code);
+    return {
+      destroy() {
+        if (c.parentNode === node) node.removeChild(c);
+        if (hoverWant === code) stopHover();
+      },
+    };
+  }
+  let destroyed = false;
 
   let { onpick, onclose }: { onpick: (e: EmojiPayload) => void; onclose: () => void } = $props();
 
@@ -46,6 +169,10 @@
     return () => {
       window.removeEventListener("click", close);
       window.removeEventListener("keydown", key, true);
+      destroyed = true;
+      hoverTok++;
+      if (hoverPlayer) destroyPlayer(hoverPlayer);
+      hoverPlayer = null;
     };
   });
 
@@ -128,9 +255,7 @@
   >
     <span class="glyph" class:gone={covered === e.code && hovered === e.code}>{e.char}</span>
     {#if hovered === e.code}
-      <span class="over">
-        <Sticker emoji={{ kind: "noto", code: e.code, alt: e.char }} size={30} mode="chat" underlay={false} onshown={() => hovered === e.code && (covered = e.code)} />
-      </span>
+      <span class="over" use:hoverHost={e.code}></span>
     {/if}
   </button>
 {/snippet}

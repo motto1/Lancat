@@ -36,7 +36,18 @@ export function emojiByChar(char: string) {
   return byChar.get(char.replace(/\ufe0f/g, ""));
 }
 
-export const MAX_PLAYING = 12;
+/** Animations running at once (each one renders on every animation frame of its own). */
+export const MAX_PLAYING = 6;
+/** Canvas resolution cap: 160 px stickers at DPR 2 were 320² px of WASM rasterising per frame;
+ *  1.5 is the sharpness limit you can tell apart at these sizes. Sticker.svelte sizes its canvas
+ *  with the same value. */
+export const PLAYER_DPR = Math.min(window.devicePixelRatio || 1, 1.5);
+/** Frames at the animation's own rate (Noto: 30 fps). Interpolation rendered a new in-between
+ *  frame on every display refresh, i.e. 144 renders/s per sticker on a 144 Hz screen. */
+const RENDER_OPTS = {
+  useFrameInterpolation: false,
+  renderConfig: { autoResize: false, freezeOnOffscreen: true, devicePixelRatio: PLAYER_DPR },
+};
 const MAX_CACHED = 24;
 
 type Lib = typeof import("@lottiefiles/dotlottie-web");
@@ -92,11 +103,11 @@ export function getPoster(key: string | null): string | null {
   }
 }
 
-/** Stores the canvas' current pixels (call right after `load`, when frame 0 is drawn). */
-export function savePoster(key: string | null, size: number, canvas: HTMLCanvasElement) {
-  if (!key) return;
+const idle: (f: () => void) => void =
+  typeof requestIdleCallback === "function" ? (f) => requestIdleCallback(f, { timeout: 2000 }) : (f) => setTimeout(f, 200);
+
+function storePoster(key: string, size: number, url: string) {
   try {
-    const url = canvas.toDataURL("image/webp", 0.92); // WebKitGTK may fall back to PNG: still fine
     if (url.length < 64) return;
     const c = posterClass(size);
     const idx: string[] = JSON.parse(localStorage.getItem(c.idx) || "[]").filter((k: string) => k !== key);
@@ -105,8 +116,52 @@ export function savePoster(key: string | null, size: number, canvas: HTMLCanvasE
     localStorage.setItem(POSTER + key, url);
     localStorage.setItem(c.idx, JSON.stringify(idx));
   } catch {
-    /* quota or tainted canvas: no poster, the glyph fallback still works */
+    /* quota: no poster, the glyph fallback still works */
   }
+}
+
+/** Stores the canvas' current pixels (call right after `load`, when frame 0 is drawn).
+ *  Only the snapshot is taken now (createImageBitmap copies the canvas at call time, before the
+ *  animation moves on); encoding and the localStorage writes, which took several ms per sticker
+ *  right when a conversation opens, run when the page is idle (OffscreenCanvas.convertToBlob
+ *  encodes off the main thread where available). */
+export function savePoster(key: string | null, size: number, canvas: HTMLCanvasElement) {
+  if (!key) return;
+  let snap: Promise<ImageBitmap>;
+  try {
+    snap = createImageBitmap(canvas);
+  } catch {
+    return;
+  }
+  idle(() => {
+    snap
+      .then(async (bmp) => {
+        try {
+          if (typeof OffscreenCanvas === "function") {
+            const oc = new OffscreenCanvas(bmp.width, bmp.height);
+            oc.getContext("2d")!.drawImage(bmp, 0, 0);
+            const blob = await oc.convertToBlob({ type: "image/webp", quality: 0.92 });
+            return await new Promise<string>((res, rej) => {
+              const r = new FileReader();
+              r.onload = () => res(String(r.result));
+              r.onerror = () => rej(r.error);
+              r.readAsDataURL(blob);
+            });
+          }
+          const c = document.createElement("canvas");
+          c.width = bmp.width;
+          c.height = bmp.height;
+          c.getContext("2d")!.drawImage(bmp, 0, 0);
+          return c.toDataURL("image/webp", 0.92); // WebKitGTK may fall back to PNG: still fine
+        } finally {
+          bmp.close();
+        }
+      })
+      .then((url) => storePoster(key, size, url))
+      .catch(() => {
+        /* tainted canvas / no encoder: no poster */
+      });
+  });
 }
 
 /** Resolves Lottie JSON text for a payload (bundled Noto, inline sticker data, or a locally imported sticker). */
@@ -131,11 +186,16 @@ export async function createPlayer(canvas: HTMLCanvasElement, data: string, loop
     data,
     loop,
     autoplay: false,
-    useFrameInterpolation: true,
-    renderConfig: { autoResize: false, freezeOnOffscreen: true, devicePixelRatio: Math.min(window.devicePixelRatio || 1, 2) },
+    ...RENDER_OPTS,
   });
   live.add(p);
   return p;
+}
+
+/** Loads another animation into an existing player (reused canvas, no new WASM instance). */
+export function reloadPlayer(p: Player, data: string, loop = true) {
+  stop(p, true);
+  p.load({ data, loop, autoplay: false, ...RENDER_OPTS });
 }
 
 export function destroyPlayer(p: Player) {
