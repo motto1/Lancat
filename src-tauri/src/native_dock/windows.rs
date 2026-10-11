@@ -28,7 +28,7 @@ use windows::Win32::Graphics::Gdi::{
     DIB_RGB_COLORS,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_CANCEL, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, KillTimer, LoadCursorW, RegisterClassW, SetTimer, SetWindowPos, ShowWindow, UpdateLayeredWindow, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE,
     SPI_SETWORKAREA, SWP_NOACTIVATE, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_SETTINGCHANGE, WM_TIMER,
@@ -159,8 +159,20 @@ pub fn show() {
 
 /// Hidden while the message toast stands in for the strip.
 pub fn set_hidden(hidden: bool) {
-    with(|s| unsafe {
+    let was_hovering = with(|s| unsafe {
         s.hidden = hidden;
+        // The toast can arrive while the pointer rests on the strip with the hover-open timer
+        // armed: that timer would open the panel behind the toast, and a hidden window gets no
+        // reliable WM_MOUSELEAVE, so end the hover here.
+        let was_hovering = hidden && s.hovering;
+        if was_hovering {
+            let _ = KillTimer(Some(s.hwnd), TIMER_HOVER);
+            let mut tme = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE | TME_CANCEL, hwndTrack: s.hwnd, dwHoverTime: 0 };
+            let _ = TrackMouseEvent(&mut tme);
+            s.hovering = false;
+            s.anim = None;
+            s.look = Look { thick: IDLE_THICK, alpha: IDLE_ALPHA };
+        }
         sync_timer(s);
         if hidden {
             let _ = ShowWindow(s.hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
@@ -168,7 +180,13 @@ pub fn set_hidden(hidden: bool) {
             render(s);
             let _ = ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
         }
+        was_hovering
     });
+    if was_hovering == Some(true) {
+        if let Some(a) = APP.get() {
+            crate::dock::on_hover_end(a);
+        }
+    }
 }
 
 pub fn set_visual(v: DockVisual) {
@@ -424,6 +442,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             match wparam.0 {
                 TIMER_HOVER => {
                     let _ = KillTimer(Some(hwnd), TIMER_HOVER);
+                    // never open behind the message toast (a click on the toast opens the panel)
+                    if super::win_toast::shown() {
+                        return LRESULT(0);
+                    }
                     if let Some(a) = app {
                         crate::dock::open_panel(a, "hover");
                     }
