@@ -11,7 +11,8 @@
 //!   to the full thickness. Colours follow the light/dark theme, unread uses the app accent;
 //! * motion: hover and open/close changes ease over the same durations as the panel's window fade
 //!   (in 120 ms ease-out, out 140 ms ease-in), on a 16 ms timer that only runs while something
-//!   moves; the unread pulse runs at ~30 fps only while there is something unread;
+//!   moves; the unread pulse only changes the window's constant alpha (the bitmap is drawn once),
+//!   at 20 fps, only while something is unread and the strip is on screen;
 //! * layout: display, work-area (taskbar moved / resized / auto-hide), DPI and theme / accent
 //!   changes reach this top-level window as broadcasts and re-apply the layout or the visual.
 
@@ -43,7 +44,10 @@ const TIMER_HOVER: usize = 1;
 const TIMER_ANIM: usize = 2;
 const TIMER_LAYOUT: usize = 3;
 const ANIM_TICK_MS: u32 = 16;
-const PULSE_TICK_MS: u32 = 33;
+/// The pulse is a slow 1.8 s breath: 20 steps/s is smooth, and each step is now a single
+/// UpdateLayeredWindow call with the same bitmap (it used to redraw every pixel into a new DIB
+/// ~30 times/s, also while the strip was hidden behind the message toast).
+const PULSE_TICK_MS: u32 = 50;
 
 /// Idle strip: thickness share (towards the screen interior) and opacity factor, as on Linux.
 const IDLE_THICK: f64 = 0.87;
@@ -81,6 +85,8 @@ struct State {
     look: Look,
     anim: Option<Anim>,
     timer_on: bool,
+    /// Hidden (the message toast stands in for it): no timer at all.
+    hidden: bool,
 }
 
 thread_local! {
@@ -127,7 +133,7 @@ pub fn create(app: &AppHandle) {
         let idle = Look { thick: IDLE_THICK, alpha: IDLE_ALPHA };
         STATE.with(|s| {
             *s.borrow_mut() =
-                Some(State { hwnd, visual: DockVisual::default(), hovering: false, pulse_t0: None, w: 6, h: 160, scale: 1.0, look: idle, anim: None, timer_on: false })
+                Some(State { hwnd, visual: DockVisual::default(), hovering: false, pulse_t0: None, w: 6, h: 160, scale: 1.0, look: idle, anim: None, timer_on: false, hidden: false })
         });
     }
 }
@@ -154,6 +160,8 @@ pub fn show() {
 /// Hidden while the message toast stands in for the strip.
 pub fn set_hidden(hidden: bool) {
     with(|s| unsafe {
+        s.hidden = hidden;
+        sync_timer(s);
         if hidden {
             let _ = ShowWindow(s.hwnd, windows::Win32::UI::WindowsAndMessaging::SW_HIDE);
         } else {
@@ -207,7 +215,9 @@ fn retarget(s: &mut State, ease_in: bool) {
 
 /// One timer for both: 16 ms while easing, 33 ms while only the unread pulse runs, none otherwise.
 fn sync_timer(s: &mut State) {
-    let want = if s.anim.is_some() {
+    let want = if s.hidden {
+        None
+    } else if s.anim.is_some() {
         Some(ANIM_TICK_MS)
     } else if s.pulse_t0.is_some() {
         Some(PULSE_TICK_MS)
@@ -230,6 +240,11 @@ fn sync_timer(s: &mut State) {
 }
 
 fn step(s: &mut State) {
+    if s.anim.is_none() {
+        // only the unread pulse runs: same pixels, new constant alpha
+        pulse_only(s);
+        return;
+    }
     if let Some(a) = &s.anim {
         let t = (a.t0.elapsed().as_secs_f64() * 1000.0 / a.ms).min(1.0);
         let e = if a.ease_in { t * t } else { 1.0 - (1.0 - t) * (1.0 - t) };
@@ -284,12 +299,8 @@ fn render(s: &State) {
         }
     }
     let r = (rw.min(rh) / 2.0).min(3.0 * s.scale);
-    let mut alpha = FILL_ALPHA * s.look.alpha;
-    if v.unread {
-        // 0.55 ↔ 1.0 over 1.8 s, like the Linux strip (accent at full strength)
-        let t = s.pulse_t0.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
-        alpha = s.look.alpha.max(0.85) * (0.775 + 0.225 * (t * std::f64::consts::TAU / 1.8).cos());
-    }
+    // unread: drawn at the pulse's peak; the breathing itself is the window's constant alpha
+    let alpha = if v.unread { s.look.alpha.max(0.85) } else { FILL_ALPHA * s.look.alpha };
     let ((br, bg, bb), (or, og, ob, oa)) = palette(v);
     let line = s.scale.max(1.0); // one logical pixel of hairline
     let mut px = vec![0u32; (w * h) as usize];
@@ -337,13 +348,31 @@ fn render(s: &State) {
             let old = SelectObject(mem, bmp.into());
             let size = SIZE { cx: w, cy: h };
             let src = POINT { x: 0, y: 0 };
-            let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+            let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: pulse_alpha(s), AlphaFormat: AC_SRC_ALPHA as u8 };
             let _ = UpdateLayeredWindow(s.hwnd, Some(screen), None, Some(&size), Some(mem), Some(&src), COLORREF(0), Some(&blend), ULW_ALPHA);
             SelectObject(mem, old);
             let _ = DeleteObject(bmp.into());
         }
         let _ = DeleteDC(mem);
         ReleaseDC(None, screen);
+    }
+}
+
+/// Constant alpha of the unread pulse: 0.55 ↔ 1.0 of the peak over 1.8 s, like the Linux strip.
+fn pulse_alpha(s: &State) -> u8 {
+    if !s.visual.unread {
+        return 255;
+    }
+    let t = s.pulse_t0.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+    let k = 0.775 + 0.225 * (t * std::f64::consts::TAU / 1.8).cos();
+    (k * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+/// Re-blends the last bitmap with the current pulse alpha (no redraw).
+fn pulse_only(s: &State) {
+    let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: pulse_alpha(s), AlphaFormat: AC_SRC_ALPHA as u8 };
+    unsafe {
+        let _ = UpdateLayeredWindow(s.hwnd, None, None, None, None, None, COLORREF(0), Some(&blend), ULW_ALPHA);
     }
 }
 
