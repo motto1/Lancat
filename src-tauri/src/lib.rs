@@ -1,6 +1,7 @@
 //! Lancat desktop shell: starts the Rust core, exposes IPC commands, forwards core events.
 
 mod commands;
+mod diag;
 mod dock;
 mod native_dock;
 mod platform;
@@ -16,9 +17,11 @@ use commands::Core;
 
 pub const EVENT: &str = "lancat://event";
 
-fn start_core(app: &tauri::App) -> anyhow::Result<Arc<Node>> {
+/// Starts the core; also returns the TCP port it was configured for (diagnostics: taken?).
+fn start_core(app: &tauri::App) -> anyhow::Result<(Arc<Node>, u16)> {
     let data_dir = app.path().app_data_dir()?;
     let cfg = NodeConfig::new(data_dir).with_env();
+    let wanted = cfg.port;
     let node = tauri::async_runtime::block_on(async {
         match Node::start(cfg.clone()).await {
             Ok(n) => Ok(n),
@@ -31,7 +34,7 @@ fn start_core(app: &tauri::App) -> anyhow::Result<Arc<Node>> {
             }
         }
     })?;
-    Ok(node)
+    Ok((node, wanted))
 }
 
 #[tauri::command]
@@ -167,6 +170,12 @@ pub fn run() {
             dock::list_monitors,
             autostart_enabled,
             set_autostart,
+            diag::get_diagnostics,
+            diag::run_fix,
+            diag::diag_status,
+            diag::dismiss_alert,
+            diag::open_diagnostics,
+            diag::diag_take_goto,
         ])
         .on_window_event(|window, event| {
             // closing the panel only hides it (dock.rs destroys it later); closing settings closes it
@@ -185,7 +194,7 @@ pub fn run() {
             }
         })
         .setup(|app| {
-            let node = start_core(app).map_err(|e| e.to_string())?;
+            let (node, wanted_port) = start_core(app).map_err(|e| e.to_string())?;
             // forward core events to every webview
             let handle = app.handle().clone();
             let mut rx = node.subscribe();
@@ -197,6 +206,9 @@ pub fn run() {
                             if let lancat_core::CoreEvent::Message { message } = &ev {
                                 let (h, m) = (handle.clone(), message.clone());
                                 let _ = handle.run_on_main_thread(move || dock::on_incoming(&h, &m));
+                            }
+                            if let lancat_core::CoreEvent::Alert { kind, report, detail } = &ev {
+                                diag::on_core_alert(&handle, kind, report.as_ref(), detail);
                             }
                             if matches!(ev, lancat_core::CoreEvent::Peer { .. } | lancat_core::CoreEvent::HistoryCleared { .. }) {
                                 tray::update_unread(&handle);
@@ -211,6 +223,7 @@ pub fn run() {
             });
             app.manage(Core(node));
             app.manage(dock::DockState::default());
+            diag::init(app.handle(), wanted_port);
             platform::init_app(app);
             dock::create_windows(app.handle())?;
             tray::create(app.handle())?;
