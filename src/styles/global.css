@@ -254,6 +254,13 @@ textarea {
   background-color: var(--text-3);
 }
 
+/* panel collapsed (parked / suspended): no CSS animation keeps the renderer busy */
+:root.lc-hidden *,
+:root.lc-hidden *::before,
+:root.lc-hidden *::after {
+  animation-play-state: paused !important;
+}
+
 @media (prefers-reduced-motion: reduce) {
   * {
     animation-duration: 1ms !important;

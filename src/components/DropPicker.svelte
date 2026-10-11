@@ -11,6 +11,11 @@
   let peers = $derived(app.onlinePeers);
   let focused = $derived(ui.dropKey?.startsWith("peer:") ? ui.dropKey.slice(5) : ui.dropKey === "all" ? "all" : null);
   let count = $derived(ui.dragPaths.length);
+  /** Index of the focused slot ("全部" is last), -1 = none. */
+  let focusIdx = $derived(focused === null ? -1 : focused === "all" ? peers.length : peers.findIndex((p) => p.id === focused));
+  /** Neighbours move aside with a transform: the slot widths used to animate, i.e. a relayout of
+   *  the row on every frame under the picker's backdrop blur (re-blurred each frame too). */
+  const shift = (i: number) => (focusIdx < 0 || i === focusIdx ? 0 : i < focusIdx ? -1 : 1);
   let focusName = $derived(focused === "all" ? `全部 ${peers.length} 台设备` : (peers.find((p) => p.id === focused)?.name ?? null));
 </script>
 
@@ -26,17 +31,21 @@
   </div>
   <div class="ring">
     {#each peers as p, i (p.id)}
-      <div class="slot" class:focus={focused === p.id} data-drop={"peer:" + p.id} style:--i={i}>
-        <div class="avatar" style:--c={avatarColor(p.id)}>{initials(p.name)}</div>
-        <div class="name">{p.name}</div>
-        <div class="os">{osGlyph(p.os)}</div>
+      <div class="slot" class:focus={focused === p.id} data-drop={"peer:" + p.id} style:--i={i} style:--shift={shift(i)}>
+        <div class="pop">
+          <div class="avatar" style:--c={avatarColor(p.id)}>{initials(p.name)}</div>
+          <div class="name">{p.name}</div>
+          <div class="os">{osGlyph(p.os)}</div>
+        </div>
       </div>
     {/each}
     {#if peers.length > 1}
-      <div class="slot all" class:focus={focused === "all"} data-drop="all" style:--i={peers.length}>
-        <div class="avatar">全部</div>
-        <div class="name">全部设备</div>
-        <div class="os">{peers.length} 台</div>
+      <div class="slot all" class:focus={focused === "all"} data-drop="all" style:--i={peers.length} style:--shift={shift(peers.length)}>
+        <div class="pop">
+          <div class="avatar">全部</div>
+          <div class="name">全部设备</div>
+          <div class="os">{peers.length} 台</div>
+        </div>
       </div>
     {/if}
   </div>
@@ -89,18 +98,23 @@
     max-width: 100%;
   }
   .slot {
-    /* the width itself grows on focus, so the row reflows: neighbours are pushed aside */
+    /* fixed width; the focused one inflates (scale) and its neighbours slide aside (translate) */
     width: 84px;
     height: 132px;
+    border-radius: 18px;
+    transform: translateX(calc(var(--shift, 0) * 22px));
+    transition:
+      transform 320ms cubic-bezier(0.34, 1.56, 0.64, 1),
+      opacity 220ms;
+  }
+  .pop {
+    width: 100%;
+    height: 100%;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
     gap: 6px;
-    border-radius: 18px;
-    transition:
-      width 320ms cubic-bezier(0.34, 1.56, 0.64, 1),
-      opacity 220ms;
     animation: slot-in 420ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
     animation-delay: calc(var(--i) * 45ms);
   }
@@ -111,11 +125,7 @@
     }
   }
   .has-focus .slot:not(.focus) {
-    width: 70px;
     opacity: 0.62;
-  }
-  .slot.focus {
-    width: 124px;
   }
   .avatar {
     width: 58px;

@@ -99,6 +99,8 @@
     phase = "opening";
     // Windows: the whole window (native Acrylic included) fades in, so the page must not slide or
     // fade inside a material that is already there; only a slight settle in scale.
+    // a compositor layer for the shell only while it animates (it used to keep one permanently)
+    shell.style.willChange = "transform, opacity";
     anim = isWindows
       ? shell.animate([{ transform: "scale(0.985)", opacity: 1 }, { transform: "none", opacity: 1 }], { duration: 160, easing: "cubic-bezier(0.2, 0.8, 0.3, 1)", fill: "both" })
       : springTo(shell, { ...edgeOffset(edge, 36), scale: 0.94, opacity: 0 }, { x: 0, y: 0, scale: 1, opacity: 1 }, { stiffness: 300, damping: 24 });
@@ -112,7 +114,13 @@
       else afterFrames(2, () => api.panelReady().catch(() => {}));
     }
     firstShow = false;
-    anim.finished.then(() => (uiLog("panel open animation done"), phase === "opening" && (phase = "open"))).catch(() => {});
+    anim.finished
+      .then(() => {
+        uiLog("panel open animation done");
+        if (phase === "opening") phase = "open";
+        shell.style.willChange = "";
+      })
+      .catch(() => {});
     app.markReadIfVisible();
     if (from === "drag") ui.dragging = true;
   }
@@ -126,6 +134,7 @@
     // what a parked panel shows first when it comes back).
     if (!isWindows) {
       anim?.cancel();
+      shell.style.willChange = "transform, opacity";
       anim = exitTo(shell, { x: 0, y: 0, scale: 1, opacity: 1 }, { ...edgeOffset(edge, 28), scale: 0.96, opacity: 0 }, 220);
       try {
         await anim.finished;
@@ -169,6 +178,38 @@
   $effect(() => {
     api.setHold(holding()).catch(() => {});
   });
+
+  // Collapsed: pause every CSS animation (infinite ones like the empty-state ping or a spinning
+  // refresh icon kept the parked renderer producing frames while nothing was on screen).
+  $effect(() => {
+    document.documentElement.classList.toggle("lc-hidden", !app.visible);
+  });
+
+  // ---- drag hit testing: `over` events come with every pointer move; elementFromPoint forces a
+  // style/layout flush (mid-animation, under the picker's blur). Resolve at most once per frame,
+  // and only when the position changed.
+  let dragPos: { x: number; y: number } | null = null;
+  let dragLast = "";
+  let dragFrame = 0;
+  function queueHitTest(x: number, y: number) {
+    dragPos = { x, y };
+    if (dragFrame) return;
+    dragFrame = requestAnimationFrame(() => {
+      dragFrame = 0;
+      if (!dragPos || !ui.dragging) return;
+      const k = `${Math.round(dragPos.x)},${Math.round(dragPos.y)}`;
+      if (k === dragLast) return;
+      dragLast = k;
+      const key = hitTest(dragPos.x, dragPos.y);
+      if (key !== ui.dropKey) ui.dropKey = key;
+    });
+  }
+  function endHitTest() {
+    cancelAnimationFrame(dragFrame);
+    dragFrame = 0;
+    dragPos = null;
+    dragLast = "";
+  }
 
   onMount(() => {
     performance.mark("mount");
@@ -251,18 +292,20 @@
         await getCurrentWebview().onDragDropEvent((ev) => {
           const p = ev.payload;
           if (p.type === "enter" || p.type === "over") {
-            ui.dragging = true;
+            if (!ui.dragging) ui.dragging = true;
             pointerInside = true;
             clearTimeout(collapseTimer);
             const pos = p.position;
-            ui.dropKey = hitTest(pos.x / devicePixelRatio, pos.y / devicePixelRatio);
+            queueHitTest(pos.x / devicePixelRatio, pos.y / devicePixelRatio);
             if (p.type === "enter") ui.dragPaths = p.paths;
           } else if (p.type === "drop") {
+            endHitTest();
             const key = hitTest(p.position.x / devicePixelRatio, p.position.y / devicePixelRatio);
             ui.dragging = false;
             ui.dropKey = null;
             dropFiles(key, p.paths);
           } else {
+            endHitTest();
             ui.dragging = false;
             ui.dropKey = null;
           }
@@ -387,7 +430,6 @@
     display: flex;
     flex-direction: column;
     opacity: 0;
-    will-change: transform, opacity;
   }
   .shell.dragging > :global(header),
   .shell.dragging > .body {
