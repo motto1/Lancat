@@ -713,13 +713,22 @@ static PRESS_OUTSIDE: AtomicBool = AtomicBool::new(false);
 // A message from a peer while the panel is closed: the strip turns into a pill saying who sent
 // what for a few seconds (Windows: native, see native_dock/win_toast.rs). Main thread only.
 pub fn on_incoming(app: &AppHandle, m: &lancat_core::Message) {
-    if m.outgoing || app.state::<DockState>().visible.load(Ordering::SeqCst) || is_moving() {
+    if m.outgoing {
         return;
     }
+    // Every decision is logged (without the message text) so a toast that did not appear can be
+    // told apart from one that was suppressed on purpose.
+    let skip = |why: &str| log::debug!("message toast for {} ({}) not shown: {why}", m.peer_id, m.kind);
+    if app.state::<DockState>().visible.load(Ordering::SeqCst) {
+        return skip("panel open");
+    }
+    if is_moving() {
+        return skip("dock being dragged");
+    }
     let core = &app.state::<Core>().0;
-    let Some(peer) = core.peers().into_iter().find(|p| p.id == m.peer_id) else { return };
+    let Some(peer) = core.peers().into_iter().find(|p| p.id == m.peer_id) else { return skip("unknown peer") };
     if peer.blocked {
-        return;
+        return skip("peer blocked");
     }
     let s = |k: &str| m.body.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
     let text = match m.kind.as_str() {
@@ -732,11 +741,12 @@ pub fn on_incoming(app: &AppHandle, m: &lancat_core::Message) {
             let size = m.body.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
             format!("📄 {} · {}", s("name"), human_size(size))
         }
-        _ => return,
+        _ => return skip("kind has no toast"),
     };
     #[cfg(windows)]
     {
-        let Some(geo) = *app.state::<DockState>().geo.lock().unwrap() else { return };
+        let Some(geo) = *app.state::<DockState>().geo.lock().unwrap() else { return skip("no dock geometry yet") };
+        log::info!("message toast: {} from {} ({})", m.kind, peer.name, m.peer_id);
         let dark = platform::theme_is_dark(&core.settings().theme);
         let hold_ms = 4000 + (text.chars().count() as u32 * 60).min(3000);
         native_dock::toast_show(
