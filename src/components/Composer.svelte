@@ -47,6 +47,7 @@
   }
 
   function onInput() {
+    ui.noteTyping();
     autosize();
     const t = targets.length === 1 ? targets[0] : null;
     if (t && Date.now() - lastTyping > 2500) {
@@ -77,6 +78,8 @@
   }
 
   function onKey(e: KeyboardEvent) {
+    // every key, Enter included: after an Enter send the panel stays open for the next message
+    ui.noteTyping();
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       send();
@@ -159,6 +162,7 @@
     onfocus={() => (ui.composerFocused = true)}
     onblur={() => {
       ui.composerFocused = false;
+      ui.endTyping();
       stopTyping();
     }}
   ></textarea>

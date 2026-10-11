@@ -76,9 +76,13 @@
    *  live outside the page: pinned, a native file dialog, a drag, a half-typed message. Popovers
    *  (emoji panel, context menu), a merely focused composer and running transfers used to count
    *  too; they kept the panel open indefinitely, since nothing released them unless the user went
-   *  back in and closed them. They are closed by the collapse instead. */
+   *  back in and closed them. They are closed by the collapse instead.
+   *  A focused composer holds while it has a draft, or for a few seconds after the last keystroke
+   *  (ui.recentlyTyped): Enter sends and empties the draft while the pointer is usually outside,
+   *  which used to collapse the panel in the middle of a conversation. An idle, empty, focused
+   *  composer still does not hold. */
   function holding(): boolean {
-    return ui.pinned || ui.dialogOpen || (ui.composerFocused && ui.draft);
+    return ui.pinned || ui.dialogOpen || (ui.composerFocused && (ui.draft || ui.recentlyTyped));
   }
   function blocked(): boolean {
     return holding() || ui.dragging;
@@ -148,6 +152,7 @@
     setLottieActive(false); // nothing animates while hidden
     ui.emojiOpen = false;
     ui.menuOpen = false;
+    ui.endTyping();
     await api.hidePanel();
   }
 
@@ -326,6 +331,7 @@
     const onWinBlur = () => {
       uiLog(`window blur, pointerInside=${pointerInside}`);
       ui.composerFocused = false;
+      ui.endTyping();
       (document.activeElement as HTMLElement | null)?.blur?.();
       if (!pointerInside && phase !== "hidden") scheduleCollapse();
     };
