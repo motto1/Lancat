@@ -8,6 +8,7 @@
 //! otherwise it shrinks back into the strip after a few seconds.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -69,9 +70,44 @@ pub struct ToastSpec {
 }
 
 struct Gfx {
-    _d2d: ID2D1Factory,
+    d2d: ID2D1Factory,
     dw: IDWriteFactory,
     rt: ID2D1DCRenderTarget,
+}
+
+/// `EndDraw` result that means the render target's device is gone (display driver reset / update,
+/// GPU removed, remote session switch): the target must be recreated, it never works again.
+const D2DERR_RECREATE_TARGET: u32 = 0x8899_000C;
+
+fn rt_props() -> D2D1_RENDER_TARGET_PROPERTIES {
+    D2D1_RENDER_TARGET_PROPERTIES {
+        r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+        dpiX: 96.0,
+        dpiY: 96.0,
+        usage: D2D1_RENDER_TARGET_USAGE_NONE,
+        minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+    }
+}
+
+fn create_gfx() -> Option<Gfx> {
+    unsafe {
+        (|| -> windows::core::Result<Gfx> {
+            let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+            let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+            let rt = d2d.CreateDCRenderTarget(&rt_props())?;
+            Ok(Gfx { d2d, dw, rt })
+        })()
+        .map_err(|e| log::warn!("toast: Direct2D init failed: {e}"))
+        .ok()
+    }
+}
+
+/// The toast is on screen (read by the cursor poller, another thread).
+static SHOWN: AtomicBool = AtomicBool::new(false);
+
+pub fn shown() -> bool {
+    SHOWN.load(Ordering::SeqCst)
 }
 
 struct State {
@@ -140,22 +176,7 @@ fn ensure_window(app: &AppHandle) -> bool {
             log::warn!("toast: CreateWindowExW failed");
             return false;
         };
-        let gfx = (|| -> windows::core::Result<Gfx> {
-            let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-            let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            let props = D2D1_RENDER_TARGET_PROPERTIES {
-                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
-                dpiX: 96.0,
-                dpiY: 96.0,
-                usage: D2D1_RENDER_TARGET_USAGE_NONE,
-                minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
-            };
-            let rt = d2d.CreateDCRenderTarget(&props)?;
-            Ok(Gfx { _d2d: d2d, dw, rt })
-        })()
-        .map_err(|e| log::warn!("toast: Direct2D init failed: {e}"))
-        .ok();
+        let gfx = create_gfx();
         STATE.with(|s| {
             *s.borrow_mut() = Some(State {
                 hwnd,
@@ -206,6 +227,10 @@ pub fn show(app: &AppHandle, spec: ToastSpec) {
     }
     let hold = spec.hold_ms;
     with(|s| unsafe {
+        if s.gfx.is_none() {
+            // init failed earlier (e.g. during a driver update): try again
+            s.gfx = create_gfx();
+        }
         let Some(g) = &s.gfx else { return };
         let sc = spec.scale;
         let (name, name_w) = layout(&g.dw, &spec.name, (12.5 * sc) as f32, DWRITE_FONT_WEIGHT_SEMI_BOLD, (NAME_MAX * sc) as f32).unzip();
@@ -245,8 +270,9 @@ pub fn show(app: &AppHandle, spec: ToastSpec) {
             s.glass_dark = s.glass.as_ref().and_then(|g| backdrop_dark(s, g));
         }
         animate(s, 1.0);
-        render(s);
+        draw(s);
         let _ = ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
+        SHOWN.store(true, Ordering::SeqCst);
         super::windows::set_hidden(true);
         let _ = KillTimer(Some(s.hwnd), TIMER_HIDE);
         if !s.hovering {
@@ -429,7 +455,35 @@ fn animate(s: &mut State, to: f64) {
     s.to = to;
     s.t0 = Instant::now();
     unsafe {
+        // going away (dismissed, clicked, timed out): a pending hide timer would fire later and
+        // re-run the shrink (or cut the next toast short); hovering may have armed a new one too
+        if to <= 0.0 {
+            let _ = KillTimer(Some(s.hwnd), TIMER_HIDE);
+        }
         SetTimer(Some(s.hwnd), TIMER_ANIM, 16, None);
+    }
+}
+
+/// Renders a frame; after a device loss recreates the render target and renders again. The toast
+/// used to stay invisible from the first driver reset until the app was restarted (every
+/// EndDraw failed with D2DERR_RECREATE_TARGET and nothing recreated the target).
+fn draw(s: &mut State) {
+    if render(s) {
+        return;
+    }
+    let Some(g) = &s.gfx else { return };
+    match unsafe { g.d2d.CreateDCRenderTarget(&rt_props()) } {
+        Ok(rt) => {
+            log::info!("toast: render target lost (display driver reset?); recreated");
+            if let Some(g) = s.gfx.as_mut() {
+                g.rt = rt;
+            }
+            render(s);
+        }
+        Err(e) => {
+            log::warn!("toast: recreating the render target failed: {e}; reinitialising Direct2D");
+            s.gfx = create_gfx();
+        }
     }
 }
 
@@ -491,12 +545,14 @@ fn avatar_color(id: &str) -> D2D1_COLOR_F {
     color(r + m, g + m, b + m, 1.0)
 }
 
-fn render(s: &State) {
-    let (Some(g), Some(spec)) = (&s.gfx, &s.spec) else { return };
+/// False when the render target must be recreated (device lost).
+fn render(s: &State) -> bool {
+    let (Some(g), Some(spec)) = (&s.gfx, &s.spec) else { return true };
     let (_, _, w, h) = s.win;
     if w <= 0 || h <= 0 {
-        return;
+        return true;
     }
+    let mut ok = true;
     let sc = spec.scale;
     let (pw, ph) = pill_size(s, sc);
     let st = spec.strip;
@@ -654,7 +710,13 @@ fn render(s: &State) {
                         rt.DrawTextLayout(pt(x as f32, (top + nh + LINE_GAP * sc) as f32), l, &b, opts);
                     }
                 }
-                let _ = rt.EndDraw(None, None);
+                if let Err(e) = rt.EndDraw(None, None) {
+                    if e.code().0 as u32 == D2DERR_RECREATE_TARGET {
+                        ok = false;
+                    } else {
+                        log::debug!("toast: EndDraw failed: {e}");
+                    }
+                }
             }
             let size = SIZE { cx: w, cy: h };
             let src = POINT { x: 0, y: 0 };
@@ -667,6 +729,7 @@ fn render(s: &State) {
         let _ = DeleteDC(mem);
         ReleaseDC(None, screen);
     }
+    ok
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -713,13 +776,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 TIMER_ANIM => {
                     with(|s| {
                         let done = step(s);
-                        render(s);
+                        draw(s);
                         if done {
                             let _ = KillTimer(Some(hwnd), TIMER_ANIM);
                             if s.to <= 0.0 {
+                                let _ = KillTimer(Some(hwnd), TIMER_HIDE);
                                 let _ = ShowWindow(s.hwnd, SW_HIDE);
                                 s.spec = None;
                                 s.hovering = false;
+                                s.glass = None; // window-sized backdrop copy: free it
+                                SHOWN.store(false, Ordering::SeqCst);
                                 super::windows::set_hidden(false);
                             }
                         }

@@ -51,7 +51,7 @@ mod win_drop;
 #[cfg(target_os = "windows")]
 mod win_toast;
 #[cfg(target_os = "windows")]
-pub use self::win_toast::{dismiss as toast_dismiss, show as toast_show, ToastSpec};
+pub use self::win_toast::{dismiss as toast_dismiss, show as toast_show, shown as toast_shown, ToastSpec};
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
