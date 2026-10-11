@@ -1,7 +1,7 @@
 //! Outgoing file transfers: 4 MiB chunks over HTTP PUT, 4 in flight, resumable, BLAKE3-verified.
 
 use std::fs::File;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -12,6 +12,7 @@ use futures_util::{stream, TryStreamExt};
 
 use crate::events::CoreEvent;
 use crate::files::{discard_partial, expand_paths, hash_file, read_at};
+use crate::netutil;
 use crate::node::{fmt_sa, json_body, Node};
 use crate::protocol::*;
 use crate::store::{FileBody, Message};
@@ -410,25 +411,40 @@ impl Node {
     /// drops inbound connections on the address we know looks online and chats fine, while
     /// uploads to that address fail; another address it was heard on (Tailscale ...) may work.
     async fn reachable_base(&self, peer_id: &str) -> Result<String> {
-        let cands = self.peer_dial_addrs(peer_id);
+        let mut cands = self.peer_dial_addrs(peer_id);
         let Some(&(first, port)) = cands.first() else { bail!("对方地址未知") };
-        for (i, (ip, port)) in cands.iter().enumerate() {
-            let base = format!("http://{}", fmt_sa(&SocketAddr::new(*ip, *port)));
-            let r = self.http.get(format!("{base}/info")).header(HEADER_DEVICE_ID, self.me().id).timeout(Duration::from_secs(4)).send().await;
-            let ok = match r {
-                Ok(r) if r.status().is_success() => matches!(json_body::<DeviceInfo>(r).await, Ok(d) if d.id == peer_id),
-                _ => false,
-            };
-            if ok {
-                if i > 0 {
-                    log::warn!("{peer_id}: {first}:{port} not reachable (inbound blocked by its firewall?), sending via {ip}");
-                }
-                return Ok(base);
+        if self.answers_as(peer_id, first, port).await {
+            return Ok(base_url(first, port));
+        }
+        // Fallbacks, checked at once: other addresses it was heard on, then our online Tailscale
+        // peers (one of them may be this device; it is heard on the LAN only while linked there).
+        for ip in netutil::tailscale_peers().await.into_iter().take(32) {
+            let ip = IpAddr::V4(ip);
+            if !cands.iter().any(|(c, _)| *c == ip) {
+                cands.push((ip, port));
             }
-            log::debug!("{peer_id}: {ip}:{port} not reachable");
+        }
+        let rest = &cands[1..];
+        let ok = futures_util::future::join_all(rest.iter().map(|(ip, p)| self.answers_as(peer_id, *ip, *p))).await;
+        if let Some((ip, p)) = rest.iter().zip(ok).find(|(_, ok)| *ok).map(|(c, _)| *c) {
+            log::warn!("{peer_id}: {first}:{port} not reachable (inbound blocked by its firewall?), sending via {ip}:{p}");
+            return Ok(base_url(ip, p));
         }
         bail!("连不上对方 {first}:{port}（对方能连我们所以文字可达，但对方的防火墙挡住了 Lancat 的入站连接，文件发不过去）")
     }
+
+    /// `GET /info` at ip:port answers with this device id.
+    async fn answers_as(&self, peer_id: &str, ip: IpAddr, port: u16) -> bool {
+        let r = self.http.get(format!("{}/info", base_url(ip, port))).header(HEADER_DEVICE_ID, self.me().id).timeout(Duration::from_secs(4)).send().await;
+        match r {
+            Ok(r) if r.status().is_success() => matches!(json_body::<DeviceInfo>(r).await, Ok(d) if d.id == peer_id),
+            _ => false,
+        }
+    }
+}
+
+fn base_url(ip: IpAddr, port: u16) -> String {
+    format!("http://{}", fmt_sa(&SocketAddr::new(ip, port)))
 }
 
 fn chunk_len(size: u64, idx: u64) -> u64 {
@@ -440,7 +456,6 @@ fn chunk_len(size: u64, idx: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::NodeConfig;
-    use std::net::IpAddr;
 
     async fn start(dir: &std::path::Path, name: &str) -> Arc<Node> {
         let mut cfg = NodeConfig::new(dir.join("data"));
