@@ -4,6 +4,7 @@ mod commands;
 mod dock;
 mod native_dock;
 mod platform;
+mod timers;
 mod tray;
 
 use std::sync::Arc;
@@ -216,8 +217,7 @@ pub fn run() {
             if std::env::var_os("LANCAT_OPEN_ON_START").is_some() {
                 // debugging / screenshots: show the panel once the webview is up
                 let h = app.handle().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                timers::after(std::time::Duration::from_millis(1500), move || {
                     let h2 = h.clone();
                     let _ = h.run_on_main_thread(move || dock::open_panel(&h2, "tray"));
                 });

@@ -85,17 +85,39 @@ struct ShowPayload {
     reason: String,
 }
 
-fn pick_monitor(app: &AppHandle, index: usize) -> Option<Monitor> {
-    let list = app.available_monitors().unwrap_or_default();
-    if let Some(primary) = app.primary_monitor().ok().flatten() {
-        if index == 0 {
-            return Some(primary);
-        }
-        // index 0 = primary, then the others in OS order
-        let others: Vec<Monitor> = list.into_iter().filter(|m| m.position() != primary.position() || m.size() != primary.size()).collect();
-        return others.into_iter().nth(index - 1).or(Some(primary));
+/// Monitors in the app's numbering: index 0 = primary, then the others in OS order.
+fn monitors_ordered(app: &AppHandle) -> Vec<Monitor> {
+    if let Some(c) = MOVE_CACHE.lock().unwrap().as_ref() {
+        return c.monitors.clone();
     }
-    list.into_iter().nth(index)
+    let list = app.available_monitors().unwrap_or_default();
+    let Some(primary) = app.primary_monitor().ok().flatten() else { return list };
+    let mut out = vec![primary.clone()];
+    out.extend(list.into_iter().filter(|m| m.position() != primary.position() || m.size() != primary.size()));
+    out
+}
+
+fn pick_monitor(app: &AppHandle, index: usize) -> Option<Monitor> {
+    let list = monitors_ordered(app);
+    list.get(index).or(list.first()).cloned()
+}
+
+/// What a dock drag reads on every 16 ms step, snapshotted when the drag starts: it used to query
+/// the settings (SQLite) and the monitor list several times per step (place_for, compute,
+/// refresh_visual's peer list for the unread flag).
+struct MoveCache {
+    monitors: Vec<Monitor>,
+    settings: lancat_core::Settings,
+    unread: bool,
+}
+static MOVE_CACHE: Mutex<Option<MoveCache>> = Mutex::new(None);
+
+/// The settings, from the drag snapshot while the dock is being dragged.
+fn settings_now(app: &AppHandle) -> lancat_core::Settings {
+    if let Some(c) = MOVE_CACHE.lock().unwrap().as_ref() {
+        return c.settings.clone();
+    }
+    app.state::<Core>().0.settings()
 }
 
 /// Edge, offset and monitor in effect: the live ones while the dock is being dragged, else the
@@ -104,7 +126,7 @@ fn placement(app: &AppHandle) -> (String, f64, usize) {
     if let Some(p) = MOVE_PLACE.lock().unwrap().clone() {
         return p;
     }
-    let s = app.state::<Core>().0.settings();
+    let s = settings_now(app);
     (s.dock_edge, s.dock_offset, s.dock_monitor)
 }
 
@@ -113,7 +135,7 @@ pub(crate) fn current_edge(app: &AppHandle) -> String {
 }
 
 fn compute(app: &AppHandle) -> Option<Geo> {
-    let s = app.state::<Core>().0.settings();
+    let s = settings_now(app);
     let (edge_now, offset_now, monitor_now) = placement(app);
     let m = pick_monitor(app, monitor_now)?;
     let sc = m.scale_factor();
@@ -204,8 +226,7 @@ pub fn create_windows(app: &AppHandle) -> tauri::Result<()> {
     spawn_poller(app.clone());
     // the collapsed app has settled: give back start-up heap and library pages (Linux)
     let a = app.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(8));
+    crate::timers::after(Duration::from_secs(8), move || {
         let st = a.state::<DockState>();
         if a.get_webview_window("panel").is_none() && !st.hovering.load(Ordering::SeqCst) {
             platform::settle_after_start();
@@ -318,6 +339,7 @@ fn boot_script(app: &AppHandle) -> String {
 
 /// Pointer entered the strip: pre-warm the panel webview so the hover delay hides its start-up.
 pub fn on_hover_start(app: &AppHandle) {
+    wake_poller();
     let st = app.state::<DockState>();
     st.hovering.store(true, Ordering::SeqCst);
     st.hover_gen.fetch_add(1, Ordering::SeqCst);
@@ -342,6 +364,11 @@ pub fn on_hover_end(app: &AppHandle) {
     } else {
         // pre-warmed but never opened: let it go after the keep-alive like a collapsed panel
         schedule_destroy(app);
+        // Windows: on_hover_start bumped panel_gen, which cancelled the suspend a collapse had
+        // scheduled; touching the strip within 4 s of a collapse left the parked panel rendering
+        // (unsuspended) until the 30 min reaper. Re-arm it.
+        #[cfg(windows)]
+        schedule_suspend(app);
     }
 }
 
@@ -352,8 +379,7 @@ pub fn schedule_hover_open(app: &AppHandle) {
     let gen = st.hover_gen.load(Ordering::SeqCst);
     let delay = Duration::from_millis(app.state::<Core>().0.settings().hover_delay_ms);
     let a = app.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(delay);
+    crate::timers::after(delay, move || {
         let a2 = a.clone();
         let _ = a.run_on_main_thread(move || {
             let st = a2.state::<DockState>();
@@ -382,36 +408,35 @@ fn schedule_destroy(app: &AppHandle) {
         return;
     }
     let a = app.clone();
-    std::thread::Builder::new()
-        .name("lancat-panel-reaper".into())
-        .spawn(move || {
-            std::thread::sleep(Duration::from_secs(secs));
-            let a2 = a.clone();
-            let _ = a.run_on_main_thread(move || {
-                let st = a2.state::<DockState>();
-                if st.visible.load(Ordering::SeqCst) || st.hovering.load(Ordering::SeqCst) || st.panel_gen.load(Ordering::SeqCst) != gen {
-                    return;
-                }
-                if let Some(p) = a2.get_webview_window("panel") {
-                    log::info!("destroying the idle panel webview (collapsed for {secs}s)");
-                    let _ = p.destroy();
-                    // give the freed UI-process side of WebKit back to the OS a moment later
-                    std::thread::spawn(|| {
-                        std::thread::sleep(Duration::from_secs(2));
-                        platform::reap_web_helpers();
-                        platform::trim_heap();
-                    });
-                }
-            });
-        })
-        .ok();
+    crate::timers::after(Duration::from_secs(secs), move || {
+        let a2 = a.clone();
+        let _ = a.run_on_main_thread(move || {
+            let st = a2.state::<DockState>();
+            if st.visible.load(Ordering::SeqCst) || st.hovering.load(Ordering::SeqCst) || st.panel_gen.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            if let Some(p) = a2.get_webview_window("panel") {
+                log::info!("destroying the idle panel webview (collapsed for {secs}s)");
+                let _ = p.destroy();
+                // give the freed UI-process side of WebKit back to the OS a moment later
+                crate::timers::after(Duration::from_secs(2), || {
+                    platform::reap_web_helpers();
+                    platform::trim_heap();
+                });
+            }
+        });
+    });
 }
 
 /// Pushes edge / unread / open state to the native strip. Main thread only.
 pub fn refresh_visual(app: &AppHandle) {
-    let core = &app.state::<Core>().0;
-    let unread = core.peers().iter().any(|p| !p.blocked && p.unread > 0);
-    let settings = core.settings();
+    let cached = MOVE_CACHE.lock().unwrap().as_ref().map(|c| (c.unread, c.settings.clone()));
+    let (unread, settings) = cached.unwrap_or_else(|| {
+        let core = &app.state::<Core>().0;
+        (core.peers().iter().any(|p| !p.blocked && p.unread > 0), core.settings())
+    });
+    #[cfg(not(windows))]
+    let _ = &settings;
     // Windows: "open" once the parked panel actually starts fading in (platform::reveal calls back)
     let open = app.state::<DockState>().visible.load(Ordering::SeqCst) && platform_revealed();
     #[allow(unused_mut)]
@@ -462,6 +487,7 @@ pub fn open_panel(app: &AppHandle, reason: &str) {
     let existed = app.get_webview_window("panel").is_some();
     // mark visible before a cold create so the boot script tells the page to animate in at once
     let was_visible = st.visible.swap(true, Ordering::SeqCst);
+    wake_poller();
     if !was_visible {
         *st.open_requested.lock().unwrap() = Some(Instant::now());
         if !existed {
@@ -497,7 +523,9 @@ pub fn open_panel(app: &AppHandle, reason: &str) {
         let _ = app.emit("panel://visible", true);
         refresh_visual(app);
     }
-    if reason == "tray" || reason == "shortcut" {
+    // opened on purpose (tray, shortcut, a click on the message toast): take the keyboard so the
+    // user can type the reply at once. Hover / drag opens never steal focus.
+    if reason == "tray" || reason == "shortcut" || reason.starts_with("toast:") {
         let _ = panel.set_focus();
     }
     let edge = current_edge(app);
@@ -505,8 +533,16 @@ pub fn open_panel(app: &AppHandle, reason: &str) {
 }
 
 pub fn hide_panel(app: &AppHandle) {
-    log::debug!("hide_panel");
     let st = app.state::<DockState>();
+    // A collapse can reach here up to three times (the page's own hidePanel after its animation,
+    // request_collapse's "not revealed yet" path and its 1 s fallback): each run restarted the
+    // fade-out from the current alpha and queued another suspend and destroy. Only the first one
+    // of a close does the work.
+    if !st.visible.swap(false, Ordering::SeqCst) {
+        log::debug!("hide_panel: already hidden");
+        return;
+    }
+    log::debug!("hide_panel");
     if let Some(panel) = app.get_webview_window("panel") {
         #[cfg(not(windows))]
         let _ = panel.hide();
@@ -516,7 +552,6 @@ pub fn hide_panel(app: &AppHandle) {
         #[cfg(windows)]
         platform::panel_visibility(&panel, false);
     }
-    st.visible.store(false, Ordering::SeqCst);
     st.cold_open.store(false, Ordering::SeqCst);
     *st.hover_since.lock().unwrap() = None;
     st.hover_disarmed.store(cursor_in_dock(app), Ordering::SeqCst);
@@ -532,8 +567,7 @@ pub fn hide_panel(app: &AppHandle) {
 fn schedule_suspend(app: &AppHandle) {
     let gen = app.state::<DockState>().panel_gen.load(Ordering::SeqCst);
     let a = app.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(4));
+    crate::timers::after(Duration::from_secs(4), move || {
         let a2 = a.clone();
         let _ = a.run_on_main_thread(move || {
             let st = a2.state::<DockState>();
@@ -573,8 +607,7 @@ pub fn request_collapse(app: &AppHandle) {
     }
     let gen = st.panel_gen.load(Ordering::SeqCst);
     let a = app.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(1000));
+    crate::timers::after(Duration::from_millis(1000), move || {
         let a2 = a.clone();
         let _ = a.run_on_main_thread(move || {
             let st = a2.state::<DockState>();
@@ -622,15 +655,47 @@ pub fn open_settings(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// The pointer is near the strip, a button is held or the panel is open: poll at full rate.
+static POLL_NEAR: AtomicBool = AtomicBool::new(true);
+/// Wakes the poller early (pointer entered the strip, panel opened).
+static POLL_WAKE: (Mutex<bool>, std::sync::Condvar) = (Mutex::new(false), std::sync::Condvar::new());
+
+pub(crate) fn wake_poller() {
+    *POLL_WAKE.0.lock().unwrap() = true;
+    POLL_WAKE.1.notify_one();
+}
+
+/// Poll period while nothing is near: the strip senses plain hovers itself (WM_MOUSEMOVE + its
+/// own hover timer), the poller is only needed for OLE drags (which deliver no mouse messages)
+/// and the pointer-inside fallback of the open panel. It used to tick every 80 ms (12.5
+/// wake-ups/s) for the whole life of the app; far from the strip it now ticks every 300 ms and
+/// switches to 80 ms as soon as the pointer is within reach, a button is held or the panel is open.
+const POLL_FAR_MS: u64 = 300;
+/// "Near": within this many logical px of the strip.
+const NEAR_PX: f64 = 240.0;
+
 fn spawn_poller(app: AppHandle) {
     std::thread::Builder::new()
         .name("lancat-dock-poller".into())
         .spawn(move || loop {
             // Linux: the native strip gets enter/leave/drag itself, so the poller only matters while
             // the panel is visible (pointer-inside fallback). Elsewhere it also senses OLE drags.
-            let idle = cfg!(target_os = "linux") && !app.state::<DockState>().visible.load(Ordering::SeqCst);
-            let ms = if is_moving() { 16 } else if idle { 500 } else { 80 };
-            std::thread::sleep(Duration::from_millis(ms));
+            let visible = app.state::<DockState>().visible.load(Ordering::SeqCst);
+            let idle = cfg!(target_os = "linux") && !visible;
+            let ms = if is_moving() {
+                16
+            } else if idle {
+                500
+            } else if visible || POLL_NEAR.load(Ordering::SeqCst) {
+                80
+            } else {
+                POLL_FAR_MS
+            };
+            {
+                let g = POLL_WAKE.0.lock().unwrap();
+                let (mut g, _) = POLL_WAKE.1.wait_timeout_while(g, Duration::from_millis(ms), |woken| !*woken).unwrap();
+                *g = false;
+            }
             if !idle {
                 tick(&app);
             }
@@ -723,7 +788,13 @@ pub fn begin_move(app: &AppHandle, from_strip: bool) {
     #[cfg(windows)]
     native_dock::toast_dismiss();
     match app.cursor_position() {
-        Ok(c) => *MOVE.lock().unwrap() = Some(Move { from_strip, start: (c.x, c.y), moved: false }),
+        Ok(c) => {
+            let core = &app.state::<Core>().0;
+            let unread = core.peers().iter().any(|p| !p.blocked && p.unread > 0);
+            let monitors = monitors_ordered(app);
+            *MOVE_CACHE.lock().unwrap() = Some(MoveCache { monitors, settings: core.settings(), unread });
+            *MOVE.lock().unwrap() = Some(Move { from_strip, start: (c.x, c.y), moved: false });
+        }
         Err(_) if from_strip => open_panel(app, "hover"),
         Err(_) => {}
     }
@@ -732,17 +803,7 @@ pub fn begin_move(app: &AppHandle, from_strip: bool) {
 /// Where the dock goes for a pointer at (x, y): monitor index (pick_monitor's numbering), nearest
 /// edge of its work area, centre of the strip at the pointer.
 fn place_for(app: &AppHandle, x: f64, y: f64) -> Option<(String, f64, usize)> {
-    let primary = app.primary_monitor().ok().flatten();
-    let mut list: Vec<Monitor> = Vec::new();
-    if let Some(p) = &primary {
-        list.push(p.clone());
-    }
-    for m in app.available_monitors().unwrap_or_default() {
-        if primary.as_ref().is_some_and(|p| p.position() == m.position() && p.size() == m.size()) {
-            continue;
-        }
-        list.push(m);
-    }
+    let list = monitors_ordered(app);
     let inside = |m: &Monitor| {
         let (p, s) = (m.position(), m.size());
         x >= p.x as f64 && x < (p.x + s.width as i32) as f64 && y >= p.y as f64 && y < (p.y + s.height as i32) as f64
@@ -757,7 +818,7 @@ fn place_for(app: &AppHandle, x: f64, y: f64) -> Option<(String, f64, usize)> {
     };
     #[cfg(not(windows))]
     let (ax, ay, aw, ah) = (m.position().x as f64, m.position().y as f64, m.size().width as f64, m.size().height as f64);
-    let len = app.state::<Core>().0.settings().dock_length.clamp(40.0, 2000.0) * sc;
+    let len = settings_now(app).dock_length.clamp(40.0, 2000.0) * sc;
     let d = [("left", x - ax), ("right", ax + aw - x), ("top", y - ay), ("bottom", ay + ah - y)];
     let edge = d.iter().min_by(|a, b| a.1.total_cmp(&b.1))?.0;
     let along = |c: f64, start: f64, span: f64| if span <= len { 0.5 } else { ((c - start - len / 2.0) / (span - len)).clamp(0.0, 1.0) };
@@ -773,6 +834,7 @@ fn move_tick(app: &AppHandle, x: f64, y: f64, scale: f64) -> bool {
         let m = g.take().unwrap();
         drop(g);
         let place = MOVE_PLACE.lock().unwrap().take();
+        *MOVE_CACHE.lock().unwrap() = None;
         let a = app.clone();
         let _ = app.run_on_main_thread(move || {
             if let (true, Some((edge, offset, monitor))) = (m.moved, place) {
@@ -803,7 +865,7 @@ fn move_tick(app: &AppHandle, x: f64, y: f64, scale: f64) -> bool {
     let Some(p) = place_for(app, x, y) else { return true };
     let prev = MOVE_PLACE.lock().unwrap().replace(p.clone());
     if prev.as_ref() != Some(&p) {
-        let edge_changed = prev.map(|q| q.0) .unwrap_or_else(|| app.state::<Core>().0.settings().dock_edge) != p.0;
+        let edge_changed = prev.map(|q| q.0).unwrap_or_else(|| settings_now(app).dock_edge) != p.0;
         let a = app.clone();
         let _ = app.run_on_main_thread(move || {
             apply_layout(&a);
@@ -831,6 +893,7 @@ fn tick(app: &AppHandle) {
     // Mouse button: a press that started outside our windows and is still held is (likely) a file
     // drag from another app.
     let down = platform::left_button_down();
+    POLL_NEAR.store(down || geo.dock.contains(cur.x, cur.y, NEAR_PX * geo.scale), Ordering::SeqCst);
     let was_down = LEFT_DOWN.swap(down, Ordering::SeqCst);
     if down && !was_down {
         PRESS_OUTSIDE.store(!in_dock && !in_panel, Ordering::SeqCst);
@@ -863,6 +926,13 @@ fn tick(app: &AppHandle) {
             // a drag (file being dragged toward the edge): open at once
             let a = app.clone();
             let _ = app.run_on_main_thread(move || open_panel(&a, "drag"));
+            return;
+        }
+        // The message toast stands in for the strip (same place): resting on it must not
+        // hover-open the panel behind the user's back; a click on the toast opens it.
+        #[cfg(windows)]
+        if native_dock::toast_shown() {
+            *st.hover_since.lock().unwrap() = None;
             return;
         }
         if st.hover_disarmed.load(Ordering::SeqCst) {

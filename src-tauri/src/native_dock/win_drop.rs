@@ -229,7 +229,7 @@ unsafe extern "system" fn drop(this: *mut Target, data: *mut c_void, _keys: u32,
     if let (false, Some(app)) = (files.is_empty(), APP.clone()) {
         log::info!("{} file(s) dropped on the dock strip", files.len());
         // this runs inside an incoming COM call: leave it before touching the panel
-        std::thread::spawn(move || {
+        crate::timers::after(std::time::Duration::ZERO, move || {
             let a = app.clone();
             let _ = app.run_on_main_thread(move || {
                 crate::dock::open_panel(&a, "drag");

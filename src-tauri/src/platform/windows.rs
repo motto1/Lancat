@@ -229,8 +229,7 @@ pub fn panel_open(win: &WebviewWindow, cold: bool) {
     // never leave the panel invisible if the page does not answer (e.g. still loading, or crashed)
     let timeout = Duration::from_millis(if cold { 4000 } else { 350 });
     let w = win.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(timeout);
+    crate::timers::after(timeout, move || {
         let w2 = w.clone();
         let _ = w.run_on_main_thread(move || {
             if REVEAL_PENDING.compare_exchange(gen, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
@@ -285,11 +284,11 @@ fn fade(win: &WebviewWindow, gen: u64, to: u8, ms: u64, done: fn(&WebviewWindow)
         done(win);
         return;
     }
-    let w = win.clone();
-    std::thread::spawn(move || {
-        let steps = (ms / 16).max(1);
-        for i in 1..=steps {
-            std::thread::sleep(Duration::from_millis(ms / steps));
+    // one timer-thread job per step (it used to be one OS thread per fade)
+    let steps = (ms / 16).max(1);
+    for i in 1..=steps {
+        let w = win.clone();
+        crate::timers::after(Duration::from_millis(ms * i / steps), move || {
             if PANEL_GEN.load(Ordering::SeqCst) != gen {
                 return;
             }
@@ -310,8 +309,8 @@ fn fade(win: &WebviewWindow, gen: u64, to: u8, ms: u64, done: fn(&WebviewWindow)
                     done(&w2);
                 }
             });
-        }
-    });
+        });
+    }
 }
 
 /// Collapses the panel: park it (see above) instead of hiding it. Main thread.
@@ -399,6 +398,10 @@ pub fn panel_visibility(win: &WebviewWindow, visible: bool) {
 /// (tens of ms) instead of a cold WebView2 start (700+ ms, much more after a long idle when the
 /// browser process and its files have left memory). Main thread only.
 pub fn panel_suspend(win: &WebviewWindow) {
+    // the open/close generation at suspend time: if the panel is opened again before the
+    // suspension completes (it is asynchronous) or before the trim runs, neither may touch it —
+    // trimming a panel that is on screen pages its renderer out right while it is being used
+    let gen = PANEL_GEN.load(Ordering::SeqCst);
     let _ = win.with_webview(move |wv| unsafe {
         let ctl = wv.controller();
         let Ok(core) = ctl.CoreWebView2() else { return };
@@ -408,9 +411,12 @@ pub fn panel_suspend(win: &WebviewWindow) {
         if let Ok(c3) = core.cast::<ICoreWebView2_3>() {
             let handler = webview2_com::TrySuspendCompletedHandler::create(Box::new(move |_err, ok| {
                 log::debug!("panel webview suspended: {ok}");
-                if pid != 0 {
-                    std::thread::spawn(move || {
-                        std::thread::sleep(Duration::from_millis(800));
+                if pid != 0 && ok && PANEL_GEN.load(Ordering::SeqCst) == gen {
+                    crate::timers::after(Duration::from_millis(800), move || {
+                        if PANEL_GEN.load(Ordering::SeqCst) != gen || REVEALED.load(Ordering::SeqCst) {
+                            log::debug!("panel reopened before the trim; skipped");
+                            return;
+                        }
                         trim_process_tree(pid);
                     });
                 }
