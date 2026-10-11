@@ -138,7 +138,26 @@ impl Store {
             CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             "#,
         )?;
+        Self::migrate(&conn)?;
         Ok(Self { conn: Mutex::new(conn), path })
+    }
+
+    /// Schema migrations, tracked in `PRAGMA user_version`.
+    fn migrate(conn: &Connection) -> Result<()> {
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if v < 1 {
+            // v1: file messages are looked up by transfer id on every chunk / cancel / status
+            // request (`message_by_transfer`); that filtered the peer's whole history through
+            // json_extract. Partial expression index over file messages only.
+            conn.execute_batch(
+                "BEGIN;
+                 CREATE INDEX IF NOT EXISTS idx_messages_transfer
+                   ON messages(peer_id, json_extract(body,'$.transfer_id')) WHERE kind='file';
+                 PRAGMA user_version = 1;
+                 COMMIT;",
+            )?;
+        }
+        Ok(())
     }
 
     fn c(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -198,32 +217,17 @@ impl Store {
 
     pub fn devices(&self) -> Result<Vec<DeviceRow>> {
         let c = self.c();
-        let mut st = c.prepare(
-            "SELECT d.id,d.name,d.os,d.ver,d.last_addr,d.port,d.last_seen,d.blocked,
-                    COALESCE(c.unread,0),COALESCE(c.last_ts,0),COALESCE(c.last_preview,'')
-             FROM devices d LEFT JOIN conversations c ON c.peer_id=d.id
-             ORDER BY COALESCE(c.last_ts,0) DESC, d.name",
-        )?;
-        let rows = st.query_map([], |r| {
-            Ok(DeviceRow {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                os: r.get(2)?,
-                ver: r.get(3)?,
-                last_addr: r.get(4)?,
-                port: r.get::<_, i64>(5)? as u16,
-                last_seen: r.get(6)?,
-                blocked: r.get::<_, i64>(7)? != 0,
-                unread: r.get(8)?,
-                last_ts: r.get(9)?,
-                last_preview: r.get(10)?,
-            })
-        })?;
+        let mut st = c.prepare_cached(&format!("{DEVICE_SELECT} ORDER BY COALESCE(c.last_ts,0) DESC, d.name"))?;
+        let rows = st.query_map([], row_to_device)?;
         Ok(rows.flatten().collect())
     }
 
+    /// One device by primary key (used to read and join the whole table and filter in Rust; it
+    /// runs for every peer event, incoming message and unknown-peer check).
     pub fn device(&self, id: &str) -> Option<DeviceRow> {
-        self.devices().ok()?.into_iter().find(|d| d.id == id)
+        let c = self.c();
+        let mut st = c.prepare_cached(&format!("{DEVICE_SELECT} WHERE d.id=?1")).ok()?;
+        st.query_row([id], row_to_device).optional().ok().flatten()
     }
 
     pub fn forget_device(&self, id: &str) -> Result<()> {
@@ -303,7 +307,7 @@ impl Store {
             .c()
             .query_row(
                 "SELECT id,peer_id,outgoing,kind,body,status,ts FROM messages
-                 WHERE peer_id=?1 AND kind='file' AND json_extract(body,'$.transfer_id')=?2",
+                 WHERE peer_id=?1 AND json_extract(body,'$.transfer_id')=?2 AND kind='file'",
                 [peer_id, transfer_id],
                 row_to_msg,
             )
@@ -354,6 +358,26 @@ impl Store {
     }
 }
 
+const DEVICE_SELECT: &str = "SELECT d.id,d.name,d.os,d.ver,d.last_addr,d.port,d.last_seen,d.blocked,
+        COALESCE(c.unread,0),COALESCE(c.last_ts,0),COALESCE(c.last_preview,'')
+     FROM devices d LEFT JOIN conversations c ON c.peer_id=d.id";
+
+fn row_to_device(r: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRow> {
+    Ok(DeviceRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        os: r.get(2)?,
+        ver: r.get(3)?,
+        last_addr: r.get(4)?,
+        port: r.get::<_, i64>(5)? as u16,
+        last_seen: r.get(6)?,
+        blocked: r.get::<_, i64>(7)? != 0,
+        unread: r.get(8)?,
+        last_ts: r.get(9)?,
+        last_preview: r.get(10)?,
+    })
+}
+
 fn row_to_msg(r: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
     let body: String = r.get(4)?;
     Ok(Message {
@@ -379,6 +403,21 @@ pub fn preview(m: &Message) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_lookups() {
+        let s = Store::open_in_memory().unwrap();
+        let c = s.c();
+        assert_eq!(c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        let plan = |sql: &str| -> String {
+            let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            st.query_map([], |r| r.get::<_, String>(3)).unwrap().flatten().collect::<Vec<_>>().join(" | ")
+        };
+        let p = plan("SELECT id FROM messages WHERE peer_id='p' AND json_extract(body,'$.transfer_id')='t' AND kind='file'");
+        assert!(p.contains("idx_messages_transfer"), "{p}");
+        let p = plan(&format!("{DEVICE_SELECT} WHERE d.id='x'"));
+        assert!(p.contains("PRIMARY KEY") || p.contains("autoindex"), "{p}");
+    }
 
     fn dev(id: &str) -> DeviceInfo {
         DeviceInfo { id: id.into(), name: format!("dev-{id}"), os: "linux".into(), ver: "0.1.0".into(), port: 47820 }
