@@ -29,6 +29,10 @@ use crate::store::FileBody;
 
 type St = State<Arc<Node>>;
 
+/// Chunk uploads buffered and written at once, over all senders (each body is up to 4 MiB and is
+/// read into memory): bounds the receiver's memory however many devices send at the same time.
+pub(crate) const MAX_INCOMING_CHUNKS: usize = 16;
+
 pub(crate) fn router(node: Arc<Node>) -> Router {
     Router::new()
         .route("/info", get(info))
@@ -155,8 +159,11 @@ async fn file_status(State(node): St, Path(tid): Path<String>) -> Result<Json<Tr
     Ok(Json(TransferStatus { have: t.have(), complete: t.is_complete() }))
 }
 
-async fn file_chunk(State(node): St, Path((tid, chunk)): Path<(String, u64)>, h: HeaderMap, body: Bytes) -> Result<StatusCode, (StatusCode, String)> {
+async fn file_chunk(State(node): St, Path((tid, chunk)): Path<(String, u64)>, h: HeaderMap, body: axum::body::Body) -> Result<StatusCode, (StatusCode, String)> {
     let from = sender(&h)?;
+    // take a slot before reading the body, so waiting uploads are not held in memory
+    let _slot = node.chunk_slots.acquire().await.map_err(err500)?;
+    let body = axum::body::to_bytes(body, (CHUNK_SIZE as usize) * 2).await.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let Some(t) = node.incoming.lock().unwrap().get(&tid).cloned() else {
         if cancelled_here(&node, &from, &tid) {
             return Err((StatusCode::GONE, "cancelled".into()));

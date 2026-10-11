@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
-use futures_util::{stream, StreamExt};
+use futures_util::{stream, TryStreamExt};
 
 use crate::events::CoreEvent;
 use crate::files::{discard_partial, expand_paths, hash_file, read_at};
@@ -17,6 +17,10 @@ use crate::protocol::*;
 use crate::store::{FileBody, Message};
 
 pub const PARALLEL_CHUNKS: usize = 4;
+/// Outgoing transfers that move data at the same time; the rest wait (still pausable/cancellable).
+/// Bounds connections and memory: at most this × PARALLEL_CHUNKS chunks (4 MiB each) in flight,
+/// however many files a folder drop queued.
+pub const MAX_ACTIVE_TRANSFERS: usize = 3;
 
 const RUN: u8 = 0;
 const PAUSE: u8 = 1;
@@ -138,7 +142,11 @@ impl Node {
             ctls.insert(msg_id.clone(), ctl.clone());
         }
         let res = tokio::select! {
-            r = self.transfer_inner(&msg_id) => r,
+            r = async {
+                // queued behind MAX_ACTIVE_TRANSFERS others; a pause/cancel meanwhile still lands
+                let _slot = self.transfer_slots.acquire().await.map_err(|_| anyhow!("shutting down"))?;
+                self.transfer_inner(&msg_id).await
+            } => r,
             _ = ctl.stopped() => Err(anyhow!("stopped")),
         };
         self.out_ctl.lock().unwrap().remove(&msg_id);
@@ -322,8 +330,11 @@ impl Node {
             self.emit(CoreEvent::Progress { msg_id: m.id.clone(), peer_id: m.peer_id.clone(), done: done_bytes.load(Ordering::Relaxed), total: size, outgoing: true });
 
             let file = Arc::new(File::open(&path)?);
-            let results: Vec<Result<()>> = stream::iter(missing)
-                .map(|idx| {
+            // try_for_each_concurrent: the first chunk that fails for good ends the transfer at
+            // once and drops (aborts) the requests still in flight, instead of pushing every
+            // remaining chunk (each with 3 tries and a 60 s timeout) before reporting the error.
+            stream::iter(missing.into_iter().map(Ok::<u64, anyhow::Error>))
+                .try_for_each_concurrent(PARALLEL_CHUNKS, |idx| {
                     let node = self.clone();
                     let file = file.clone();
                     let base = base.clone();
@@ -372,12 +383,7 @@ impl Node {
                         Ok(())
                     }
                 })
-                .buffer_unordered(PARALLEL_CHUNKS)
-                .collect()
-                .await;
-            if let Some(Err(e)) = results.into_iter().find(|r| r.is_err()) {
-                return Err(e);
-            }
+                .await?;
 
             let r = self
                 .http

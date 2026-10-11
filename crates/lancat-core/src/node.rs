@@ -107,6 +107,10 @@ pub struct Node {
     pub(crate) active_out: Mutex<HashSet<String>>,
     /// Pause / cancel switches of the outgoing transfers that are running right now.
     pub(crate) out_ctl: Mutex<HashMap<String, Arc<crate::transfer::TransferCtl>>>,
+    /// Outgoing transfers allowed to move data at once (see transfer::MAX_ACTIVE_TRANSFERS).
+    pub(crate) transfer_slots: tokio::sync::Semaphore,
+    /// Incoming chunk bodies buffered / written at once (see server::file_chunk).
+    pub(crate) chunk_slots: tokio::sync::Semaphore,
     pub(crate) http: reqwest::Client,
     pub(crate) conn_seq: AtomicU64,
     pub(crate) mdns: Mutex<Option<crate::discovery::Mdns>>,
@@ -166,6 +170,8 @@ impl Node {
             incoming: Mutex::new(HashMap::new()),
             active_out: Mutex::new(HashSet::new()),
             out_ctl: Mutex::new(HashMap::new()),
+            transfer_slots: tokio::sync::Semaphore::new(crate::transfer::MAX_ACTIVE_TRANSFERS),
+            chunk_slots: tokio::sync::Semaphore::new(crate::server::MAX_INCOMING_CHUNKS),
             http,
             conn_seq: AtomicU64::new(1),
             mdns: Mutex::new(None),
