@@ -140,14 +140,19 @@ impl slint::platform::Platform for Win32Platform {
             let wins: Vec<Rc<Win32Window>> = WINDOWS.with(|w| w.borrow().iter().filter_map(|(_, w)| w.upgrade()).collect());
             for w in &wins {
                 if w.needs_redraw.get() {
-                    unsafe {
-                        let _ = InvalidateRect(Some(w.hwnd.get()), None, false);
+                    // 先渲染（ReusedBuffer 只重画脏区），再只让脏区失效：WM_PAINT 只拷贝这一块，
+                    // 不再每帧整窗 SetDIBitsToDevice（无设备时的雷达动画从 ~40% 单核降下来）
+                    if let Some(r) = w.render() {
+                        let full = std::env::var("LANCAT_FULL_BLIT").as_deref() == Ok("1");
+                        unsafe {
+                            let _ = InvalidateRect(Some(w.hwnd.get()), if full { None } else { Some(&r) }, false);
+                        }
                     }
                 }
             }
             let wait = slint::platform::duration_until_next_timer_update();
             let anim = wins.iter().any(|w| w.window.has_active_animations());
-            let ms = if anim { 8 } else { wait.map(|d| d.as_millis().min(u32::MAX as u128 - 1) as u32).unwrap_or(INFINITE) };
+            let ms = if anim { 16 } else { wait.map(|d| d.as_millis().min(u32::MAX as u128 - 1) as u32).unwrap_or(INFINITE) };
             unsafe {
                 MsgWaitForMultipleObjectsEx(None, ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
                 let mut msg = MSG::default();
@@ -268,40 +273,77 @@ impl Win32Window {
         LogicalPosition::new(x / s, y / s)
     }
 
-    fn paint(&self) {
-        let h = self.hwnd.get();
+    /// 渲染到缓冲（只重画脏区），返回要拷贝到窗口的矩形；没有变化返回 None。
+    fn render(&self) -> Option<RECT> {
         let size = self.size.get();
         let (w, hgt) = (size.width as usize, size.height as usize);
+        if w == 0 || hgt == 0 {
+            return None;
+        }
         let mut buf = self.buf.borrow_mut();
+        let mut full = false;
         if buf.len() != w * hgt {
             buf.clear();
             buf.resize(w * hgt, Bgra::default());
             self.renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
             self.renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
+            full = true;
         }
         self.needs_redraw.set(false);
         let t = std::time::Instant::now();
-        self.renderer.render(&mut buf, w);
+        let region = self.renderer.render(&mut buf, w);
+        if !self.first_paint_logged.replace(true) {
+            log::info!("first frame {}x{} rendered in {} ms ({} ms after start)", w, hgt, t.elapsed().as_millis(), crate::t0().elapsed().as_millis());
+        }
+        if full {
+            return Some(RECT { left: 0, top: 0, right: w as i32, bottom: hgt as i32 });
+        }
+        let o = region.bounding_box_origin();
+        let sz = region.bounding_box_size();
+        if sz.width == 0 || sz.height == 0 {
+            return None;
+        }
+        Some(RECT { left: o.x.max(0), top: o.y.max(0), right: (o.x + sz.width as i32).min(w as i32), bottom: (o.y + sz.height as i32).min(hgt as i32) })
+    }
+
+    fn paint(&self) {
+        let h = self.hwnd.get();
+        // 在 WM_PAINT 里才发现有新变化（两次循环之间又改了东西）：先渲染，拷完本次失效区后
+        // 再把这次的脏区单独失效，否则落在 rcPaint 外的那部分新内容就永远不会被拷到窗口上。
+        let late = if self.needs_redraw.get() { self.render() } else { None };
+        let size = self.size.get();
+        let (w, hgt) = (size.width as usize, size.height as usize);
+        let buf = self.buf.borrow();
         unsafe {
             let mut ps = PAINTSTRUCT::default();
             let dc = BeginPaint(h, &mut ps);
-            let bi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: w as i32,
-                    biHeight: -(hgt as i32),
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            SetDIBitsToDevice(dc, 0, 0, w as u32, hgt as u32, 0, 0, 0, hgt as u32, buf.as_ptr() as *const _, &bi, DIB_RGB_COLORS);
+            if buf.len() == w * hgt && w > 0 {
+                // 只拷贝失效区：取覆盖它的整行作为一张小的 top-down DIB（源 y 恒为 0，避开 top-down 的 ySrc 歧义）
+                let r = ps.rcPaint;
+                let (x0, y0) = (r.left.max(0), r.top.max(0));
+                let (x1, y1) = (r.right.min(w as i32), r.bottom.min(hgt as i32));
+                if x1 > x0 && y1 > y0 {
+                    let rows = (y1 - y0) as u32;
+                    let bi = BITMAPINFO {
+                        bmiHeader: BITMAPINFOHEADER {
+                            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                            biWidth: w as i32,
+                            biHeight: -(rows as i32),
+                            biPlanes: 1,
+                            biBitCount: 32,
+                            biCompression: BI_RGB.0,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    let p = buf[y0 as usize * w..].as_ptr();
+                    SetDIBitsToDevice(dc, x0, y0, (x1 - x0) as u32, rows, x0, 0, 0, rows, p as *const _, &bi, DIB_RGB_COLORS);
+                }
+            }
             let _ = EndPaint(h, &ps);
-        }
-        if !self.first_paint_logged.replace(true) {
-            log::info!("first frame {}x{} rendered in {} ms ({} ms after start)", w, hgt, t.elapsed().as_millis(), crate::t0().elapsed().as_millis());
+            if let Some(r) = late {
+                let _ = InvalidateRect(Some(h), Some(&r), false);
+            }
         }
     }
 

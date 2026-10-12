@@ -1549,8 +1549,13 @@ fn run_script(parts: &[String]) {
                 }
             }
             "menu" => {
+                // 脚本在 with_app 里跑：不能 invoke_peer_menu（回调里再 with_app 会借用失败，菜单不出），直接设属性
                 if let (Some(id), Some(ui)) = (id, app.ui()) {
-                    ui.invoke_peer_menu(id.into(), 30.0, 140.0);
+                    let blocked = app.peers.iter().find(|p| p.id == id.as_str()).is_some_and(|p| p.blocked);
+                    ui.set_menu_x(30.0);
+                    ui.set_menu_y(140.0);
+                    ui.set_menu_blocked(blocked);
+                    ui.set_menu_peer(id.into());
                 }
             }
             "attach-menu" => {

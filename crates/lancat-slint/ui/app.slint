@@ -784,6 +784,11 @@ export component PanelWindow inherits Window {
                     }
                     side := Flickable {
                         vertical-stretch: 1;
+                        // 同 list：Flickable 默认把内容高度当成自己的 max-height，设备少时整个 body 被压到
+                        // 侧栏内容那么高（输入栏浮在面板中间、下方一大片空白）
+                        min-height: 0px;
+                        preferred-height: 0px;
+                        max-height: 100000px;
                         content-height: col.preferred-height;
                         col := VerticalLayout {
                             for p in root.peers: SidebarItem {
