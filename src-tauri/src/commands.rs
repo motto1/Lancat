@@ -106,6 +106,7 @@ pub fn delete_message(core: State<'_, Core>, id: String) -> R<()> {
 }
 
 /// The left button went down on the panel header: drag to move the dock.
+#[cfg(desktop)]
 #[tauri::command]
 pub fn dock_move_start(app: AppHandle) {
     crate::dock::begin_move(&app, false);
@@ -119,7 +120,10 @@ pub fn get_settings(core: State<'_, Core>) -> Settings {
 #[tauri::command]
 pub fn set_settings(app: AppHandle, core: State<'_, Core>, settings: Settings) -> R<Settings> {
     let s = core.0.set_settings(settings).map_err(e)?;
+    #[cfg(desktop)]
     crate::dock::apply_layout(&app);
+    #[cfg(mobile)]
+    let _ = app;
     // the native material's tint follows the theme setting
     #[cfg(windows)]
     if let Some(p) = tauri::Manager::get_webview_window(&app, "panel") {
@@ -160,7 +164,10 @@ pub fn reveal_file(path: String) -> R<()> {
     if !p.exists() {
         return Err("文件不存在".into());
     }
-    tauri_plugin_opener::reveal_item_in_dir(p).map_err(e)
+    #[cfg(desktop)]
+    return tauri_plugin_opener::reveal_item_in_dir(p).map_err(e);
+    #[cfg(mobile)]
+    return Err(format!("已保存到 {}", p.parent().map(|d| d.display().to_string()).unwrap_or_default()));
 }
 
 // ------------------------------------------------------------------ stickers (.tgs / Lottie)

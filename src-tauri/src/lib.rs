@@ -1,23 +1,43 @@
 //! Lancat desktop shell: starts the Rust core, exposes IPC commands, forwards core events.
 
 mod commands;
+#[cfg(desktop)]
 mod diag;
+#[cfg(desktop)]
 mod dock;
+#[cfg(mobile)]
+mod mobile;
+#[cfg(desktop)]
 mod native_dock;
+#[cfg(desktop)]
 mod platform;
+#[cfg(desktop)]
 mod timers;
+#[cfg(desktop)]
 mod tray;
 
+#[cfg(desktop)]
 use std::sync::Arc;
 
+#[cfg(desktop)]
 use lancat_core::{Node, NodeConfig};
+#[cfg(desktop)]
 use tauri::{Emitter, Manager};
 
+#[cfg(desktop)]
 use commands::Core;
 
 pub const EVENT: &str = "lancat://event";
 
+/// Android / iOS entry point (called from the Kotlin activity through JNI).
+#[cfg(mobile)]
+#[tauri::mobile_entry_point]
+pub fn run() {
+    mobile::run()
+}
+
 /// Starts the core; also returns the TCP port it was configured for (diagnostics: taken?).
+#[cfg(desktop)]
 fn start_core(app: &tauri::App) -> anyhow::Result<(Arc<Node>, u16)> {
     let data_dir = app.path().app_data_dir()?;
     let cfg = NodeConfig::new(data_dir).with_env();
@@ -37,12 +57,14 @@ fn start_core(app: &tauri::App) -> anyhow::Result<(Arc<Node>, u16)> {
     Ok((node, wanted))
 }
 
+#[cfg(desktop)]
 #[tauri::command]
 fn autostart_enabled(app: tauri::AppHandle) -> bool {
     use tauri_plugin_autostart::ManagerExt;
     app.autolaunch().is_enabled().unwrap_or(false)
 }
 
+#[cfg(desktop)]
 #[tauri::command]
 fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
@@ -57,7 +79,7 @@ fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
 /// Works with or without the single-instance lock (LANCAT_DATA_DIR disables it).
 /// Not SIGUSR1/SIGUSR2: JavaScriptCore uses SIGUSR2 to suspend threads for GC (JSC_SIGNAL_FOR_GC)
 /// and replacing that handler crashes the process.
-#[cfg(unix)]
+#[cfg(all(unix, desktop))]
 fn spawn_signal_control(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         use tokio::signal::unix::{signal, SignalKind};
@@ -91,6 +113,7 @@ fn spawn_signal_control(app: tauri::AppHandle) {
     });
 }
 
+#[cfg(desktop)]
 pub fn run() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,tao=warn,wry=warn")).try_init();
     // graphics env defaults must be in place before GTK/EGL/WebKit start (Linux)

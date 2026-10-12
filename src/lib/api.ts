@@ -200,6 +200,9 @@ export const api = {
   importSticker: (name: string, lottie: string) => invoke<StickerMeta>("import_sticker", { name, lottie }),
   sticker: (id: string) => invoke<string>("get_sticker", { id }),
   deleteSticker: (id: string) => invoke<void>("delete_sticker", { id }),
+  // Android only
+  pickFiles: () => invoke<string[]>("pick_files"),
+  takeShared: () => invoke<string[]>("take_shared"),
   // window / dock
   openPanel: (reason: string) => invoke<void>("cmd_open_panel", { reason }),
   hidePanel: () => invoke<void>("cmd_hide_panel"),

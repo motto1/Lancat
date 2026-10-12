@@ -4,6 +4,7 @@
   import { app } from "../lib/state.svelte";
   import { ui } from "../lib/ui.svelte";
   import Icon from "./Icon.svelte";
+  import { isAndroid } from "../lib/platform";
   import EmojiPanel from "./EmojiPanel.svelte";
 
   let text = $state("");
@@ -100,7 +101,8 @@
     if (disabled) return;
     ui.dialogOpen = true; // native dialog: do not collapse underneath it
     try {
-      const sel = await openDialog({ multiple: true, directory, title: directory ? "选择要发送的文件夹" : "选择要发送的文件" });
+      // Android: the system picker hands out content URIs; the native side copies them to paths
+      const sel = isAndroid ? await api.pickFiles() : await openDialog({ multiple: true, directory, title: directory ? "选择要发送的文件夹" : "选择要发送的文件" });
       const paths = sel == null ? [] : Array.isArray(sel) ? sel : [sel];
       if (paths.length) {
         await api.sendFiles(targets, paths as string[]);

@@ -3,6 +3,7 @@
   "identifier": "default",
   "description": "Lancat windows",
   "windows": ["panel", "settings"],
+  "platforms": ["linux", "macOS", "windows"],
   "permissions": [
     "core:default",
     "core:window:allow-show",

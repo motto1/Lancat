@@ -1,0 +1,6 @@
+{
+  "identifier": "app.lancat",
+  "bundle": {
+    "android": { "minSdkVersion": 26 }
+  }
+}
