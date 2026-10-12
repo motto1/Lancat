@@ -144,9 +144,31 @@ async fn file_chunk(State(node): St, Path((tid, chunk)): Path<(String, u64)>, h:
     let from = sender(&h)?;
     // take a slot before reading the body, so waiting uploads are not held in memory
     let _slot = node.chunk_slots.acquire().await.map_err(err500)?;
-    let body = axum::body::to_bytes(body, (CHUNK_SIZE as usize) * 2).await.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    // read it in frames as they arrive, so the progress moves within the chunk (progress.rs)
+    let meter = node.meter_get(&tid);
+    let confirmed = || node.incoming.lock().unwrap().get(&tid).map(|t| t.received_bytes()).unwrap_or(0);
+    let max = (CHUNK_SIZE as usize) * 2;
+    let mut buf: Vec<u8> = Vec::with_capacity(CHUNK_SIZE as usize);
+    let mut frames = body.into_data_stream();
+    while let Some(f) = futures_util::StreamExt::next(&mut frames).await {
+        let f = match f {
+            Ok(f) if buf.len() + f.len() <= max => f,
+            r => {
+                if let Some(mt) = &meter {
+                    mt.add(-(buf.len() as i64));
+                }
+                return Err((StatusCode::BAD_REQUEST, r.err().map(|e| e.to_string()).unwrap_or_else(|| "chunk too large".into())));
+            }
+        };
+        buf.extend_from_slice(&f);
+        if let Some(mt) = &meter {
+            mt.add(f.len() as i64);
+            mt.emit_with(&node, false, confirmed);
+        }
+    }
     let hash = h.get(HEADER_CHUNK_HASH).and_then(|v| v.to_str().ok()).map(String::from);
-    node.incoming_chunk(&from, &tid, chunk, body.to_vec(), hash).await?;
+    let streamed = if meter.is_some() { buf.len() as u64 } else { 0 };
+    node.incoming_chunk(&from, &tid, chunk, buf, hash, streamed).await?;
     Ok(StatusCode::OK)
 }
 
@@ -187,6 +209,7 @@ impl Node {
                 t
             }
         };
+        self.meter(&tid, &m.msg_id, from, m.size, false);
         // make sure the conversation shows the file even if the offer never arrived
         let body = FileBody { name: m.name.clone(), size: m.size, transfer_id: tid.clone(), hash: m.hash.clone(), ..Default::default() };
         if !self.store_incoming(from, &m.msg_id, "file", serde_json::to_value(&body).unwrap_or_default(), "receiving", m.ts) {
@@ -201,7 +224,18 @@ impl Node {
         Ok(TransferStatus { have: t.have(), complete: t.is_complete() })
     }
 
-    pub(crate) async fn incoming_chunk(&self, from: &str, tid: &str, chunk: u64, body: Vec<u8>, hash: Option<String>) -> Result<(), (StatusCode, String)> {
+    /// `streamed`: bytes of this chunk already counted as in flight on the transfer's meter.
+    pub(crate) async fn incoming_chunk(&self, from: &str, tid: &str, chunk: u64, body: Vec<u8>, hash: Option<String>, streamed: u64) -> Result<(), (StatusCode, String)> {
+        // written or not, these bytes stop being "in flight" (on success they are confirmed)
+        struct Settle(Option<Arc<crate::progress::Meter>>, u64);
+        impl Drop for Settle {
+            fn drop(&mut self) {
+                if let Some(m) = &self.0 {
+                    m.add(-(self.1 as i64));
+                }
+            }
+        }
+        let settle = Settle(self.meter_get(tid), streamed);
         let Some(t) = self.incoming.lock().unwrap().get(tid).cloned() else {
             if cancelled_here(self, from, tid) {
                 return Err((StatusCode::GONE, "cancelled".into()));
@@ -220,17 +254,23 @@ impl Node {
             return Err((StatusCode::UNPROCESSABLE_ENTITY, e.to_string()));
         }
         self.touch_peer(from);
-        self.emit(CoreEvent::Progress {
-            msg_id: t.manifest.msg_id.clone(),
-            peer_id: from.to_string(),
-            done: t.received_bytes(),
-            total: t.manifest.size,
-            outgoing: false,
-        });
+        let meter = settle.0.clone();
+        drop(settle);
+        match meter {
+            Some(mt) => mt.emit(self, t.received_bytes(), true),
+            None => self.emit(CoreEvent::Progress {
+                msg_id: t.manifest.msg_id.clone(),
+                peer_id: from.to_string(),
+                done: t.received_bytes(),
+                total: t.manifest.size,
+                outgoing: false,
+            }),
+        }
         Ok(())
     }
 
     pub(crate) async fn incoming_finish(&self, from: &str, tid: &str) -> Result<(), (StatusCode, String)> {
+        self.meter_drop(tid);
         let t = self.incoming.lock().unwrap().get(tid).cloned().ok_or((StatusCode::NOT_FOUND, "unknown transfer".to_string()))?;
         if t.manifest.from != from {
             return Err((StatusCode::FORBIDDEN, "not your transfer".into()));

@@ -16,6 +16,7 @@ pub mod files;
 mod link;
 pub mod netutil;
 pub mod node;
+mod progress;
 pub mod protocol;
 pub mod server;
 pub mod store;

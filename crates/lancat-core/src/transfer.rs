@@ -335,7 +335,8 @@ impl Node {
             let total_chunks = manifest.chunk_count();
             let missing: Vec<u64> = (0..total_chunks).filter(|i| !have.contains(i)).collect();
             let done_bytes = Arc::new(AtomicU64::new(have.iter().map(|&i| chunk_len(size, i)).sum()));
-            self.emit(CoreEvent::Progress { msg_id: m.id.clone(), peer_id: m.peer_id.clone(), done: done_bytes.load(Ordering::Relaxed), total: size, outgoing: true });
+            let meter = self.meter(&manifest.transfer_id, &m.id, &m.peer_id, size, true);
+            meter.emit(self, done_bytes.load(Ordering::Relaxed), true);
 
             let file = Arc::new(File::open(&path)?);
             // try_for_each_concurrent: the first chunk that fails for good ends the transfer at
@@ -350,6 +351,7 @@ impl Node {
                     let tid = manifest.transfer_id.clone();
                     let done_bytes = done_bytes.clone();
                     let msg = m.clone();
+                    let meter = meter.clone();
                     async move {
                         let len = chunk_len(size, idx) as usize;
                         let data = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
@@ -362,15 +364,20 @@ impl Node {
                         let data = axum::body::Bytes::from(data);
                         let mut last_err = None;
                         for _ in 0..3 {
+                            let sent = Arc::new(AtomicU64::new(0));
+                            let body = crate::progress::counting_body(data.clone(), meter.clone(), node.clone(), done_bytes.clone(), sent.clone());
                             let r = node
                                 .http
                                 .put(format!("{base}/files/{tid}/{idx}"))
                                 .header(HEADER_DEVICE_ID, &me)
                                 .header(HEADER_CHUNK_HASH, &hash)
-                                .body(data.clone())
+                                .header(reqwest::header::CONTENT_LENGTH, len)
+                                .body(body)
                                 .timeout(Duration::from_secs(60))
                                 .send()
                                 .await;
+                            // confirmed below on success; a failed attempt takes its bytes back
+                            meter.add(-(sent.swap(0, Ordering::Relaxed) as i64));
                             match r {
                                 Ok(r) if r.status().is_success() => {
                                     last_err = None;
@@ -392,7 +399,7 @@ impl Node {
                         }
                         let done = done_bytes.fetch_add(len as u64, Ordering::Relaxed) + len as u64;
                         node.touch_peer(&msg.peer_id);
-                        node.emit(CoreEvent::Progress { msg_id: msg.id.clone(), peer_id: msg.peer_id.clone(), done, total: size, outgoing: true });
+                        meter.emit(&node, done, true);
                         Ok(())
                     }
                 })
@@ -406,6 +413,7 @@ impl Node {
                 .send()
                 .await?;
             if r.status().is_success() {
+                self.meter_drop(&manifest.transfer_id);
                 return Ok(());
             }
             if r.status() == reqwest::StatusCode::CONFLICT && attempt == 0 {
@@ -519,8 +527,9 @@ impl Node {
             };
             let have: std::collections::HashSet<u64> = have.into_iter().collect();
             let mut done: u64 = have.iter().map(|&i| chunk_len(size, i)).sum();
-            self.emit(CoreEvent::Progress { msg_id: m.id.clone(), peer_id: m.peer_id.clone(), done, total: size, outgoing: true });
             let data = self.links.lock().unwrap().get(&m.peer_id).map(|l| l.data.clone()).ok_or_else(lost)?;
+            let meter = self.meter(&tid, &m.id, &m.peer_id, size, true);
+            meter.emit(self, done, true);
             let file = Arc::new(File::open(path)?);
             let mut next = (0..manifest.chunk_count()).filter(|i| !have.contains(i));
             let mut inflight = std::collections::HashSet::new();
@@ -540,6 +549,8 @@ impl Node {
                         let mut frame = LinkPiece::encode_header(&tid, idx, len as u32, (k * LINK_PIECE) as u32, &hash, piece.len());
                         frame.extend_from_slice(piece);
                         data.send(frame).await.map_err(|_| lost())?;
+                        meter.add(piece.len() as i64);
+                        meter.emit(self, done, false);
                     }
                     inflight.insert(idx);
                 }
@@ -558,8 +569,9 @@ impl Node {
                         return Err(terr(ErrCode::from_peer(None, code.as_deref()), format!("chunk {chunk}: {e}")));
                     }
                     done += chunk_len(size, chunk);
+                    meter.add(-(chunk_len(size, chunk) as i64));
                     self.touch_peer(&m.peer_id);
-                    self.emit(CoreEvent::Progress { msg_id: m.id.clone(), peer_id: m.peer_id.clone(), done, total: size, outgoing: true });
+                    meter.emit(self, done, true);
                 }
             }
             if !self.send_over_link(&m.peer_id, &WsMsg::FileFinish { transfer_id: tid.clone() }) {

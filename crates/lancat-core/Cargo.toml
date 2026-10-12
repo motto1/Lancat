@@ -12,7 +12,7 @@ axum = { version = "0.8", features = ["ws"] }
 # same major as axum's ws support, so only one tungstenite is linked
 tokio-tungstenite = "0.29"
 futures-util = { version = "0.3", features = ["sink"] }
-reqwest = { version = "0.13", default-features = false }
+reqwest = { version = "0.13", default-features = false, features = ["stream"] }
 mdns-sd = "0.21"
 socket2 = { version = "0.6", features = ["all"] }
 if-addrs = "0.15"

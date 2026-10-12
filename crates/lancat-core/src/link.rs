@@ -303,12 +303,14 @@ pub(crate) struct Assembly {
     have: Vec<bool>,
     missing: usize,
     hash: [u8; 32],
+    /// Bytes of new pieces counted on the transfer's meter.
+    counted: u64,
 }
 
 impl Assembly {
     fn new(len: usize, hash: [u8; 32]) -> Self {
         let n = len.div_ceil(LINK_PIECE).max(1);
-        Assembly { buf: vec![0u8; len], have: vec![false; n], missing: n, hash }
+        Assembly { buf: vec![0u8; len], have: vec![false; n], missing: n, hash, counted: 0 }
     }
 }
 
@@ -376,9 +378,13 @@ impl Node {
             }
             asm.insert(key.clone(), Assembly::new(len, p.hash));
         }
+        let meter = self.meter_get(&p.transfer_id);
         let a = asm.get_mut(&key).unwrap();
         if a.buf.len() != len || a.hash != p.hash {
             // the file changed under this chunk: start it over
+            if let Some(mt) = &meter {
+                mt.add(-(a.counted as i64));
+            }
             *a = Assembly::new(len, p.hash);
         }
         let k = off / LINK_PIECE;
@@ -386,16 +392,23 @@ impl Node {
         if !a.have[k] {
             a.have[k] = true;
             a.missing -= 1;
+            if let Some(mt) = &meter {
+                a.counted += p.data.len() as u64;
+                mt.add(p.data.len() as i64);
+                let tid = &p.transfer_id;
+                mt.emit_with(self, false, || self.incoming.lock().unwrap().get(tid).map(|t| t.received_bytes()).unwrap_or(0));
+            }
         }
         if a.missing > 0 {
             return;
         }
         let a = asm.remove(&key).unwrap();
+        let counted = a.counted;
         let (node, from, out) = (self.clone(), peer_id.to_string(), out.clone());
         let (tid, chunk) = key;
         let hash = a.hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
         tokio::spawn(async move {
-            let r = node.incoming_chunk(&from, &tid, chunk, a.buf, Some(hash)).await;
+            let r = node.incoming_chunk(&from, &tid, chunk, a.buf, Some(hash), counted).await;
             let reply = match r {
                 Ok(()) => WsMsg::FileChunkAck { transfer_id: tid, chunk, error: None, gone: false, code: None },
                 Err((code, e)) => WsMsg::FileChunkAck {

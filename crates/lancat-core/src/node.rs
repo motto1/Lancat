@@ -165,6 +165,8 @@ pub struct Node {
     pub(crate) transfer_slots: tokio::sync::Semaphore,
     /// Incoming chunk bodies buffered / written at once (see server::file_chunk).
     pub(crate) chunk_slots: tokio::sync::Semaphore,
+    /// Live byte progress per transfer id (progress.rs).
+    pub(crate) meters: Mutex<HashMap<String, Arc<crate::progress::Meter>>>,
     pub(crate) http: reqwest::Client,
     pub(crate) conn_seq: AtomicU64,
     pub(crate) mdns: Mutex<Option<crate::discovery::Mdns>>,
@@ -242,6 +244,7 @@ impl Node {
             recv_alert_at: Mutex::new(None),
             transfer_slots: tokio::sync::Semaphore::new(crate::transfer::MAX_ACTIVE_TRANSFERS),
             chunk_slots: tokio::sync::Semaphore::new(crate::server::MAX_INCOMING_CHUNKS),
+            meters: Mutex::new(HashMap::new()),
             http,
             conn_seq: AtomicU64::new(1),
             mdns: Mutex::new(None),
