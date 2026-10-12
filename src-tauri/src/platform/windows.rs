@@ -539,6 +539,7 @@ pub fn init_app(_app: &mut tauri::App) {}
 
 pub fn tune_webview(_win: &WebviewWindow) {}
 
+#[allow(dead_code)] // 只有 Linux 的 dock.rs（wayland_tick）用到；Windows 上恒为 false
 pub fn use_layer_shell() -> bool {
     false
 }
