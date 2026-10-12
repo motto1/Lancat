@@ -109,6 +109,17 @@ impl Win32Platform {
 
 thread_local! {
     static WINDOWS: RefCell<Vec<(isize, Weak<Win32Window>)>> = const { RefCell::new(Vec::new()) };
+    /// 面板窗口（第一个创建的窗口）。
+    static PANEL: RefCell<Weak<Win32Window>> = const { RefCell::new(Weak::new()) };
+}
+
+/// 停靠模式（默认开）：面板由 crate::dock 显示/收起；`LANCAT_SLINT_NODOCK=1` 退回阶段 2 的独立窗口。
+pub fn dock_mode() -> bool {
+    env("LANCAT_SLINT_NODOCK").as_deref() != Some("1")
+}
+
+fn panel() -> Option<Rc<Win32Window>> {
+    PANEL.with(|p| p.borrow().upgrade())
 }
 
 fn window_for(h: HWND) -> Option<Rc<Win32Window>> {
@@ -222,6 +233,11 @@ impl Win32Window {
             let h = CreateWindowExW(ex, CLASS, w!("Lancat"), WS_POPUP, 0, 0, 360, 520, None, None, Some(inst), None).map_err(|e| e.to_string())?;
             rc.hwnd.set(h);
             WINDOWS.with(|w| w.borrow_mut().push((h.0 as isize, Rc::downgrade(&rc))));
+            PANEL.with(|p| {
+                if p.borrow().upgrade().is_none() {
+                    *p.borrow_mut() = Rc::downgrade(&rc);
+                }
+            });
             let _ = SetLayeredWindowAttributes(h, COLORREF(0), 0, LWA_ALPHA);
             let scale = GetDpiForWindow(h) as f32 / 96.0;
             rc.scale.set(scale);
@@ -323,7 +339,15 @@ impl WindowAdapter for Win32Window {
     fn set_visible(&self, visible: bool) -> Result<(), slint::PlatformError> {
         self.visible.set(visible);
         let h = self.hwnd.get();
-        if visible {
+        if visible && dock_mode() {
+            // 停放：已映射、alpha 0、点击穿透；dock::open_panel 时再定位并淡入
+            set_layered(h, true);
+            set_alpha(h, 0, self);
+            unsafe {
+                let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+            }
+            self.needs_redraw.set(true);
+        } else if visible {
             place_default(self);
             unsafe {
                 // never take the foreground (a full-screen game may be in front)
@@ -693,7 +717,7 @@ pub fn accent_color() -> Option<slint::Color> {
 
 // ---------- fade / park ----------
 
-fn fade_ms(opening: bool) -> u64 {
+pub fn fade_ms(opening: bool) -> u64 {
     env("LANCAT_WIN_FADE_MS").and_then(|v| v.parse().ok()).unwrap_or(if opening { 120 } else { 140 })
 }
 
@@ -750,9 +774,84 @@ fn fade_to(wnd: &Win32Window, to: u8, ms: u64) {
 
 /// Esc / collapse: fade out and park (stays mapped, click-through, alpha 0).
 pub fn request_hide() {
+    if dock_mode() {
+        crate::dock::hide_panel();
+        return;
+    }
     let wins: Vec<Rc<Win32Window>> = WINDOWS.with(|w| w.borrow().iter().filter_map(|(_, w)| w.upgrade()).collect());
     for w in wins {
         fade_to(&w, 0, fade_ms(false));
     }
 }
 
+
+// ---------- dock API（crate::dock 调用，UI 线程） ----------
+
+pub fn panel_hwnd() -> Option<HWND> {
+    panel().map(|w| w.hwnd.get())
+}
+
+pub fn panel_scale() -> Option<f32> {
+    panel().map(|w| w.scale.get())
+}
+
+pub fn panel_place(r: crate::dock::Rect) {
+    if let Some(w) = panel() {
+        unsafe {
+            let _ = SetWindowPos(w.hwnd.get(), Some(HWND_TOPMOST), r.x.round() as i32, r.y.round() as i32, r.w.round() as i32, r.h.round() as i32, SWP_NOACTIVATE);
+        }
+    }
+}
+
+/// 定位到停靠条旁并淡入（不激活：悬停打开时前台仍是用户原来的窗口）。
+pub fn panel_show(r: crate::dock::Rect) {
+    let Some(w) = panel() else { return };
+    panel_place(r);
+    w.needs_redraw.set(true);
+    unsafe {
+        let _ = ShowWindow(w.hwnd.get(), SW_SHOWNOACTIVATE);
+    }
+    fade_to(&w, 255, fade_ms(true));
+}
+
+/// 淡出并停放。面板拿着前台时把前台交还给打开前的窗口（`prev`），否则交给 Z 序里下一个可见窗口。
+pub fn panel_hide(prev: Option<isize>) {
+    let Some(w) = panel() else { return };
+    let h = w.hwnd.get();
+    unsafe {
+        if GetForegroundWindow() == h {
+            let back = prev.map(|p| HWND(p as _)).filter(|p| IsWindow(Some(*p)).as_bool() && IsWindowVisible(*p).as_bool());
+            let next = back.or_else(|| {
+                let mut n = GetWindow(h, GW_HWNDNEXT).ok();
+                while let Some(c) = n {
+                    if IsWindowVisible(c).as_bool() && GetWindowLongPtrW(c, GWL_EXSTYLE) & WS_EX_TOOLWINDOW.0 as isize == 0 {
+                        return Some(c);
+                    }
+                    n = GetWindow(c, GW_HWNDNEXT).ok();
+                }
+                None
+            });
+            if let Some(n) = next {
+                let _ = SetForegroundWindow(n);
+            }
+        }
+    }
+    fade_to(&w, 0, fade_ms(false));
+}
+
+/// 主动打开（点 toast、托盘、第二次启动）：拿键盘焦点；返回之前的前台窗口。
+pub fn panel_focus() -> Option<isize> {
+    let w = panel()?;
+    let h = w.hwnd.get();
+    unsafe {
+        let prev = GetForegroundWindow();
+        if prev == h {
+            return None;
+        }
+        if !SetForegroundWindow(h).as_bool() {
+            log::debug!("SetForegroundWindow refused (foreground lock)");
+        }
+        let _ = SetFocus(Some(h));
+        (!prev.0.is_null()).then_some(prev.0 as isize)
+    }
+}

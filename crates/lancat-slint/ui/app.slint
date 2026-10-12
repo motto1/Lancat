@@ -224,6 +224,9 @@ export component PanelWindow inherits Window {
     in property <bool> refreshing;
     in property <string> toast;
     in-out property <string> draft;
+    /// 拖着文件进来时的提示（空 = 不在拖）
+    in property <string> drop-hint;
+    out property <bool> composer-focused: input.has-focus;
 
     callback select-peer(string);
     callback send-text(string);
@@ -231,6 +234,7 @@ export component PanelWindow inherits Window {
     callback refresh();
     callback open-settings();
     callback escape();
+    callback header-pressed();
 
     // glass tint (the native Acrylic behind it is the blur), 8px DWM corner
     Rectangle {
@@ -279,6 +283,12 @@ export component PanelWindow inherits Window {
             // header
             Rectangle {
                 height: 46px;
+                // 按住标题栏拖动 = 移动停靠条（dock::begin_move）；按钮在上层，照常点击
+                TouchArea {
+                    pointer-event(e) => {
+                        if e.kind == PointerEventKind.down && e.button == PointerEventButton.left { root.header-pressed(); }
+                    }
+                }
                 HorizontalLayout {
                     padding-left: 14px;
                     padding-right: 10px;
@@ -380,6 +390,24 @@ export component PanelWindow inherits Window {
                     }
                 }
             }
+        }
+    }
+
+    if root.drop-hint != "": Rectangle {
+        x: 6px;
+        y: 6px;
+        width: parent.width - 12px;
+        height: parent.height - 12px;
+        border-radius: 12px;
+        border-width: 2px;
+        border-color: Theme.accent;
+        background: Theme.accent.with-alpha(0.08);
+        Rectangle {
+            width: min(dh.preferred-width + 28px, parent.width - 24px);
+            height: 34px;
+            border-radius: 17px;
+            background: Theme.glass-strong;
+            dh := Text { text: root.drop-hint; color: Theme.text; font-size: 12.5px; font-weight: 500; overflow: elide; }
         }
     }
 

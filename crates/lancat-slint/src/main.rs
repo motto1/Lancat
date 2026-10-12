@@ -10,6 +10,8 @@
 slint::include_modules!();
 
 #[cfg(windows)]
+mod dock;
+#[cfg(windows)]
 mod win;
 
 use lancat_core::{CoreEvent, Message, Node, NodeConfig, PeerView};
@@ -48,7 +50,8 @@ thread_local! {
 }
 
 fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
-    APP.with(|a| a.borrow_mut().as_mut().map(f))
+    // try_borrow_mut：停靠回调可能在 App 方法里同步回到这里，嵌套那次跳过而不是 panic
+    APP.with(|a| a.try_borrow_mut().ok().and_then(|mut b| b.as_mut().map(f)))
 }
 
 const TINTS: [u32; 8] = [0xff9f0a, 0x30d158, 0x64d2ff, 0xbf5af2, 0xff375f, 0x5e5ce6, 0xffd60a, 0x0a84ff];
@@ -64,7 +67,7 @@ fn peer_item(p: &PeerView) -> PeerItem {
     PeerItem { id: p.id.clone().into(), name: p.name.clone().into(), initial: initial.into(), tint: tint(&p.id), online: p.online, unread: p.unread as i32 }
 }
 
-fn human(n: u64) -> String {
+pub(crate) fn human(n: u64) -> String {
     let f = n as f64;
     if f >= 1073741824.0 {
         format!("{:.1} GB", f / 1073741824.0)
@@ -205,6 +208,8 @@ impl App {
                     None => self.peers.push(peer),
                 }
                 self.rebuild_peers();
+                #[cfg(windows)]
+                dock::refresh_visual();
                 if self.auto_select && online && self.selected.is_empty() {
                     self.auto_select = false;
                     self.selected = id;
@@ -220,7 +225,14 @@ impl App {
                 }
                 self.rebuild_peers();
             }
-            CoreEvent::Message { message } | CoreEvent::MessageUpdate { message } => self.upsert_message(message),
+            CoreEvent::Message { message } => {
+                #[cfg(windows)]
+                dock::on_incoming(&message);
+                self.upsert_message(message);
+                #[cfg(windows)]
+                dock::refresh_visual();
+            }
+            CoreEvent::MessageUpdate { message } => self.upsert_message(message),
             CoreEvent::Typing { peer_id, typing } => {
                 self.typing.insert(peer_id, typing);
                 self.update_header();
@@ -287,10 +299,76 @@ impl App {
     }
 }
 
+impl App {
+    /// 拖放 / 附件：发给当前会话（「全部」时发给所有在线设备）。
+    #[allow(dead_code)]
+    fn send_files(&mut self, files: Vec<String>) {
+        let targets: Vec<String> = if self.selected.is_empty() {
+            self.peers.iter().filter(|p| p.online && !p.blocked).map(|p| p.id.clone()).collect()
+        } else {
+            vec![self.selected.clone()]
+        };
+        if targets.is_empty() {
+            if let Some(ui) = self.ui() {
+                ui.set_toast("没有在线设备".into());
+            }
+            return;
+        }
+        let node = self.node.clone();
+        let paths: Vec<std::path::PathBuf> = files.into_iter().map(Into::into).collect();
+        self.rt.spawn(async move {
+            match node.send_files(&targets, &paths).await {
+                Ok(ms) => post(move |app| {
+                    for m in ms {
+                        app.upsert_message(m);
+                    }
+                }),
+                Err(e) => {
+                    let e = e.to_string();
+                    log::warn!("send_files failed: {e}");
+                    post(move |app| {
+                        if let Some(ui) = app.ui() {
+                            ui.set_toast(format!("发送失败：{e}").into());
+                        }
+                    });
+                }
+            }
+        });
+    }
+
+    /// 停靠打开面板：从 toast 打开时切到发消息的那个会话。
+    #[allow(dead_code)]
+    fn on_dock_open(&mut self, reason: &str) {
+        if let Some(id) = reason.strip_prefix("toast:") {
+            if self.peers.iter().any(|p| p.id == id) && self.selected != id {
+                self.selected = id.to_string();
+                self.update_header();
+                self.load_messages();
+            }
+        }
+        if !self.selected.is_empty() {
+            let _ = self.node.mark_read(&self.selected);
+        }
+        if let Some(ui) = self.ui() {
+            if reason == "tray" || reason.starts_with("toast:") {
+                ui.invoke_focus_input();
+            }
+        }
+    }
+}
+
 /// Run `f` with the app on the UI thread (from any thread).
 fn post(f: impl FnOnce(&mut App) + Send + 'static) {
     let _ = slint::invoke_from_event_loop(move || {
         with_app(f);
+    });
+}
+
+fn open_settings() {
+    with_app(|app| {
+        if let Some(ui) = app.ui() {
+            ui.set_toast("设置页在阶段 4 补齐".into());
+        }
     });
 }
 
@@ -305,13 +383,19 @@ pub(crate) fn theme_is_dark(theme: &str) -> bool {
     }
 }
 
-fn data_dir() -> std::path::PathBuf {
+pub(crate) fn data_dir() -> std::path::PathBuf {
     env("LANCAT_DATA_DIR").map(Into::into).unwrap_or_else(|| dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("lancat-slint-dev"))
 }
 
 fn main() {
     let _ = t0();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // 单实例：已有实例（同一数据目录）在跑就把命令行转给它然后退出
+    #[cfg(windows)]
+    if win::dock_mode() && dock::forward_to_running() {
+        return;
+    }
 
     #[cfg(windows)]
     slint::platform::set_platform(Box::new(win::Win32Platform::new())).expect("set platform");
@@ -384,9 +468,13 @@ fn main() {
     ui.on_typing(|| {
         with_app(|app| {
             if app.selected.is_empty() || app.last_typing_sent.is_some_and(|t| t.elapsed().as_secs() < 3) {
+                #[cfg(windows)]
+                dock::note_typed();
                 return;
             }
             app.last_typing_sent = Some(Instant::now());
+            #[cfg(windows)]
+            dock::note_typed();
             app.node.send_typing(&app.selected, true);
         });
     });
@@ -408,12 +496,11 @@ fn main() {
         #[cfg(windows)]
         win::request_hide();
     });
-    ui.on_open_settings(|| {
-        with_app(|app| {
-            if let Some(ui) = app.ui() {
-                ui.set_toast("设置页在阶段 4 补齐".into());
-            }
-        });
+    ui.on_open_settings(open_settings);
+    ui.on_header_pressed(|| {
+        // 按住标题栏拖动可以把停靠条移到别的边（旧版 dock_move_start）
+        #[cfg(windows)]
+        dock::begin_move(false);
     });
     // toast auto-hide (2.6 s, like the old panel)
     {
@@ -450,6 +537,40 @@ fn main() {
 
     ui.show().expect("show");
     log::info!("panel shown {} ms after start", t0().elapsed().as_millis());
+    #[cfg(windows)]
+    if win::dock_mode() {
+        let w1 = ui.as_weak();
+        let w2 = ui.as_weak();
+        dock::init(
+            node.clone(),
+            dock::Hooks {
+                composer: Box::new(move || w1.upgrade().map(|u| (u.get_composer_focused(), !u.get_draft().is_empty())).unwrap_or((false, false))),
+                on_open: Box::new(|reason| {
+                    let r = reason.to_string();
+                    with_app(move |app| app.on_dock_open(&r));
+                }),
+                on_close: Box::new(|| {}),
+                on_drag_hint: Box::new(move |n| {
+                    if let Some(u) = w2.upgrade() {
+                        let target = with_app(|app| if app.selected.is_empty() { "所有在线设备".to_string() } else { app.peers.iter().find(|p| p.id == app.selected).map(|p| p.name.clone()).unwrap_or_default() }).unwrap_or_default();
+                        u.set_drop_hint(match n {
+                            Some(n) => format!("松开发送 {n} 个文件给 {target}").into(),
+                            None => "".into(),
+                        });
+                    }
+                }),
+                on_drop: Box::new(|files, _pos| {
+                    with_app(move |app| app.send_files(files));
+                }),
+                on_settings: Box::new(|| {
+                    dock::open_panel("probe");
+                    open_settings();
+                }),
+            },
+        );
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        dock::handle_args(&args, false);
+    }
     ui.run().expect("run");
     node.shutdown();
 }
