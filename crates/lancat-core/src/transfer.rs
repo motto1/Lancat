@@ -99,7 +99,7 @@ impl Node {
                     kind: "file".into(),
                     body: serde_json::to_value(&body)?,
                     status: "transferring".into(),
-                    ts: now_ms(),
+                    ts: crate::protocol::msg_stamp(),
                 };
                 self.store.insert_message(&m, false)?;
                 self.emit(CoreEvent::Message { message: m.clone() });

@@ -169,6 +169,45 @@ impl Store {
     }
 
     // ---------- kv / settings ----------
+    /// Newest message timestamp (0 when empty).
+    pub fn max_message_ts(&self) -> i64 {
+        self.c().query_row("SELECT COALESCE(MAX(ts),0) FROM messages", [], |r| r.get(0)).unwrap_or(0)
+    }
+
+    /// One-time repair of histories stored while received messages kept the sender's clock: walks
+    /// each conversation from its newest row back in insertion (rowid) order, which is the order
+    /// things arrived here, and pulls any message stamped later than its successor back to just
+    /// before it. A peer whose clock ran fast then no longer has its message sitting below the
+    /// replies sent after it.
+    pub fn repair_message_order(&self) {
+        let mut c = self.c();
+        let Ok(tx) = c.transaction() else { return };
+        let mut fixes: Vec<(i64, i64)> = Vec::new();
+        {
+            let Ok(mut st) = tx.prepare("SELECT rowid, peer_id, ts FROM messages ORDER BY peer_id, rowid DESC") else { return };
+            let Ok(rows) = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))) else { return };
+            let mut peer = String::new();
+            let mut next = i64::MAX;
+            for (rowid, p, ts) in rows.flatten() {
+                if p != peer {
+                    peer = p;
+                    next = i64::MAX;
+                }
+                let ts2 = if ts >= next { next - 1 } else { ts };
+                if ts2 != ts {
+                    fixes.push((rowid, ts2));
+                }
+                next = ts2;
+            }
+        }
+        for (rowid, ts) in &fixes {
+            let _ = tx.execute("UPDATE messages SET ts=?1 WHERE rowid=?2", rusqlite::params![ts, rowid]);
+        }
+        if tx.commit().is_ok() && !fixes.is_empty() {
+            log::info!("re-ordered {} messages stamped with a peer's clock", fixes.len());
+        }
+    }
+
     pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
         Ok(self.c().query_row("SELECT value FROM kv WHERE key=?1", [key], |r| r.get(0)).optional()?)
     }

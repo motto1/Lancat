@@ -248,6 +248,33 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+static LAST_STAMP: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// Timestamp of a message entering this device's history, sent or received: our clock, strictly
+/// increasing. Conversations are ordered by it, so they show things in the order they happened
+/// here. Received messages used to keep the sender's clock, and a peer running a few minutes
+/// fast put every reply we sent afterwards *above* its message, out of sight.
+pub fn msg_stamp() -> i64 {
+    use std::sync::atomic::Ordering::SeqCst;
+    let now = now_ms();
+    let mut last = LAST_STAMP.load(SeqCst);
+    loop {
+        let next = now.max(last + 1);
+        match LAST_STAMP.compare_exchange_weak(last, next, SeqCst, SeqCst) {
+            Ok(_) => return next,
+            Err(v) => last = v,
+        }
+    }
+}
+
+/// Never stamp below the newest stored message (our clock may have been set back), unless that
+/// one lies implausibly far in the future.
+pub fn seed_msg_stamp(newest: i64) {
+    if newest <= now_ms() + 600_000 {
+        LAST_STAMP.fetch_max(newest, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

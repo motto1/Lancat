@@ -185,6 +185,11 @@ impl Node {
     pub async fn start(cfg: NodeConfig) -> Result<Arc<Node>> {
         std::fs::create_dir_all(&cfg.data_dir).with_context(|| format!("create {}", cfg.data_dir.display()))?;
         let store = Store::open(&cfg.data_dir.join("lancat.db"))?;
+        if store.kv_get("msg_order_v1").ok().flatten().is_none() {
+            store.repair_message_order();
+            let _ = store.kv_set("msg_order_v1", "1");
+        }
+        crate::protocol::seed_msg_stamp(store.max_message_ts());
         store.mark_interrupted().ok();
 
         let id = match store.kv_get("device_id")? {
@@ -879,7 +884,7 @@ impl Node {
             kind: kind.into(),
             body,
             status: "pending".into(),
-            ts: now_ms(),
+            ts: crate::protocol::msg_stamp(),
         }
     }
 
@@ -1098,8 +1103,11 @@ impl Node {
             kind: kind.into(),
             body,
             status: status.into(),
-            // keep the sender's clock only when it is sane, else ours
-            ts: if (ts - now_ms()).abs() < 86_400_000 { ts } else { now_ms() },
+            // arrival time on our clock, not the sender's (see msg_stamp)
+            ts: {
+                let _sender_ts = ts;
+                crate::protocol::msg_stamp()
+            },
         };
         if self.store.device(peer_id).is_none() {
             // message from a peer we never saw via discovery: record a stub
