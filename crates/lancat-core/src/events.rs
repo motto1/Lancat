@@ -17,6 +17,9 @@ pub struct PeerView {
     pub unread: i64,
     pub last_ts: i64,
     pub last_preview: String,
+    /// Reached through this peer (its name) because there is no direct path; None when direct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 /// A peer told us it cannot connect to us (`WsMsg::InboundBlocked`), or it had to send a file

@@ -10,6 +10,8 @@ pub const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
 pub const PROBE_BURST_SECS: [u64; 3] = [0, 1, 3];
 /// Fallback while no peer is online: one probe round this often.
 pub const IDLE_PROBE_SECS: u64 = 180;
+/// How often the tailnet peer list is re-read to find devices that came online later.
+pub const TS_RELIST_SECS: u64 = 60;
 /// How often the network watcher compares interface addresses / checks for a wake-up.
 pub const NETWATCH_SECS: u64 = 5;
 /// Link keepalive: ping every 30 s; the link is dropped after 2 silent intervals (60–90 s).
@@ -140,6 +142,55 @@ pub enum WsMsg {
     /// own inbound connections are blocked (firewall, "Public" network) so it can warn its user.
     /// Optional and informational: older peers fail to parse it and skip it.
     InboundBlocked { addr: String, port: u16 },
+    /// Gossip: the peers the sender has a link to right now (relay.rs). Sent on link changes and
+    /// every 45 s. Older peers skip it.
+    Peers { peers: Vec<PeerHint> },
+    /// A message for `to` from `from`, through the peer this link goes to (one hop, relay.rs).
+    /// `msg` is a `WsMsg` as JSON (kept raw so a relay forwards types it does not know).
+    Relay { to: String, from: String, msg: serde_json::Value },
+}
+
+/// One entry of `WsMsg::Peers`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PeerHint {
+    pub device: DeviceInfo,
+    /// Addresses the gossiping peer knows it by, best first.
+    #[serde(default)]
+    pub addrs: Vec<String>,
+}
+
+const RELAY_MAGIC: &[u8; 4] = b"LCR1";
+
+/// A binary link frame for `to`, sent through a relay:
+/// magic(4) | to_len(1) | to | from_len(1) | from | inner frame
+pub fn relay_frame(to: &str, from: &str, inner: &[u8]) -> Vec<u8> {
+    let (t, f) = (to.as_bytes(), from.as_bytes());
+    let (t, f) = (&t[..t.len().min(255)], &f[..f.len().min(255)]);
+    let mut v = Vec::with_capacity(6 + t.len() + f.len() + inner.len());
+    v.extend_from_slice(RELAY_MAGIC);
+    v.push(t.len() as u8);
+    v.extend_from_slice(t);
+    v.push(f.len() as u8);
+    v.extend_from_slice(f);
+    v.extend_from_slice(inner);
+    v
+}
+
+pub fn is_relay_frame(b: &[u8]) -> bool {
+    b.len() >= 4 && &b[..4] == RELAY_MAGIC
+}
+
+/// (to, from, inner frame)
+pub fn relay_unframe(b: &[u8]) -> Option<(String, String, &[u8])> {
+    if !is_relay_frame(b) {
+        return None;
+    }
+    let tl = *b.get(4)? as usize;
+    let to = std::str::from_utf8(b.get(5..5 + tl)?).ok()?.to_string();
+    let fl = *b.get(5 + tl)? as usize;
+    let s = 6 + tl;
+    let from = std::str::from_utf8(b.get(s..s + fl)?).ok()?.to_string();
+    Some((to, from, b.get(s + fl..)?))
 }
 
 impl WsMsg {

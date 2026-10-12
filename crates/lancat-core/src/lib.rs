@@ -17,6 +17,7 @@ mod link;
 pub mod netutil;
 pub mod node;
 mod progress;
+mod relay;
 pub mod protocol;
 pub mod server;
 pub mod store;

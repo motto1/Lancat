@@ -132,6 +132,8 @@ pub(crate) struct Link {
     pub conn_id: u64,
     /// Dialed by the device with the smaller id (wins over a simultaneous second connection).
     pub preferred: bool,
+    /// Last ping round-trip in ms (u64::MAX until measured): picks the fastest relay.
+    pub rtt_ms: Arc<AtomicU64>,
 }
 
 pub struct Node {
@@ -167,6 +169,14 @@ pub struct Node {
     pub(crate) chunk_slots: tokio::sync::Semaphore,
     /// Live byte progress per transfer id (progress.rs).
     pub(crate) meters: Mutex<HashMap<String, Arc<crate::progress::Meter>>>,
+    /// target peer -> relay peer -> what the relay said about it (relay.rs).
+    pub(crate) relays: Mutex<HashMap<String, HashMap<String, crate::relay::RelayHint>>>,
+    /// Sends a gossip round soon (links changed).
+    pub(crate) gossip_kick: tokio::sync::Notify,
+    /// peer -> last attempt at the addresses a relay gave for it.
+    pub(crate) intro_tries: Mutex<HashMap<String, Instant>>,
+    /// Reply channels to relayed senders (relay.rs `reply_tx`).
+    pub(crate) relay_replies: Mutex<HashMap<String, mpsc::UnboundedSender<String>>>,
     pub(crate) http: reqwest::Client,
     pub(crate) conn_seq: AtomicU64,
     pub(crate) mdns: Mutex<Option<crate::discovery::Mdns>>,
@@ -245,6 +255,10 @@ impl Node {
             transfer_slots: tokio::sync::Semaphore::new(crate::transfer::MAX_ACTIVE_TRANSFERS),
             chunk_slots: tokio::sync::Semaphore::new(crate::server::MAX_INCOMING_CHUNKS),
             meters: Mutex::new(HashMap::new()),
+            relays: Mutex::new(HashMap::new()),
+            gossip_kick: tokio::sync::Notify::new(),
+            intro_tries: Mutex::new(HashMap::new()),
+            relay_replies: Mutex::new(HashMap::new()),
             http,
             conn_seq: AtomicU64::new(1),
             mdns: Mutex::new(None),
@@ -260,6 +274,7 @@ impl Node {
         crate::server::spawn(node.clone(), listener);
         crate::discovery::start(node.clone());
         node.clone().spawn_housekeeping();
+        node.clone().spawn_gossip();
         log::info!("lancat node {} ({}) listening on :{}", node.me().id, node.me().name, port);
         Ok(node)
     }
@@ -716,6 +731,7 @@ impl Node {
 
     pub fn peer_view(&self, id: &str) -> Option<PeerView> {
         let row = self.store.device(id)?;
+        let via = self.relay_name(id);
         let peers = self.peers.read().unwrap();
         let rt = peers.get(id);
         Some(PeerView {
@@ -723,7 +739,8 @@ impl Node {
             name: rt.map(|p| p.info.name.clone()).unwrap_or(row.name),
             os: row.os,
             ver: row.ver,
-            online: rt.map(|p| p.online).unwrap_or(false),
+            online: rt.map(|p| p.online).unwrap_or(false) || via.is_some(),
+            via,
             addr: rt.map(|p| p.addr.to_string()).unwrap_or(row.last_addr),
             port: rt.map(|p| p.info.port).unwrap_or(row.port),
             blocked: row.blocked,
@@ -735,17 +752,20 @@ impl Node {
 
     pub fn peers(&self) -> Vec<PeerView> {
         let rows = self.store.devices().unwrap_or_default();
+        let vias = self.relay_names();
         let peers = self.peers.read().unwrap();
         let mut v: Vec<PeerView> = rows
             .into_iter()
             .map(|row| {
                 let rt = peers.get(&row.id);
+                let via = vias.get(&row.id).cloned();
                 PeerView {
                     id: row.id.clone(),
                     name: rt.map(|p| p.info.name.clone()).unwrap_or(row.name),
                     os: row.os,
                     ver: row.ver,
-                    online: rt.map(|p| p.online).unwrap_or(false),
+                    online: rt.map(|p| p.online).unwrap_or(false) || via.is_some(),
+                    via,
                     addr: rt.map(|p| p.addr.to_string()).unwrap_or(row.last_addr),
                     port: rt.map(|p| p.info.port).unwrap_or(row.port),
                     blocked: row.blocked,
@@ -911,10 +931,7 @@ impl Node {
     }
 
     pub fn send_typing(&self, peer_id: &str, typing: bool) {
-        let msg = serde_json::to_string(&WsMsg::Typing { typing }).unwrap_or_default();
-        if let Some(l) = self.links.lock().unwrap().get(peer_id) {
-            let _ = l.tx.send(msg);
-        }
+        self.send_to(peer_id, &WsMsg::Typing { typing });
     }
 
     fn to_wire(m: &Message) -> Option<WsMsg> {
@@ -928,7 +945,7 @@ impl Node {
     /// Delivers a text/emoji message: over the WebSocket link when present, else HTTP POST /msg.
     pub(crate) async fn deliver(self: &Arc<Self>, m: &Message) {
         let Some(wire) = Self::to_wire(m) else { return };
-        if self.send_over_link(&m.peer_id, &wire) {
+        if self.send_to(&m.peer_id, &wire) {
             if m.status == "pending" {
                 self.set_status(&m.id, "sent");
             }
@@ -1004,7 +1021,7 @@ impl Node {
             f.insert(peer_id.to_string(), false);
         }
         loop {
-            if self.is_online(peer_id) {
+            if self.reachable(peer_id) {
                 for m in self.store.unacked_outgoing(peer_id).unwrap_or_default() {
                     self.deliver(&m).await;
                 }
@@ -1089,6 +1106,8 @@ impl Node {
             }
             // handled by the link loop itself (`run_link`); never valid over POST /msg
             WsMsg::FileStart { .. } | WsMsg::FileFinish { .. } => None,
+            // link-only (handled by `run_link`); never valid over POST /msg
+            WsMsg::Peers { .. } | WsMsg::Relay { .. } => None,
             WsMsg::InboundBlocked { addr, port } => {
                 self.inbound_blocked_report(peer_id, addr, port);
                 None

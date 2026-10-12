@@ -179,12 +179,29 @@ async fn probe_loop(node: Arc<Node>, sock: Arc<tokio::net::UdpSocket>) {
     let mut burst: Option<(tokio::time::Instant, usize)> = None;
     let mut idle_next = tokio::time::Instant::now() + Duration::from_secs(IDLE_PROBE_SECS);
     let mut ts_cache: Vec<Ipv4Addr> = vec![];
+    // A device that joins the tailnet later (a phone switching Tailscale on) is only found if we
+    // look again: mobile builds cannot list the tailnet themselves, and with peers already online
+    // the idle fallback never probes. Re-list it every minute and probe when someone new is there.
+    let mut ts_next = tokio::time::Instant::now() + Duration::from_secs(TS_RELIST_SECS);
     loop {
         let deadline = match burst {
             Some((t0, i)) => t0 + Duration::from_secs(PROBE_BURST_SECS[i]),
             None => idle_next,
         };
         tokio::select! {
+            _ = tokio::time::sleep_until(ts_next), if burst.is_none() => {
+                ts_next = tokio::time::Instant::now() + Duration::from_secs(TS_RELIST_SECS);
+                if netutil::probe_ifaces().iter().any(|i| i.is_tailscale()) {
+                    let now = netutil::tailscale_peers().await;
+                    if now.iter().any(|ip| !ts_cache.contains(ip)) {
+                        log::info!("tailnet has new peers {:?}: probing", now.iter().filter(|ip| !ts_cache.contains(ip)).collect::<Vec<_>>());
+                        burst = Some((tokio::time::Instant::now(), 0));
+                    } else {
+                        ts_cache = now;
+                    }
+                }
+                continue;
+            }
             _ = node.probe_kick.notified() => {
                 // a new trigger restarts the schedule (several triggers at once = one burst)
                 burst = Some((tokio::time::Instant::now(), 0));

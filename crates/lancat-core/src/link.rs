@@ -194,13 +194,14 @@ impl Node {
         self.peer_seen(device, ip);
         let preferred = if dialer { me_id.as_str() < peer_id.as_str() } else { peer_id.as_str() < me_id.as_str() };
         let conn_id = self.conn_seq.fetch_add(1, Ordering::Relaxed);
+        let rtt = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
         {
             let mut links = self.links.lock().unwrap();
             if links.get(&peer_id).is_some_and(|l| l.preferred && !preferred) {
                 log::debug!("link with {peer_id}: keeping the connection dialed by the smaller id, dropping this one");
                 return;
             }
-            links.insert(peer_id.clone(), Link { tx: out_tx.clone(), data: data_tx.clone(), conn_id, preferred });
+            links.insert(peer_id.clone(), Link { tx: out_tx.clone(), data: data_tx.clone(), conn_id, preferred, rtt_ms: rtt.clone() });
         }
         // the address a working link runs over is the one to dial next time
         self.set_peer_addr(&peer_id, ip);
@@ -223,7 +224,12 @@ impl Node {
             tokio::spawn(async move { node.flush_peer(&id).await });
         }
 
+        // tell everyone (this peer included) who we can reach now (relay.rs)
+        self.kick_gossip();
         let ping = serde_json::to_string(&WsMsg::Ping).unwrap_or_default();
+        // one ping right away: the round-trip time ranks this link as a relay
+        let mut ping_at = Some(std::time::Instant::now());
+        let _ = out_tx.send(ping.clone());
         let mut tick = tokio::time::interval(Duration::from_secs(LINK_PING_SECS));
         // after a freeze/suspend only one tick fires, so the peer gets a chance to answer
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -242,7 +248,14 @@ impl Node {
                     idle = 0;
                     match f {
                         Frame::Text(t) => match serde_json::from_str::<WsMsg>(&t) {
-                            Ok(WsMsg::FileStart { manifest }) => self.link_file_start(&peer_id, manifest, &out_tx, ip),
+                            Ok(WsMsg::FileStart { manifest }) => self.link_file_start(&peer_id, manifest, &out_tx, false),
+                            Ok(WsMsg::Pong) => {
+                                if let Some(t) = ping_at.take() {
+                                    rtt.store(t.elapsed().as_millis() as u64, Ordering::Relaxed);
+                                }
+                            }
+                            Ok(WsMsg::Peers { peers }) => self.on_peers(&peer_id, peers),
+                            Ok(WsMsg::Relay { to, from, msg }) => self.on_relay(&peer_id, to, from, msg).await,
                             Ok(WsMsg::FileFinish { transfer_id }) => self.link_file_finish(&peer_id, transfer_id, &out_tx),
                             Ok(w) => {
                                 if let Some(reply) = self.handle_wire(&peer_id, w, Some(ip)).await {
@@ -251,6 +264,11 @@ impl Node {
                             }
                             Err(_) => {}
                         },
+                        Frame::Bin(b) if is_relay_frame(&b) => {
+                            if let Some((from, inner, out)) = self.on_relay_bin(&peer_id, &b).await {
+                                self.link_piece(&from, &inner, &mut asm, &out);
+                            }
+                        }
                         Frame::Bin(b) => self.link_piece(&peer_id, &b, &mut asm, &out_tx),
                     }
                 }
@@ -258,6 +276,7 @@ impl Node {
                     idle += 1;
                     if idle > LINK_MISSED_PINGS { timed_out = true; break; }
                     if out_tx.send(ping.clone()).is_err() { closed = true; break; }
+                    ping_at = Some(std::time::Instant::now());
                 }
                 _ = stop.changed() => break,
             }
@@ -281,6 +300,10 @@ impl Node {
         }
         if ours {
             self.kick_housekeeping();
+        }
+        if !self.links.lock().unwrap().contains_key(&peer_id) {
+            self.relay_drop(&peer_id);
+            self.kick_gossip();
         }
     }
 }
@@ -316,15 +339,20 @@ impl Assembly {
 
 impl Node {
     /// `FileStart` over the link: the same as POST /files; answered with `FileHave`.
-    fn link_file_start(self: &Arc<Self>, peer_id: &str, manifest: FileManifest, out: &mpsc::UnboundedSender<String>, _ip: IpAddr) {
-        // the sender only uses the link when it could not connect to us: say why in our log
-        log::warn!(
-            "{peer_id} could not connect to us on TCP {} and sends {} over the link instead (inbound connections are blocked here: on Windows allow Lancat in the firewall, or set the network to Private)",
-            self.me().port,
-            manifest.name
-        );
-        // the same news as `InboundBlocked` (older senders never send that): warn our user
-        self.inbound_blocked_report(peer_id, String::new(), self.me().port);
+    /// `relayed`: it came through another peer (relay.rs), which says nothing about our firewall.
+    pub(crate) fn link_file_start(self: &Arc<Self>, peer_id: &str, manifest: FileManifest, out: &mpsc::UnboundedSender<String>, relayed: bool) {
+        if relayed {
+            log::info!("{peer_id} sends {} through a relay", manifest.name);
+        } else {
+            // the sender only uses the link when it could not connect to us: say why in our log
+            log::warn!(
+                "{peer_id} could not connect to us on TCP {} and sends {} over the link instead (inbound connections are blocked here: on Windows allow Lancat in the firewall, or set the network to Private)",
+                self.me().port,
+                manifest.name
+            );
+            // the same news as `InboundBlocked` (older senders never send that): warn our user
+            self.inbound_blocked_report(peer_id, String::new(), self.me().port);
+        }
         let (node, from, out) = (self.clone(), peer_id.to_string(), out.clone());
         tokio::spawn(async move {
             let transfer_id = manifest.transfer_id.clone();
@@ -344,7 +372,7 @@ impl Node {
     }
 
     /// `FileFinish` over the link: the same as POST /finish; answered with `FileDone`.
-    fn link_file_finish(self: &Arc<Self>, peer_id: &str, transfer_id: String, out: &mpsc::UnboundedSender<String>) {
+    pub(crate) fn link_file_finish(self: &Arc<Self>, peer_id: &str, transfer_id: String, out: &mpsc::UnboundedSender<String>) {
         let (node, from, out) = (self.clone(), peer_id.to_string(), out.clone());
         tokio::spawn(async move {
             let reply = match node.incoming_finish(&from, &transfer_id).await {

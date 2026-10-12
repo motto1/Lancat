@@ -163,7 +163,7 @@ impl Node {
             }
             Err(_) if ctl.get() == CANCEL => {
                 log::info!("transfer {msg_id} cancelled");
-                self.send_over_link(&m.peer_id, &WsMsg::FileCancel { transfer_id: body.transfer_id.clone() });
+                self.send_to(&m.peer_id, &WsMsg::FileCancel { transfer_id: body.transfer_id.clone() });
                 ("cancelled", None, None)
             }
             Err(e) if ctl.get() == PEER_CANCEL || e.downcast_ref::<PeerCancelled>().is_some() => {
@@ -217,7 +217,7 @@ impl Node {
         }
         self.set_status(msg_id, "cancelled");
         drop(ctls);
-        self.send_over_link(&m.peer_id, &WsMsg::FileCancel { transfer_id: body.transfer_id });
+        self.send_to(&m.peer_id, &WsMsg::FileCancel { transfer_id: body.transfer_id });
         Ok(())
     }
 
@@ -288,7 +288,7 @@ impl Node {
             body.size = size;
             self.store.update_message(msg_id, "transferring", Some(&serde_json::to_value(&body)?))?;
         }
-        if !self.is_online(&m.peer_id) {
+        if !self.reachable(&m.peer_id) {
             return Err(terr(ErrCode::PeerOffline, "对方不在线"));
         }
         let route = self.pick_route(&m.peer_id).await?;
@@ -296,7 +296,7 @@ impl Node {
 
         // announce, so the receiver's UI shows it right away
         let offer = WsMsg::FileOffer { id: m.id.clone(), transfer_id: body.transfer_id.clone(), name: body.name.clone(), size, ts: m.ts };
-        self.send_over_link(&m.peer_id, &offer);
+        self.send_to(&m.peer_id, &offer);
 
         let manifest = FileManifest {
             transfer_id: body.transfer_id.clone(),
@@ -443,6 +443,10 @@ impl Node {
     /// address. A receiver whose firewall drops inbound connections still dials us, so its link is
     /// the one path that is sure to exist.
     async fn pick_route(&self, peer_id: &str) -> Result<Route> {
+        // no direct path at all, but a relay: the link transfer runs through it
+        if !self.is_online(peer_id) && self.relay_via(peer_id).is_some() {
+            return Ok(Route::Link);
+        }
         let (ip, port) = self.peer_addr(peer_id).ok_or_else(|| terr(ErrCode::PeerOffline, "对方地址未知"))?;
         let linked = || self.links.lock().unwrap().contains_key(peer_id);
         let known_blocked = matches!(self.http_unreachable.lock().unwrap().get(peer_id), Some((a, t)) if *a == ip && t.elapsed() < Duration::from_secs(60));
@@ -510,7 +514,7 @@ impl Node {
         let _unregister = Unregister(self, tid.clone());
         let lost = || terr(ErrCode::LinkLost, "与对方的连接断开了");
         'attempt: for attempt in 0..2 {
-            if !self.send_over_link(&m.peer_id, &WsMsg::FileStart { manifest: manifest.clone() }) {
+            if !self.send_to(&m.peer_id, &WsMsg::FileStart { manifest: manifest.clone() }) {
                 return Err(lost());
             }
             let have = loop {
@@ -527,9 +531,10 @@ impl Node {
             };
             let have: std::collections::HashSet<u64> = have.into_iter().collect();
             let mut done: u64 = have.iter().map(|&i| chunk_len(size, i)).sum();
-            let data = self.links.lock().unwrap().get(&m.peer_id).map(|l| l.data.clone()).ok_or_else(lost)?;
             let meter = self.meter(&tid, &m.id, &m.peer_id, size, true);
             meter.emit(self, done, true);
+            let (data, relayed) = self.data_path(&m.peer_id).ok_or_else(lost)?;
+            let me_id = self.me().id;
             let file = Arc::new(File::open(path)?);
             let mut next = (0..manifest.chunk_count()).filter(|i| !have.contains(i));
             let mut inflight = std::collections::HashSet::new();
@@ -548,6 +553,7 @@ impl Node {
                     for (k, piece) in buf.chunks(LINK_PIECE).enumerate() {
                         let mut frame = LinkPiece::encode_header(&tid, idx, len as u32, (k * LINK_PIECE) as u32, &hash, piece.len());
                         frame.extend_from_slice(piece);
+                        let frame = if relayed { relay_frame(&m.peer_id, &me_id, &frame) } else { frame };
                         data.send(frame).await.map_err(|_| lost())?;
                         meter.add(piece.len() as i64);
                         meter.emit(self, done, false);
@@ -574,7 +580,7 @@ impl Node {
                     meter.emit(self, done, true);
                 }
             }
-            if !self.send_over_link(&m.peer_id, &WsMsg::FileFinish { transfer_id: tid.clone() }) {
+            if !self.send_to(&m.peer_id, &WsMsg::FileFinish { transfer_id: tid.clone() }) {
                 return Err(lost());
             }
             loop {
