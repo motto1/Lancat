@@ -31,7 +31,7 @@
     if (!p) return app.me ? `本机：${app.me.name}` : "";
     if ((app.typing[p.id] ?? 0) > now) return "正在输入…";
     if (p.blocked) return "已拉黑";
-    return p.online ? `在线 · ${osGlyph(p.os)} · ${p.addr}` : "离线";
+    return p.online ? (p.via ? `在线 · ${osGlyph(p.os)} · 经 ${p.via} 中转` : `在线 · ${osGlyph(p.os)} · ${p.addr}`) : "离线";
   });
 
   // a probe burst lasts ~3 s (0 s / 1 s / 3 s); spin the icon meanwhile

@@ -30,7 +30,8 @@ class AppState {
   broadcast = $state(false);
   messages = $state<Record<string, Message[]>>({});
   hasMore = $state<Record<string, boolean>>({});
-  progress = $state<Record<string, { done: number; total: number }>>({});
+  /** Live transfer progress; `rate` (bytes/s) is smoothed over ≥ 0.5 s windows starting at `at`/`base`. */
+  progress = $state<Record<string, { done: number; total: number; rate: number; at: number; base: number }>>({});
   typing = $state<Record<string, number>>({});
   /** Panel is on screen (unread is only cleared while visible). */
   visible = $state(false);
@@ -224,9 +225,24 @@ class AppState {
         this.upsertMessage(e.message);
         if (e.message.status === "done" || e.message.status === "failed") delete this.progress[e.message.id];
         break;
-      case "progress":
-        this.progress[e.msg_id] = { done: e.done, total: e.total };
+      case "progress": {
+        const now = performance.now();
+        const p = this.progress[e.msg_id];
+        if (!p || e.done < p.base) {
+          this.progress[e.msg_id] = { done: e.done, total: e.total, rate: p?.rate ?? 0, at: now, base: e.done };
+          break;
+        }
+        let { rate, at, base } = p;
+        const dt = now - at;
+        if (dt >= 500) {
+          const inst = ((e.done - base) * 1000) / dt;
+          rate = rate > 0 ? rate * 0.6 + inst * 0.4 : inst;
+          at = now;
+          base = e.done;
+        }
+        this.progress[e.msg_id] = { done: e.done, total: e.total, rate, at, base };
         break;
+      }
       case "typing":
         if (e.typing) this.typing[e.peer_id] = Date.now() + 5000;
         else delete this.typing[e.peer_id];

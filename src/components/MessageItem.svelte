@@ -22,6 +22,14 @@
   /** A failed transfer with a known cause: short reason + what to do. */
   let failure = $derived(m.kind === "file" && m.status === "failed" ? failureInfo(m.body?.code) : null);
   let pct = $derived(prog && prog.total > 0 ? prog.done / prog.total : m.status === "done" ? 1 : 0);
+  let active = $derived(m.status === "transferring" || m.status === "receiving");
+  /** "12.3 MB/s · 剩 8 秒" while bytes are moving. */
+  let speed = $derived.by(() => {
+    if (!active || !prog || prog.rate < 1) return "";
+    const left = Math.max(0, prog.total - prog.done) / prog.rate;
+    const eta = left < 1 ? "" : left < 60 ? ` · 剩 ${Math.ceil(left)} 秒` : left < 3600 ? ` · 剩 ${Math.ceil(left / 60)} 分` : ` · 剩 ${(left / 3600).toFixed(1)} 小时`;
+    return `${formatSize(prog.rate)}/s${eta}`;
+  });
 
   function fileIcon(name: string): string {
     const ext = name.split(".").pop()?.toLowerCase() ?? "";
@@ -76,7 +84,11 @@
           {#if m.status === "transferring" || m.status === "receiving" || (m.status === "paused" && prog)}
             · {Math.floor(pct * 100)}%
           {/if}
-          · <span class="st" title={m.status === "failed" ? (m.body?.error ?? "") : undefined}>{statusLabel()}</span>
+          {#if speed}
+            · <span class="st">{speed}</span>
+          {:else}
+            · <span class="st" title={m.status === "failed" ? (m.body?.error ?? "") : undefined}>{statusLabel()}</span>
+          {/if}
         </div>
         {#if failure && (failure.hint || failure.local)}
           <div class="why">

@@ -22,6 +22,8 @@ export interface Peer {
   unread: number;
   last_ts: number;
   last_preview: string;
+  /** Reached through this peer (name) when there is no direct path. */
+  via?: string;
 }
 
 export interface EmojiPayload {
