@@ -378,9 +378,9 @@ pub fn webview_builder<'a, R: Runtime, M: Manager<R>>(b: WebviewWindowBuilder<'a
 /// Panel shown (true) or collapsed but kept alive (false): steer WebView2's memory target level
 /// (Low lets the renderer drop caches while hidden).
 pub fn panel_visibility(win: &WebviewWindow, visible: bool) {
-    // Measured while collapsed-but-alive: −17…21 MB with GPU on, but no difference (~125 MB
-    // either way) with the default `--disable-gpu`, so it stays opt-in (`LANCAT_WV2_LOWMEM=1`).
-    if env("LANCAT_WV2_LOWMEM").as_deref() != Some("1") {
+    // Measured while collapsed-but-alive: −17…21 MB with GPU on (now the default), no
+    // difference under `--disable-gpu`. On by default; `LANCAT_WV2_LOWMEM=0` turns it off.
+    if env("LANCAT_WV2_LOWMEM").as_deref() == Some("0") {
         return;
     }
     let _ = win.with_webview(move |wv| unsafe {
@@ -425,6 +425,29 @@ pub fn panel_suspend(win: &WebviewWindow) {
             let _ = c3.TrySuspend(&handler);
         }
     });
+}
+
+/// Pointer is on the strip of a parked panel: resume it ahead of the open. Bumps the generation
+/// so a trim still pending from the last suspend skips the page that is waking up.
+pub fn panel_prewarm(win: &WebviewWindow) {
+    PANEL_GEN.fetch_add(1, Ordering::SeqCst);
+    panel_resume(win);
+}
+
+/// Blocks until Windows signals low physical memory (returns at once while it stays low).
+pub fn wait_low_memory() {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Memory::{CreateMemoryResourceNotification, LowMemoryResourceNotification};
+    use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+    static H: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let h = *H.get_or_init(|| unsafe { CreateMemoryResourceNotification(LowMemoryResourceNotification).map(|h| h.0 as usize).unwrap_or(0) });
+    if h == 0 {
+        std::thread::sleep(Duration::from_secs(3600));
+        return;
+    }
+    unsafe {
+        let _ = WaitForSingleObject(HANDLE(h as *mut _), INFINITE);
+    }
 }
 
 /// Undo `panel_suspend` before the panel is shown again. Main thread only.

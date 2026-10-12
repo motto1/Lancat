@@ -214,14 +214,45 @@ pub fn create_windows(app: &AppHandle) -> tauri::Result<()> {
                 let _ = core.set_settings(s);
             }
         }
+        // one-time: a timed destroy only traded a little commit for a multi-second cold start
+        // after every long pause; the suspended panel costs no CPU and little resident memory,
+        // so the default becomes resident (0). It is released only when Windows runs low on
+        // memory (spawn_low_memory_watch). A keep-alive the user picked is left alone.
+        if core.store.kv_get("keep_alive_v3").ok().flatten().is_none() {
+            let _ = core.store.kv_set("keep_alive_v3", "1");
+            let mut s = core.settings();
+            if s.panel_keep_alive_s == 1800 {
+                s.panel_keep_alive_s = 0;
+                let _ = core.set_settings(s);
+            }
+        }
+    }
+    // Linux: same resident default (the hidden WebKit page is throttled, CSS animations paused;
+    // released under memory pressure). A value the user picked is left alone.
+    #[cfg(target_os = "linux")]
+    {
+        let core = &app.state::<Core>().0;
+        if core.store.kv_get("keep_alive_v3").ok().flatten().is_none() {
+            let _ = core.store.kv_set("keep_alive_v3", "1");
+            let mut s = core.settings();
+            if s.panel_keep_alive_s == 60 || s.panel_keep_alive_s == 1800 {
+                s.panel_keep_alive_s = 0;
+                let _ = core.set_settings(s);
+            }
+        }
     }
     native_dock::create(app);
     apply_layout(app);
     native_dock::show();
     refresh_visual(app);
     if keep_alive_s(app) == 0 {
-        // "always resident" mode: instant opens, at the cost of a live web renderer
+        // "always resident" mode: instant opens. On Windows the parked page is suspended and
+        // trimmed like a collapsed one, and released if the system runs low on memory.
         let _ = ensure_panel(app);
+        #[cfg(any(windows, target_os = "linux"))]
+        schedule_suspend_after(app, 10);
+        #[cfg(any(windows, target_os = "linux"))]
+        spawn_low_memory_watch(app.clone());
     }
     spawn_poller(app.clone());
     // the collapsed app has settled: give back start-up heap and library pages (Linux)
@@ -348,9 +379,18 @@ pub fn on_hover_start(app: &AppHandle) {
         return;
     }
     st.panel_gen.fetch_add(1, Ordering::SeqCst); // cancel a pending destroy
-    if app.get_webview_window("panel").is_none() {
-        st.cold_open.store(true, Ordering::SeqCst);
-        let _ = ensure_panel(app);
+    match app.get_webview_window("panel") {
+        None => {
+            st.cold_open.store(true, Ordering::SeqCst);
+            let _ = ensure_panel(app);
+        }
+        // Windows: wake the suspended page now, so the resume and the page-ins of its trimmed
+        // processes happen during the hover delay instead of after the open (on_hover_end
+        // suspends it again if it is not opened)
+        #[cfg(any(windows, target_os = "linux"))]
+        Some(p) => platform::panel_prewarm(&p),
+        #[cfg(not(any(windows, target_os = "linux")))]
+        Some(_) => {}
     }
 }
 
@@ -367,7 +407,7 @@ pub fn on_hover_end(app: &AppHandle) {
         // Windows: on_hover_start bumped panel_gen, which cancelled the suspend a collapse had
         // scheduled; touching the strip within 4 s of a collapse left the parked panel rendering
         // (unsuspended) until the 30 min reaper. Re-arm it.
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         schedule_suspend(app);
     }
 }
@@ -417,6 +457,8 @@ fn schedule_destroy(app: &AppHandle) {
             }
             if let Some(p) = a2.get_webview_window("panel") {
                 log::info!("destroying the idle panel webview (collapsed for {secs}s)");
+                #[cfg(target_os = "linux")]
+                platform::panel_resume(&p);
                 let _ = p.destroy();
                 // give the freed UI-process side of WebKit back to the OS a moment later
                 crate::timers::after(Duration::from_secs(2), || {
@@ -474,6 +516,8 @@ pub fn open_panel(app: &AppHandle, reason: &str) {
     }
     #[cfg(windows)]
     native_dock::toast_dismiss();
+    #[cfg(target_os = "linux")]
+    native_dock::toast_dismiss();
     log::debug!("open_panel({reason})");
     if PANEL_CREATING.load(Ordering::SeqCst) {
         // dispatched from inside the WebView2 creation pump: defer until the panel exists
@@ -510,6 +554,8 @@ pub fn open_panel(app: &AppHandle, reason: &str) {
             *st.geo.lock().unwrap() = Some(geo);
             place(&panel, geo.panel, &geo);
         }
+        #[cfg(target_os = "linux")]
+        platform::panel_resume(&panel);
         #[cfg(not(windows))]
         let _ = panel.show();
         // Windows: shown (or un-parked) at alpha 0, brought in once the page reports a frame
@@ -558,16 +604,21 @@ pub fn hide_panel(app: &AppHandle) {
     let _ = app.emit("panel://visible", false);
     refresh_visual(app);
     schedule_destroy(app);
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     schedule_suspend(app);
 }
 
 /// A few seconds after collapsing (unless reopened), suspend the parked panel page.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn schedule_suspend(app: &AppHandle) {
+    schedule_suspend_after(app, 4);
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn schedule_suspend_after(app: &AppHandle, secs: u64) {
     let gen = app.state::<DockState>().panel_gen.load(Ordering::SeqCst);
     let a = app.clone();
-    crate::timers::after(Duration::from_secs(4), move || {
+    crate::timers::after(Duration::from_secs(secs), move || {
         let a2 = a.clone();
         let _ = a.run_on_main_thread(move || {
             let st = a2.state::<DockState>();
@@ -754,7 +805,19 @@ pub fn on_incoming(app: &AppHandle, m: &lancat_core::Message) {
             native_dock::ToastSpec { peer_id: peer.id.clone(), name: peer.name.clone(), text, edge: current_edge(app), strip: geo.dock, scale: geo.scale, dark, hold_ms },
         );
     }
-    #[cfg(not(windows))]
+    // Linux: the same strip-inflating pill as Windows (native_dock/linux_toast.rs)
+    #[cfg(target_os = "linux")]
+    {
+        let Some(geo) = *app.state::<DockState>().geo.lock().unwrap() else { return skip("no dock geometry yet") };
+        log::info!("message toast: {} from {} ({})", m.kind, peer.name, m.peer_id);
+        let dark = native_dock::theme_is_dark(&core.settings().theme);
+        let hold_ms = 4000 + (text.chars().count() as u32 * 60).min(3000);
+        native_dock::toast_show(
+            app,
+            native_dock::ToastSpec { peer_id: peer.id.clone(), name: peer.name.clone(), text, edge: current_edge(app), strip: geo.dock, origin: geo.origin, scale: geo.scale, dark, hold_ms },
+        );
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     let _ = text;
 }
 
@@ -795,7 +858,7 @@ pub fn is_moving() -> bool {
 
 /// The left button went down on the strip (`from_strip`) or the panel header.
 pub fn begin_move(app: &AppHandle, from_strip: bool) {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     native_dock::toast_dismiss();
     match app.cursor_position() {
         Ok(c) => {
@@ -887,7 +950,40 @@ fn move_tick(app: &AppHandle, x: f64, y: f64, scale: f64) -> bool {
     true
 }
 
+/// Wayland (layer-shell) has no global cursor position. Whether the pointer is over the panel or
+/// the strip comes from GDK's pointer focus instead, as a backstop for the panel's enter/leave
+/// events: WebKitGTK on a layer surface sometimes delivers no leave at all, and the panel then
+/// stayed open until clicked away.
+#[cfg(target_os = "linux")]
+fn wayland_tick(app: &AppHandle) {
+    static OUTSIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let st = app.state::<DockState>();
+    if !st.visible.load(Ordering::SeqCst) || st.pinned.load(Ordering::SeqCst) {
+        OUTSIDE.store(0, Ordering::SeqCst);
+        return;
+    }
+    let a = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let Some(inside) = platform::pointer_in_app() else { return };
+        if inside {
+            OUTSIDE.store(0, Ordering::SeqCst);
+        } else if OUTSIDE.fetch_add(1, Ordering::SeqCst) < 1 {
+            // two readings in a row (~160 ms): crossing from the panel to the strip is not leaving
+            return;
+        }
+        let last = *a.state::<DockState>().last_inside.lock().unwrap();
+        if last != Some(inside) {
+            log::debug!("pointer {} (GDK pointer focus)", if inside { "back inside" } else { "left the panel" });
+            emit_cursor(&a, inside);
+        }
+    });
+}
+
 fn tick(app: &AppHandle) {
+    #[cfg(target_os = "linux")]
+    if platform::use_layer_shell() {
+        return wayland_tick(app);
+    }
     let Ok(cur) = app.cursor_position() else { return }; // e.g. Wayland: rely on webview events
     {
         let scale = app.state::<DockState>().geo.lock().unwrap().map(|g| g.scale).unwrap_or(1.0);
@@ -940,7 +1036,7 @@ fn tick(app: &AppHandle) {
         }
         // The message toast stands in for the strip (same place): resting on it must not
         // hover-open the panel behind the user's back; a click on the toast opens it.
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         if native_dock::toast_shown() {
             *st.hover_since.lock().unwrap() = None;
             return;
@@ -1105,4 +1201,38 @@ pub fn list_monitors(app: AppHandle) -> Vec<MonitorInfo> {
         out.push(MonitorInfo { index: out.len(), name: m.name().cloned().unwrap_or_else(|| format!("显示器 {}", out.len() + 1)), width: m.size().width, height: m.size().height, primary: false });
     }
     out
+}
+
+/// Resident panel: release the parked webview only when Windows reports low physical memory
+/// (the next hover or open re-creates it). One thread, blocked on the notification handle
+/// (Linux: polls /proc for memory pressure).
+#[cfg(any(windows, target_os = "linux"))]
+fn spawn_low_memory_watch(app: AppHandle) {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("lancat-lowmem".into()).spawn(move || loop {
+        platform::wait_low_memory();
+        let a = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            let st = a.state::<DockState>();
+            if st.visible.load(Ordering::SeqCst) || st.hovering.load(Ordering::SeqCst) || PANEL_CREATING.load(Ordering::SeqCst) {
+                return;
+            }
+            if let Some(p) = a.get_webview_window("panel") {
+                log::info!("system memory is low: releasing the parked panel webview");
+                #[cfg(target_os = "linux")]
+                platform::panel_resume(&p);
+                let _ = p.destroy();
+                #[cfg(target_os = "linux")]
+                crate::timers::after(Duration::from_secs(2), || {
+                    platform::reap_web_helpers();
+                    platform::trim_heap();
+                });
+            }
+        });
+        // the notification stays signalled while memory is low; look again later
+        std::thread::sleep(Duration::from_secs(300));
+    });
 }

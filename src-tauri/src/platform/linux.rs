@@ -116,6 +116,16 @@ pub fn place_layer(win: &WebviewWindow, x: f64, y: f64, w: f64, h: f64) -> bool 
     false
 }
 
+/// Whether the pointer is over one of our surfaces (panel or strip). On Wayland GDK only knows the
+/// pointer while it is over one of ours, which is exactly the question. Main thread.
+pub fn pointer_in_app() -> Option<bool> {
+    use gtk::gdk::prelude::*;
+    let seat = gtk::gdk::Display::default()?.default_seat()?;
+    let ptr = seat.pointer()?;
+    let (w, _, _) = ptr.window_at_position();
+    Some(w.is_some())
+}
+
 /// GTK delivers drag events to the dock webview itself; the poller does not need button state.
 pub fn left_button_down() -> bool {
     false
@@ -299,8 +309,152 @@ fn mesa_only_vendor() -> Option<String> {
 /// even with no web views (tauri keeps the WebContext alive on Linux for that reason, see
 /// tauri-apps/tauri#14626); WebKit launches a new one on the next page load, exactly as it does
 /// after a network-process crash. `LANCAT_KEEP_NETWORK_PROCESS=1` disables this.
+// ------------------------------------------------------------------ frozen panel
+//
+// Linux counterpart of WebView2's TrySuspend + EmptyWorkingSet: a few seconds after the panel
+// collapses its WebKit web process is stopped (SIGSTOP: no timers, no GC, 0 CPU) and, when the
+// app has a cgroup of its own, the kernel is asked to page out about as much as that renderer
+// holds (cgroup v2 memory.reclaim; the stopped renderer's pages are the coldest there). Opening
+// or hovering the strip continues it (SIGCONT) before the panel is shown. Events sent to the
+// page meanwhile are queued by the UI process and delivered on resume. LANCAT_FREEZE=0 disables.
+
+static FROZEN: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+    fn getpid() -> i32;
+}
+const SIGCONT: i32 = 18;
+const SIGSTOP: i32 = 19;
+
+fn ppid_comm(pid: i32) -> Option<(i32, String)> {
+    let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (l, r) = (s.find('(')?, s.rfind(')')?);
+    let ppid = s.get(r + 2..)?.split_whitespace().nth(1)?.parse().ok()?;
+    Some((ppid, s[l + 1..r].to_string()))
+}
+
+fn rss_kb(pid: i32) -> u64 {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:")).and_then(|l| l.split_whitespace().nth(1)?.parse().ok()))
+        .unwrap_or(0)
+}
+
+/// Our WebKit renderers (direct children named WebKitWebProcess; not the network process).
+fn web_processes() -> Vec<i32> {
+    let me = unsafe { getpid() };
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|&p| matches!(ppid_comm(p), Some((pp, c)) if pp == me && c.starts_with("WebKitWebProc")))
+        .collect()
+}
+
+pub fn panel_suspend(win: &WebviewWindow) {
+    use tauri::Manager;
+    if std::env::var("LANCAT_FREEZE").as_deref() == Ok("0") {
+        return;
+    }
+    // the settings window has a renderer of its own, which must keep running: while it is open
+    // the collapsed panel is only hidden
+    if win.app_handle().get_webview_window("settings").is_some() {
+        log::debug!("panel not frozen: settings window open");
+        return;
+    }
+    let mut frozen = FROZEN.lock().unwrap();
+    if !frozen.is_empty() {
+        return;
+    }
+    let pids = web_processes();
+    if pids.is_empty() {
+        return;
+    }
+    for &p in &pids {
+        // SAFETY: plain syscall on our own child
+        unsafe { kill(p, SIGSTOP) };
+    }
+    let kb: u64 = pids.iter().map(|&p| rss_kb(p)).sum();
+    *frozen = pids.clone();
+    drop(frozen);
+    log::info!("panel web process frozen ({pids:?}, {} MB resident)", kb >> 10);
+    let _ = std::thread::Builder::new().name("lancat-reclaim".into()).spawn(move || reclaim(kb * 1024 * 3 / 4));
+}
+
+/// Pages out `bytes` of our cgroup's coldest memory, only when the cgroup holds nothing but this
+/// app (a systemd unit, or the per-app scope niri/GNOME/KDE start apps in), never a shared one.
+fn reclaim(bytes: u64) {
+    let me = unsafe { getpid() };
+    let Some(path) = std::fs::read_to_string("/proc/self/cgroup").ok().and_then(|s| s.lines().find_map(|l| l.strip_prefix("0::").map(str::to_string))) else { return };
+    let dir = format!("/sys/fs/cgroup{path}");
+    let procs = std::fs::read_to_string(format!("{dir}/cgroup.procs")).unwrap_or_default();
+    let ours = |p: i32| p == me || ppid_comm(p).is_some_and(|(pp, _)| pp == me);
+    if procs.is_empty() || !procs.lines().filter_map(|l| l.trim().parse::<i32>().ok()).all(ours) {
+        log::debug!("not reclaiming: cgroup {path} is shared with other processes");
+        return;
+    }
+    let cur = || std::fs::read_to_string(format!("{dir}/memory.current")).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+    let before = cur();
+    // EAGAIN = reclaimed less than asked, which is fine
+    let r = std::fs::write(format!("{dir}/memory.reclaim"), bytes.to_string());
+    let after = cur();
+    match r {
+        Err(e) if e.raw_os_error() != Some(11) => log::debug!("memory.reclaim unavailable: {e}"),
+        _ => log::info!("paged out {} MB of the frozen panel (cgroup {} → {} MB)", before.saturating_sub(after) >> 20, before >> 20, after >> 20),
+    }
+}
+
+pub fn panel_resume(_win: &WebviewWindow) {
+    if thaw_all() {
+        log::debug!("panel web process resumed");
+    }
+}
+
+/// Continues every renderer we stopped; true if there was one.
+pub fn thaw_all() -> bool {
+    let pids = std::mem::take(&mut *FROZEN.lock().unwrap());
+    for &p in &pids {
+        // SAFETY: plain syscall
+        unsafe { kill(p, SIGCONT) };
+    }
+    !pids.is_empty()
+}
+
+/// Hover on the strip: continue the renderer during the hover delay, before the open.
+pub fn panel_prewarm(win: &WebviewWindow) {
+    panel_resume(win);
+}
+
+/// Blocks until the system is short of memory: MemAvailable under 6 % of RAM, or the kernel's
+/// pressure stall (PSI "some" avg10) above 25 %. Polled every 15 s; returns at once while low.
+pub fn wait_low_memory() {
+    fn low() -> bool {
+        let mi = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+        let kb = |k: &str| mi.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<f64>().ok());
+        if let (Some(t), Some(a)) = (kb("MemTotal:"), kb("MemAvailable:")) {
+            if t > 0.0 && a / t < 0.06 {
+                return true;
+            }
+        }
+        let psi = std::fs::read_to_string("/proc/pressure/memory").unwrap_or_default();
+        psi.lines()
+            .find(|l| l.starts_with("some"))
+            .and_then(|l| l.split_whitespace().find_map(|f| f.strip_prefix("avg10=")))
+            .and_then(|v| v.parse::<f64>().ok())
+            .is_some_and(|v| v > 25.0)
+    }
+    while !low() {
+        std::thread::sleep(std::time::Duration::from_secs(15));
+    }
+}
+
+/// Opt-in only (LANCAT_REAP_NETWORK=1): WebKitGTK does not bring a terminated network process
+/// back for the web context, so the next panel webview never loaded its page and the panel could
+/// not be opened any more (seen 2026-10-12 after a low-memory release).
 pub fn reap_web_helpers() {
-    if std::env::var_os("LANCAT_KEEP_NETWORK_PROCESS").is_some() {
+    if std::env::var_os("LANCAT_REAP_NETWORK").is_none() {
         return;
     }
     let me = std::process::id();
@@ -331,6 +485,3 @@ pub fn reap_web_helpers() {
     }
 }
 
-extern "C" {
-    fn kill(pid: i32, sig: i32) -> i32;
-}

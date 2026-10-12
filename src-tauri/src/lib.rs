@@ -251,6 +251,9 @@ pub fn run() {
             tauri::RunEvent::ExitRequested { api, code: None, .. } => api.prevent_exit(),
             // any real exit says goodbye so peers mark us offline at once (idempotent)
             tauri::RunEvent::Exit => {
+                // a frozen (SIGSTOPped) panel renderer must be able to notice we are gone and exit
+                #[cfg(target_os = "linux")]
+                platform::thaw_all();
                 if let Some(core) = app.try_state::<Core>() {
                     core.0.shutdown();
                 }

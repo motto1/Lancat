@@ -45,6 +45,10 @@ pub(crate) fn hover_delay(app: &AppHandle) -> u64 {
 mod linux;
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub use self::linux::{create, place, set_visual, show};
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+mod linux_toast;
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub use self::linux_toast::{dismiss as toast_dismiss, show as toast_show, shown as toast_shown, theme_is_dark, ToastSpec};
 
 #[cfg(target_os = "windows")]
 mod win_drop;
