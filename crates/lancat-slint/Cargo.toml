@@ -1,0 +1,44 @@
+[package]
+name = "lancat-slint"
+version = "0.1.0"
+edition = "2021"
+authors = ["Motto"]
+license = "MIT"
+description = "Lancat 面板的 Slint 版（直接调用 lancat-core，软件渲染）"
+
+# 独立 workspace：不改根 Cargo.toml / Cargo.lock，不影响 tauri dev。
+[workspace]
+
+[dependencies]
+lancat-core = { path = "../lancat-core", default-features = false }
+slint = { version = "=1.18.1", default-features = false, features = ["std", "compat-1-2", "renderer-software", "software-renderer-systemfonts"] }
+# IME 预编辑 / 输入法候选框位置走 Slint 内部 API（WindowAdapterInternal / InternalKeyEvent），必须钉死版本
+i-slint-core = "=1.18.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+serde_json = "1"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
+dirs = "7"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# 阶段 3 之前 Linux 先用 winit 后端跑通界面；之后换成自写 SCTK layer-shell Platform
+slint = { version = "=1.18.1", default-features = false, features = ["backend-winit", "renderer-winit-software"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Input_Ime", "Win32_UI_HiDpi", "Win32_UI_Controls", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Registry"] }
+
+[build-dependencies]
+slint-build = "=1.18.1"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.fastrel]
+inherits = "release"
+lto = false
+codegen-units = 16
+opt-level = "s"

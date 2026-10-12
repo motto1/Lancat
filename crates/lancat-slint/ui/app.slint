@@ -1,0 +1,402 @@
+// Lancat 面板（Slint 版）骨架：会话列表 + 聊天页 + 输入框。
+// 视觉 token 取自 src/styles/global.css（见 docs/slint/inventory.md §5）。
+
+export struct PeerItem {
+    id: string,
+    name: string,
+    initial: string,
+    tint: color,
+    online: bool,
+    unread: int,
+}
+
+export struct MsgItem {
+    id: string,
+    outgoing: bool,
+    kind: string,      // text | emoji | file
+    text: string,
+    status: string,
+    first: bool,       // first of a group (tail corner)
+    fname: string,
+    fmeta: string,
+    progress: float,   // 0..1, <0 = no bar
+}
+
+export global Theme {
+    in-out property <bool> dark: false;
+    in-out property <bool> native-glass: true;
+    in-out property <color> accent: #0a84ff;
+    out property <color> accent-contrast: #ffffff;
+    out property <color> glass: native-glass
+        ? (dark ? rgba(30, 30, 34, 0.38) : rgba(246, 246, 248, 0.42))
+        : (dark ? rgba(36, 36, 40, 0.82) : rgba(246, 246, 248, 0.86));
+    out property <color> glass-strong: dark ? rgba(44, 44, 48, 0.94) : rgba(252, 252, 253, 0.94);
+    out property <color> glass-border: dark ? rgba(255, 255, 255, 0.12) : rgba(0, 0, 0, 0.1);
+    out property <color> sidebar: dark ? rgba(255, 255, 255, 0.04) : rgba(0, 0, 0, 0.035);
+    out property <color> text: dark ? #f5f5f7 : #1d1d1f;
+    out property <color> text-2: dark ? rgba(235, 235, 245, 0.68) : rgba(60, 60, 67, 0.72);
+    out property <color> text-3: dark ? rgba(235, 235, 245, 0.38) : rgba(60, 60, 67, 0.45);
+    out property <color> sep: dark ? rgba(255, 255, 255, 0.09) : rgba(0, 0, 0, 0.08);
+    out property <color> bubble-in: dark ? rgba(255, 255, 255, 0.1) : rgba(0, 0, 0, 0.06);
+    out property <color> hover: dark ? rgba(255, 255, 255, 0.07) : rgba(0, 0, 0, 0.05);
+    out property <color> field: dark ? rgba(255, 255, 255, 0.07) : rgba(255, 255, 255, 0.7);
+    out property <color> rim-top: dark ? rgba(255, 255, 255, 0.22) : rgba(255, 255, 255, 0.85);
+    out property <color> online: #30d158;
+    out property <color> danger: #ff3b30;
+    out property <duration> dur-fast: 120ms;
+    out property <duration> dur: 160ms;
+    out property <duration> dur-slow: 220ms;
+}
+
+component Avatar inherits Rectangle {
+    in property <PeerItem> peer;
+    in property <bool> active;
+    in property <bool> all;
+    width: 38px;
+    height: 38px;
+    border-radius: 19px;
+    background: all ? (active ? Theme.accent : Theme.hover) : peer.tint;
+    opacity: (all || peer.online) ? 1 : 0.45;
+    Text {
+        text: all ? "全" : peer.initial;
+        color: all ? (active ? Theme.accent-contrast : Theme.text-2) : #ffffff;
+        font-size: 13px;
+        font-weight: 600;
+    }
+}
+
+component SidebarItem inherits Rectangle {
+    in property <PeerItem> peer;
+    in property <bool> active;
+    in property <bool> all;
+    callback clicked();
+    height: 62px;
+    border-radius: 10px;
+    background: ta.has-hover ? Theme.hover : transparent;
+    animate background { duration: Theme.dur-fast; }
+    ta := TouchArea { clicked => { root.clicked(); } }
+    VerticalLayout {
+        alignment: center;
+        spacing: 3px;
+        HorizontalLayout {
+            alignment: center;
+            ring := Rectangle {
+                width: 46px;
+                height: 46px;
+                border-radius: 23px;
+                border-width: active ? 2px : 0px;
+                border-color: Theme.accent;
+                av := Avatar {
+                    peer: root.peer;
+                    active: root.active;
+                    all: root.all;
+                    transform-scale: ta.pressed ? 0.94 : (ta.has-hover ? 1.05 : 1.0);
+                    animate transform-scale { duration: Theme.dur; easing: cubic-bezier(0.2, 0.9, 0.3, 1.4); }
+                }
+                if !root.all && root.peer.online: Rectangle {
+                    x: parent.width - 14px;
+                    y: parent.height - 14px;
+                    width: 11px;
+                    height: 11px;
+                    border-radius: 5.5px;
+                    background: Theme.online;
+                    border-width: 2px;
+                    border-color: Theme.glass-strong;
+                }
+                if !root.all && root.peer.unread > 0: Rectangle {
+                    x: parent.width - 18px;
+                    y: 0px;
+                    min-width: 17px;
+                    height: 17px;
+                    border-radius: 8.5px;
+                    background: Theme.danger;
+                    border-width: 1.5px;
+                    border-color: Theme.glass-strong;
+                    HorizontalLayout {
+                        padding-left: 4px;
+                        padding-right: 4px;
+                        Text {
+                            text: root.peer.unread > 99 ? "99+" : root.peer.unread;
+                            color: #ffffff;
+                            font-size: 10px;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+        Text {
+            text: root.all ? "全部" : root.peer.name;
+            font-size: 10px;
+            color: root.active ? Theme.text : Theme.text-2;
+            font-weight: root.active ? 500 : 400;
+            horizontal-alignment: center;
+            overflow: elide;
+            max-width: 58px;
+        }
+    }
+}
+
+component IconButton inherits Rectangle {
+    in property <string> glyph;
+    in property <bool> spin;
+    callback clicked();
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
+    background: ta.has-hover ? Theme.hover : transparent;
+    animate background { duration: Theme.dur-fast; }
+    ta := TouchArea { clicked => { root.clicked(); } }
+    Text {
+        text: root.glyph;
+        font-size: 15px;
+        color: root.spin ? Theme.accent : Theme.text-2;
+    }
+}
+
+component Bubble inherits Rectangle {
+    in property <MsgItem> m;
+    in property <length> avail;
+    // the row
+    height: body.preferred-height + (m.first ? 8px : 2px);
+    body := Rectangle {
+        y: m.first ? 8px : 2px;
+        x: m.outgoing ? parent.width - self.width : 0px;
+        width: min(lay.preferred-width, root.avail * 0.78);
+        height: lay.preferred-height;
+        border-radius: 16px;
+        border-bottom-left-radius: (m.first && !m.outgoing) ? 5px : 16px;
+        border-bottom-right-radius: (m.first && m.outgoing) ? 5px : 16px;
+        background: m.kind == "file"
+            ? (m.outgoing ? Theme.accent.with-alpha(0.14) : Theme.bubble-in)
+            : (m.outgoing ? Theme.accent : Theme.bubble-in);
+        lay := VerticalLayout {
+            padding-left: 10px;
+            padding-right: 10px;
+            padding-top: 6px;
+            padding-bottom: 6px;
+            spacing: 3px;
+            if m.kind != "file": Text {
+                text: m.text;
+                wrap: word-wrap;
+                font-size: m.kind == "emoji" ? 34px : 13px;
+                color: m.outgoing && m.kind != "emoji" ? Theme.accent-contrast : Theme.text;
+            }
+            if m.kind == "file": VerticalLayout {
+                spacing: 2px;
+                Text { text: "📄 " + m.fname; font-size: 12.5px; font-weight: 500; color: Theme.text; overflow: elide; }
+                Text { text: m.fmeta; font-size: 10.5px; color: m.status == "failed" ? Theme.danger : Theme.text-2; }
+                if m.progress >= 0: Rectangle {
+                    height: 4px;
+                    border-radius: 2px;
+                    background: Theme.sep;
+                    Rectangle {
+                        x: 0;
+                        width: parent.width * clamp(m.progress, 0, 1);
+                        border-radius: 2px;
+                        background: Theme.accent;
+                        animate width { duration: 200ms; }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component PanelWindow inherits Window {
+    title: "Lancat";
+    no-frame: true;
+    always-on-top: true;
+    background: transparent;
+    width: 360px;
+    height: 520px;
+    default-font-size: 13px;
+    default-font-family: "Segoe UI Variable Text";
+
+    in property <[PeerItem]> peers;
+    in property <[MsgItem]> messages;
+    in property <string> selected-id;   // "" = 全部
+    in property <string> header-title: "Lancat";
+    in property <string> subtitle;
+    in property <bool> subtitle-accent;
+    in property <bool> refreshing;
+    in property <string> toast;
+    in-out property <string> draft;
+
+    callback select-peer(string);
+    callback send-text(string);
+    callback typing();
+    callback refresh();
+    callback open-settings();
+    callback escape();
+
+    // glass tint (the native Acrylic behind it is the blur), 8px DWM corner
+    Rectangle {
+        background: Theme.glass;
+        border-radius: 8px;
+    }
+    // specular rim on top (Windows glass cue)
+    Rectangle {
+        y: 0;
+        height: 1px;
+        x: 8px;
+        width: parent.width - 16px;
+        background: Theme.rim-top;
+    }
+
+    HorizontalLayout {
+        // sidebar
+        Rectangle {
+            width: 66px;
+            background: Theme.sidebar;
+            Rectangle { x: parent.width - 0.5px; width: 0.5px; background: Theme.sep; }
+            Flickable {
+                content-height: col.preferred-height;
+                col := VerticalLayout {
+                    padding-top: 8px;
+                    padding-bottom: 8px;
+                    padding-left: 4px;
+                    padding-right: 4px;
+                    spacing: 0px;
+                    SidebarItem {
+                        all: true;
+                        active: root.selected-id == "";
+                        clicked => { root.select-peer(""); }
+                    }
+                    Rectangle { height: 11px; Rectangle { height: 0.5px; x: 10px; width: parent.width - 20px; background: Theme.sep; } }
+                    for p in root.peers: SidebarItem {
+                        peer: p;
+                        active: root.selected-id == p.id;
+                        clicked => { root.select-peer(p.id); }
+                    }
+                }
+            }
+        }
+        // main column
+        VerticalLayout {
+            // header
+            Rectangle {
+                height: 46px;
+                HorizontalLayout {
+                    padding-left: 14px;
+                    padding-right: 10px;
+                    spacing: 4px;
+                    VerticalLayout {
+                        alignment: center;
+                        Text { text: root.header-title; font-size: 13px; font-weight: 600; color: Theme.text; overflow: elide; }
+                        if root.subtitle != "": Text { text: root.subtitle; font-size: 11px; color: root.subtitle-accent ? Theme.accent : Theme.text-2; overflow: elide; }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        IconButton { glyph: "⟳"; spin: root.refreshing; clicked => { root.refresh(); } }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        IconButton { glyph: "⚙"; clicked => { root.open-settings(); } }
+                    }
+                }
+                Rectangle { y: parent.height - 0.5px; height: 0.5px; background: Theme.sep; }
+            }
+            // conversation
+            list := Flickable {
+                vertical-stretch: 1;
+                content-height: msgcol.preferred-height;
+                msgcol := VerticalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    padding-top: 4px;
+                    padding-bottom: 6px;
+                    alignment: end;
+                    min-height: list.height;
+                    for m in root.messages: Bubble { m: m; avail: list.width - 20px; }
+                }
+            }
+            // composer
+            Rectangle {
+                Rectangle { y: 0; height: 0.5px; background: Theme.sep; }
+                HorizontalLayout {
+                    padding-left: 6px;
+                    padding-right: 8px;
+                    padding-top: 8px;
+                    padding-bottom: 9px;
+                    spacing: 2px;
+                    alignment: stretch;
+                    VerticalLayout { alignment: end; IconButton { glyph: "+"; } }
+                    VerticalLayout { alignment: end; IconButton { glyph: "☺"; } }
+                    field := Rectangle {
+                        horizontal-stretch: 1;
+                        height: max(30px, min(96px, input.preferred-height + 12px));
+                        border-radius: 15px;
+                        background: Theme.field;
+                        border-width: 0.5px;
+                        border-color: input.has-focus ? Theme.accent.with-alpha(0.6) : Theme.glass-border;
+                        keys := FocusScope {
+                            capture-key-pressed(event) => {
+                                if event.text == Key.Return && !event.modifiers.shift {
+                                    if root.draft != "" { root.send-text(root.draft); root.draft = ""; }
+                                    return accept;
+                                }
+                                if event.text == Key.Escape { root.escape(); return accept; }
+                                reject
+                            }
+                            input := TextInput {
+                                x: 11px;
+                                y: 6px;
+                                width: parent.width - 22px;
+                                single-line: false;
+                                wrap: word-wrap;
+                                font-size: 13px;
+                                color: Theme.text;
+                                selection-background-color: Theme.accent.with-alpha(0.35);
+                                text <=> root.draft;
+                                edited => { root.typing(); }
+                            }
+                        }
+                        if root.draft == "" && !input.has-focus: Text {
+                            x: 11px;
+                            text: "发消息…";
+                            color: Theme.text-3;
+                            font-size: 13px;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: end;
+                        send := Rectangle {
+                            width: 30px;
+                            height: 30px;
+                            border-radius: 15px;
+                            background: Theme.accent;
+                            opacity: root.draft != "" ? 1 : 0.35;
+                            transform-scale: root.draft != "" ? (sta.pressed ? 0.9 : 1.0) : 0.88;
+                            animate opacity { duration: Theme.dur; }
+                            animate transform-scale { duration: Theme.dur-slow; easing: cubic-bezier(0.2, 0.9, 0.3, 1.4); }
+                            Text { text: "↑"; color: Theme.accent-contrast; font-size: 15px; font-weight: 700; }
+                            sta := TouchArea {
+                                clicked => { if root.draft != "" { root.send-text(root.draft); root.draft = ""; } }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.toast != "": Rectangle {
+        y: parent.height - 70px;
+        x: (parent.width - self.width) / 2;
+        width: min(tt.preferred-width + 24px, parent.width * 0.8);
+        height: 30px;
+        border-radius: 10px;
+        background: rgba(0, 0, 0, 0.42);
+        tt := Text { text: root.toast; color: #ffffff; font-size: 12px; }
+    }
+
+    public function scroll-to-end() {
+        list.content-y = min(0px, list.height - list.content-height);
+    }
+    public function focus-input() {
+        input.focus();
+    }
+}
