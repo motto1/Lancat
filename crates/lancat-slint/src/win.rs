@@ -687,6 +687,7 @@ pub fn theme_is_dark(theme: &str) -> bool {
 /// System accent colour (DWM ColorizationColor is 0xAARRGGBB; AccentColor in Explorer\Accent is ABGR).
 pub fn accent_color() -> Option<slint::Color> {
     let v = reg_dword(w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Accent"), w!("AccentColorMenu"))?;
+    log::info!("system accent AccentColorMenu=0x{v:08x}");
     Some(slint::Color::from_rgb_u8(v as u8, (v >> 8) as u8, (v >> 16) as u8))
 }
 

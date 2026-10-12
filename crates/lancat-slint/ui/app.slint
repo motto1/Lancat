@@ -104,7 +104,7 @@ component SidebarItem inherits Rectangle {
                     border-color: Theme.glass-strong;
                 }
                 if !root.all && root.peer.unread > 0: Rectangle {
-                    x: parent.width - 18px;
+                    x: parent.width - self.width + 2px;
                     y: 0px;
                     min-width: 17px;
                     height: 17px;

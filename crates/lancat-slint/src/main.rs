@@ -39,6 +39,8 @@ struct App {
     selected: String,
     typing: std::collections::HashMap<String, bool>,
     last_typing_sent: Option<Instant>,
+    /// nothing was online at start: open the first peer that comes online
+    auto_select: bool,
 }
 
 thread_local! {
@@ -196,11 +198,19 @@ impl App {
     fn on_core(&mut self, ev: CoreEvent) {
         match ev {
             CoreEvent::Peer { peer } => {
+                let online = peer.online && !peer.blocked;
+                let id = peer.id.clone();
                 match self.peers.iter_mut().find(|p| p.id == peer.id) {
                     Some(p) => *p = peer,
                     None => self.peers.push(peer),
                 }
                 self.rebuild_peers();
+                if self.auto_select && online && self.selected.is_empty() {
+                    self.auto_select = false;
+                    self.selected = id;
+                    self.update_header();
+                    self.load_messages();
+                }
             }
             CoreEvent::PeerRemoved { peer_id } => {
                 self.peers.retain(|p| p.id != peer_id);
@@ -225,7 +235,8 @@ impl App {
             CoreEvent::HistoryCleared { .. } => self.load_messages(),
             CoreEvent::Settings { settings } => {
                 if let Some(ui) = self.ui() {
-                    let dark = theme_is_dark(&settings.theme);
+                    // LANCAT_SLINT_THEME=light|dark：测试用，覆盖设置里的主题
+    let dark = theme_is_dark(&env("LANCAT_SLINT_THEME").unwrap_or(settings.theme.clone()));
                     ui.global::<Theme>().set_dark(dark);
                     #[cfg(windows)]
                     win::refresh_material(&ui, dark);
@@ -321,8 +332,12 @@ fn main() {
 
     let ui = PanelWindow::new().expect("create panel");
     let settings = node.settings();
-    let dark = theme_is_dark(&settings.theme);
+    // LANCAT_SLINT_THEME=light|dark：测试用，覆盖设置里的主题
+    let dark = theme_is_dark(&env("LANCAT_SLINT_THEME").unwrap_or(settings.theme.clone()));
     ui.global::<Theme>().set_dark(dark);
+    // the Acrylic tint (also the opaque fallback with transparency effects off) follows the app theme
+    #[cfg(windows)]
+    win::refresh_material(&ui, dark);
     #[cfg(windows)]
     if let Some(c) = win::accent_color() {
         ui.global::<Theme>().set_accent(c);
@@ -344,11 +359,13 @@ fn main() {
         selected: String::new(),
         typing: Default::default(),
         last_typing_sent: None,
+        auto_select: true,
     };
     // first online peer is the default conversation
     app.rebuild_peers();
     if let Some(p) = app.peers.iter().find(|p| p.online && !p.blocked) {
         app.selected = p.id.clone();
+        app.auto_select = false;
     }
     app.update_header();
     app.load_messages();
