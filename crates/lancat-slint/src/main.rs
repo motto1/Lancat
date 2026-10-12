@@ -422,10 +422,7 @@ fn main() {
     // the Acrylic tint (also the opaque fallback with transparency effects off) follows the app theme
     #[cfg(windows)]
     win::refresh_material(&ui, dark);
-    #[cfg(windows)]
-    if let Some(c) = win::accent_color() {
-        ui.global::<Theme>().set_accent(c);
-    }
+    // accent 固定 #0a84ff（与旧版相同，不跟系统强调色；app.slint 的默认值）
 
     let peer_model = Rc::new(VecModel::<PeerItem>::default());
     let msg_model = Rc::new(VecModel::<MsgItem>::default());

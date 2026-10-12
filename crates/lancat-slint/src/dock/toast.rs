@@ -783,7 +783,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 s.spec = None;
                                 s.hovering = false;
                                 s.glass = None; // window-sized backdrop copy: free it
+                                // Direct2D / DirectWrite（工厂、DC 渲染目标、字体缓存）只在 toast 显示时用：
+                                // 收回后整套释放并修剪工作集，收起空闲时 WS 回到 ~21 MB（不释放时常驻 ~56 MB）。
+                                // 下次 show() 会重新 create_gfx()（与设备丢失后的重建是同一条路径）。
+                                s.gfx = None;
+                                s.name = None;
+                                s.text = None;
+                                s.initial = None;
                                 SHOWN.store(false, Ordering::SeqCst);
+                                crate::win::trim_working_set();
                                 super::strip::set_hidden(false);
                             }
                         }

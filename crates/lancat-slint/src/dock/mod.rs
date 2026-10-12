@@ -15,6 +15,7 @@
 pub mod drop;
 pub mod strip;
 pub mod toast;
+pub mod tray;
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -276,6 +277,7 @@ pub fn init(node: Arc<Node>, hooks: Hooks) {
         drop::register_panel(h);
     }
     ipc_window();
+    tray::create();
     apply_layout();
     strip::show();
     schedule_poll(POLL_FAR_MS);
@@ -300,12 +302,14 @@ pub fn apply_layout() {
 
 pub fn refresh_visual() {
     let Some(v) = with(|d| {
-        let unread = d.node.peers().iter().any(|p| !p.blocked && p.unread > 0);
+        let n: i64 = d.node.peers().iter().filter(|p| !p.blocked).map(|p| p.unread as i64).sum();
         let dark = crate::theme_is_dark(&d.node.settings().theme);
-        DockVisual { edge: current_edge(d), unread, open: d.visible, dark, ..Default::default() }
+        (DockVisual { edge: current_edge(d), unread: n > 0, open: d.visible, dark, ..Default::default() }, n)
     }) else {
         return;
     };
+    let (v, n) = v;
+    tray::set_unread(n);
     strip::set_visual(v);
 }
 
@@ -335,9 +339,16 @@ pub fn note_typed() {
     with(|d| d.last_typed = Some(Instant::now()));
 }
 
-#[allow(dead_code)] // 固定按钮（阶段 4）用
 pub fn set_pinned(p: bool) {
-    with(|d| d.pinned = p);
+    with(|d| {
+        d.pinned = p;
+        // 取消钉住时光标已在外面：从现在起重新计时收起
+        d.leave_since = None;
+    });
+}
+
+pub fn pinned() -> bool {
+    with(|d| d.pinned).unwrap_or(false)
 }
 
 pub fn open_panel(reason: &str) {
@@ -410,7 +421,6 @@ pub fn hide_panel() {
     refresh_visual();
 }
 
-#[allow(dead_code)] // 托盘（下一步）用
 pub fn toggle_panel() {
     if is_visible() {
         hide_panel();
