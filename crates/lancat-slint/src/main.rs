@@ -11,6 +11,8 @@ slint::include_modules!();
 
 #[cfg(windows)]
 mod dock;
+#[cfg(target_os = "linux")]
+mod wl;
 #[cfg(windows)]
 mod win;
 
@@ -399,6 +401,14 @@ fn main() {
 
     #[cfg(windows)]
     slint::platform::set_platform(Box::new(win::Win32Platform::new())).expect("set platform");
+    // 阶段 3 spike：LANCAT_SLINT_WL=1 用自写的 SCTK layer-shell 后端（默认仍是 winit）
+    #[cfg(target_os = "linux")]
+    if env("LANCAT_SLINT_WL").as_deref() == Some("1") {
+        match wl::WlPlatform::new() {
+            Ok(p) => slint::platform::set_platform(Box::new(p)).expect("set platform"),
+            Err(e) => log::warn!("wayland layer-shell backend unavailable ({e}); using winit"),
+        }
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().thread_name("lancat-core").build().expect("tokio");
     let mut cfg = NodeConfig::new(data_dir()).with_env();
