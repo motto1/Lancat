@@ -158,7 +158,7 @@ pub fn set_unread(n: i64) {
     }
 }
 
-fn test_instance() -> bool {
+pub fn test_instance() -> bool {
     std::env::var_os("LANCAT_DATA_DIR").is_some()
 }
 
@@ -178,7 +178,7 @@ pub fn autostart_enabled() -> bool {
     !r.is_ok() || size == 0 || buf[0] % 2 == 0
 }
 
-fn set_autostart(on: bool) {
+pub fn set_autostart(on: bool) {
     if test_instance() {
         return;
     }

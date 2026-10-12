@@ -1,0 +1,614 @@
+// 设置窗口（旧版 src/components/Settings.svelte + DiagSection.svelte）：480×620 普通窗口，可调大小。
+
+import { Theme, Icon, Btn } from "common.slint";
+import { Icons } from "icons.slint";
+
+export struct DevItem {
+    id: string,
+    name: string,
+    sub: string,        // "Windows · 192.168.1.20"
+    online: bool,
+    blocked: bool,
+}
+
+export struct DiagCheck {
+    id: string,
+    title: string,
+    status: string,     // ok | warn | error | unknown
+    summary: string,
+    detail: string,     // 多行（详情 + 手动办法），空 = 无展开箭头
+    fix-id: string,
+    fix-label: string,
+    fix-admin: bool,
+    fix-confirm: string,
+    result: string,     // 修复/预览结果文字
+    result-cmds: string,
+    result-ok: bool,
+    result-fail: bool,
+}
+
+component Section inherits Rectangle {
+    in property <string> title;
+    background: Theme.field;
+    border-width: 0.5px;
+    border-color: Theme.glass-border;
+    border-radius: 11px;
+    VerticalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        padding-top: 6px;
+        padding-bottom: 10px;
+        if root.title != "": Text {
+            text: root.title;
+            font-size: 11px;
+            font-weight: 600;
+            color: Theme.text-3;
+            height: 8px + 14px + 4px;
+            vertical-alignment: center;
+        }
+        @children
+    }
+}
+
+component Row inherits Rectangle {
+    in property <string> label;
+    in property <bool> last;
+    min-height: 34px;
+    HorizontalLayout {
+        spacing: 10px;
+        alignment: stretch;
+        Text { text: root.label; font-size: 12.5px; color: Theme.text; vertical-alignment: center; horizontal-stretch: 1; }
+        @children
+    }
+    if !root.last: Rectangle { y: parent.height - 0.5px; height: 0.5px; background: Theme.sep; }
+}
+
+component Field inherits Rectangle {
+    in-out property <string> text;
+    in property <string> placeholder;
+    in property <bool> mono;
+    in property <bool> multi;
+    callback edited(string);
+    callback accepted(string);
+    border-radius: 6px;
+    background: Theme.glass-strong-solid;
+    border-width: 0.5px;
+    border-color: Theme.glass-border;
+    Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-radius: 9px;
+        border-width: 3px;
+        border-color: Theme.accent.with-alpha(ti.has-focus ? 0.35 : 0);
+    }
+    ti := TextInput {
+        x: 8px;
+        y: root.multi ? 4px : 0px;
+        width: parent.width - 16px;
+        height: root.multi ? parent.height - 8px : parent.height;
+        vertical-alignment: root.multi ? top : center;
+        single-line: !root.multi;
+        wrap: root.multi ? word-wrap : no-wrap;
+        font-size: root.mono ? 11.5px : 12.5px;
+        font-family: root.mono ? "Cascadia Code" : "";
+        color: Theme.text;
+        selection-background-color: Theme.accent.with-alpha(0.35);
+        text <=> root.text;
+        edited => { root.edited(self.text); }
+        accepted => { root.accepted(self.text); }
+    }
+    if root.text == "": Text {
+        x: 8px;
+        y: root.multi ? 4px : 0px;
+        height: root.multi ? 16px : parent.height;
+        vertical-alignment: center;
+        text: root.placeholder;
+        font-size: root.mono ? 11.5px : 12.5px;
+        color: Theme.text-3;
+    }
+}
+
+component Slider inherits Rectangle {
+    in property <float> minimum;
+    in property <float> maximum: 1;
+    in property <float> step: 0.01;
+    in-out property <float> value;
+    callback changed(float);
+    width: 180px;
+    height: 20px;
+    property <float> frac: (value - minimum) / max(0.000001, maximum - minimum);
+    Rectangle {
+        y: (parent.height - 4px) / 2;
+        height: 4px;
+        border-radius: 2px;
+        background: Theme.sep;
+        Rectangle { x: 0; width: parent.width * root.frac; border-radius: 2px; background: Theme.accent; }
+    }
+    Rectangle {
+        x: (root.width - 16px) * root.frac;
+        y: (root.height - 16px) / 2;
+        width: 16px;
+        height: 16px;
+        border-radius: 8px;
+        background: Theme.accent;
+        border-width: 2px;
+        border-color: #ffffff;
+    }
+    ta := TouchArea {
+        function set(x: length) {
+            let f = clamp((x - 8px) / (root.width - 16px), 0, 1);
+            let raw = root.minimum + f * (root.maximum - root.minimum);
+            let v = clamp(round(raw / root.step) * root.step, root.minimum, root.maximum);
+            if v != root.value { root.value = v; root.changed(v); }
+        }
+        pointer-event(e) => { if e.kind == PointerEventKind.down { self.set(self.mouse-x); } }
+        moved => { if self.pressed { self.set(self.mouse-x); } }
+    }
+}
+
+component Seg inherits Rectangle {
+    in property <[{v: string, l: string}]> items;
+    in property <string> value;
+    callback pick(string);
+    height: 24px;
+    width: lay.preferred-width;
+    border-radius: 7px;
+    background: Theme.hover;
+    lay := HorizontalLayout {
+        padding: 2px;
+        spacing: 2px;
+        for it in root.items: Rectangle {
+            width: tx.preferred-width + 20px;
+            border-radius: 5px;
+            background: root.value == it.v ? (Theme.dark ? #636366 : #ffffff) : (sta.has-hover ? Theme.hover : transparent);
+            animate background { duration: Theme.dur-slow; }
+            tx := Text { text: it.l; font-size: 12px; color: Theme.text; font-weight: root.value == it.v ? 500 : 400; }
+            sta := TouchArea { clicked => { root.pick(it.v); } }
+        }
+    }
+}
+
+component Switch inherits Rectangle {
+    in property <bool> on;
+    in property <bool> enabled: true;
+    callback toggled();
+    width: 38px;
+    height: 22px;
+    border-radius: 11px;
+    background: on ? Theme.online : Theme.sep;
+    opacity: enabled ? 1 : 0.45;
+    animate background { duration: Theme.dur-slow; }
+    Rectangle {
+        x: root.on ? 18px : 2px;
+        y: 2px;
+        width: 18px;
+        height: 18px;
+        border-radius: 9px;
+        background: #ffffff;
+        animate x { duration: Theme.dur-slow; easing: cubic-bezier(0.2, 0.8, 0.3, 1); }
+    }
+    TouchArea { enabled: root.enabled; clicked => { root.toggled(); } }
+}
+
+component Note inherits Text {
+    font-size: 11px;
+    color: Theme.text-2;
+    wrap: word-wrap;
+}
+
+component Em inherits Text {
+    font-size: 11.5px;
+    color: Theme.text-2;
+    min-width: 54px;
+    vertical-alignment: center;
+}
+
+component CheckRow inherits Rectangle {
+    in property <DiagCheck> c;
+    in property <bool> busy;
+    in property <string> confirming;
+    callback fix(string, bool);
+    callback confirm(string);
+    callback cancel-confirm();
+    property <bool> open;
+    height: lay.preferred-height;
+    lay := VerticalLayout {
+        padding-top: 8px;
+        padding-bottom: 8px;
+        spacing: 6px;
+        HorizontalLayout {
+            spacing: 9px;
+            VerticalLayout {
+                padding-top: 4px;
+                alignment: start;
+                Rectangle {
+                    width: 9px;
+                    height: 9px;
+                    border-radius: 4.5px;
+                    background: root.c.status == "ok" ? Theme.online : (root.c.status == "warn" ? Theme.warn : (root.c.status == "error" ? Theme.danger : Theme.text-3));
+                }
+            }
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 1px;
+                HorizontalLayout {
+                    spacing: 6px;
+                    alignment: start;
+                    Text { text: root.c.title; font-size: 12.5px; font-weight: 500; color: Theme.text; }
+                    Rectangle {
+                        width: bt.preferred-width + 10px;
+                        height: 16px;
+                        border-radius: 4px;
+                        property <color> bcol: root.c.status == "ok" ? Theme.online : (root.c.status == "warn" ? Theme.warn : (root.c.status == "error" ? Theme.danger : Theme.text-3));
+                        background: bcol.with-alpha(0.15);
+                        bt := Text {
+                            text: root.c.status == "ok" ? "正常" : (root.c.status == "warn" ? "注意" : (root.c.status == "error" ? "有问题" : "未知"));
+                            font-size: 10px;
+                            font-weight: 600;
+                            color: parent.bcol;
+                        }
+                    }
+                }
+                Text { text: root.c.summary; font-size: 11.5px; color: Theme.text-2; wrap: word-wrap; }
+            }
+            if root.c.detail != "": VerticalLayout {
+                alignment: start;
+                Rectangle {
+                    width: 22px;
+                    height: 22px;
+                    border-radius: 6px;
+                    background: mta.has-hover ? Theme.hover : transparent;
+                    Icon { d: root.open ? "M6 9l6 6 6-6" : "M9 6l6 6-6 6"; size: 12px; sw: 2.2; color: Theme.text-2; }
+                    mta := TouchArea { clicked => { root.open = !root.open; } }
+                }
+            }
+        }
+        if root.open && root.c.detail != "": Rectangle {
+            height: dt.preferred-height + 12px;
+            border-radius: 7px;
+            background: Theme.hover;
+            dt := Text {
+                x: 9px;
+                width: parent.width - 18px;
+                text: root.c.detail;
+                font-size: 11px;
+                color: Theme.text-2;
+                wrap: word-wrap;
+            }
+        }
+        if root.c.fix-id != "" && root.confirming == root.c.fix-id: Rectangle {
+            height: cl.preferred-height;
+            border-radius: 8px;
+            background: Theme.warn.with-alpha(0.12);
+            cl := VerticalLayout {
+                padding: 9px;
+                spacing: 8px;
+                Text { text: root.c.fix-confirm; font-size: 11.5px; color: Theme.text; wrap: word-wrap; }
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: 6px;
+                    Btn { text: "取消"; clicked => { root.cancel-confirm(); } }
+                    Btn { text: "确定修改"; primary: true; clicked => { root.fix(root.c.fix-id, false); } }
+                }
+            }
+        }
+        if root.c.fix-id != "" && root.confirming != root.c.fix-id: HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            padding-left: 18px;
+            Btn {
+                text: root.c.fix-label;
+                icon: root.c.fix-admin ? "M12 3 5 6v5c0 4.5 3 8.3 7 10 4-1.7 7-5.5 7-10V6z" : "";
+                primary: root.c.status == "error" || root.c.status == "warn";
+                enabled: !root.busy;
+                clicked => {
+                    if root.c.fix-confirm != "" { root.confirm(root.c.fix-id); } else { root.fix(root.c.fix-id, false); }
+                }
+            }
+            Rectangle {
+                width: pv.preferred-width;
+                pv := Text { text: "预览命令"; font-size: 11.5px; color: Theme.accent; vertical-alignment: center; }
+                TouchArea { enabled: !root.busy; clicked => { root.fix(root.c.fix-id, true); } }
+            }
+            if root.c.fix-admin: Text { text: "需要一次管理员授权"; font-size: 11px; color: Theme.text-3; vertical-alignment: center; }
+        }
+        if root.c.result != "": Rectangle {
+            height: rl.preferred-height;
+            border-radius: 7px;
+            background: root.c.result-fail ? Theme.danger.with-alpha(0.1) : (root.c.result-ok ? Theme.online.with-alpha(0.12) : Theme.hover);
+            rl := VerticalLayout {
+                padding: 8px;
+                spacing: 6px;
+                Text { text: root.c.result; font-size: 11.5px; color: Theme.text; wrap: word-wrap; }
+                if root.c.result-cmds != "": Text { text: root.c.result-cmds; font-size: 10.5px; font-family: "Cascadia Code"; color: Theme.text-2; wrap: word-wrap; }
+            }
+        }
+    }
+    Rectangle { y: parent.height - 0.5px; height: 0.5px; background: Theme.sep; }
+}
+
+export component SettingsWindow inherits Window {
+    title: "Lancat 设置";
+    preferred-width: 480px;
+    preferred-height: 620px;
+    min-width: 420px;
+    min-height: 480px;
+    background: Theme.dark ? #2c2c30 : #fcfcfd;
+    default-font-size: 13px;
+    default-font-family: "Segoe UI Variable Text";
+
+    in property <bool> saved-flash;
+    // 本机
+    in-out property <string> device-name;
+    in property <string> me-name;
+    in property <string> me-id;
+    in property <string> me-port;
+    in property <string> me-ver;
+    in property <string> me-os;
+    // 停靠
+    in property <string> dock-edge;
+    in-out property <float> dock-offset;
+    in-out property <float> dock-length;
+    in-out property <float> hover-delay;
+    in-out property <float> collapse-delay;
+    in-out property <float> keep-alive;
+    in property <[string]> monitors;
+    in property <int> dock-monitor;
+    // 接收
+    in property <string> recv-dir;
+    in property <bool> recv-custom;
+    in-out property <string> max-file-mb;
+    // 设备
+    in property <[DevItem]> devices;
+    in-out property <string> blocked-ips;
+    in property <[string]> manual-peers;
+    // 通用
+    in property <bool> autostart;
+    in property <bool> autostart-enabled: true;
+    in property <string> theme: "system";
+    in property <bool> confirm-clear;
+    in property <int> emoji-count;
+    // 诊断
+    in property <[DiagCheck]> checks;
+    in property <int> problems: -1;   // -1 = 尚未检查
+    in property <string> diag-time;
+    in property <bool> checking;
+    in property <bool> dry-run-forced;
+    in property <string> diag-error;
+    in property <bool> fix-busy;
+    in-out property <string> confirming;
+    in-out property <length> scroll-y <=> fl.content-y;
+    out property <length> diag-y: diag-sec.y;
+
+    callback save();                  // 文本/滑块类：防抖保存
+    callback save-now();
+    callback set-edge(string);
+    callback set-monitor(int);
+    callback set-theme(string);
+    callback pick-dir();
+    callback reset-dir();
+    callback toggle-block(string);
+    callback remove-manual(string);
+    callback toggle-autostart();
+    callback clear-all();
+    callback recheck();
+    callback run-fix(string, bool);
+
+    fl := Flickable {
+        content-height: col.preferred-height;
+        col := VerticalLayout {
+            padding-left: 22px;
+            padding-right: 22px;
+            padding-top: 18px;
+            padding-bottom: 30px;
+            spacing: 14px;
+            HorizontalLayout {
+                spacing: 10px;
+                alignment: start;
+                Text { text: "Lancat 设置"; font-size: 17px; font-weight: 700; color: Theme.text; }
+                if root.saved-flash: Text { text: "已保存"; font-size: 11px; font-weight: 500; color: Theme.online; vertical-alignment: center; }
+            }
+            Section {
+                title: "本机";
+                Row {
+                    label: "设备名称";
+                    VerticalLayout {
+                        alignment: center;
+                        Field {
+                            width: 220px;
+                            height: 26px;
+                            text <=> root.device-name;
+                            placeholder: root.me-name;
+                            edited => { root.save(); }
+                        }
+                    }
+                }
+                Row { label: "设备 ID"; Text { text: root.me-id; font-size: 11px; font-family: "Cascadia Code"; color: Theme.text-2; vertical-alignment: center; } }
+                Row { label: "服务端口"; last: true; Text { text: "TCP/UDP " + root.me-port; font-size: 11px; font-family: "Cascadia Code"; color: Theme.text-2; vertical-alignment: center; } }
+            }
+            diag-sec := Section {
+                VerticalLayout {
+                    HorizontalLayout {
+                        spacing: 8px;
+                        height: 8px + 26px;
+                        padding-top: 8px;
+                        Text { text: "权限与诊断"; font-size: 11px; font-weight: 600; color: Theme.text-3; vertical-alignment: center; }
+                        if root.problems >= 0: Text {
+                            text: root.problems > 0 ? "发现 " + root.problems + " 个问题" : "一切正常";
+                            font-size: 11.5px;
+                            font-weight: 500;
+                            color: root.problems > 0 ? Theme.danger : Theme.online;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        if root.diag-time != "": Text { text: root.diag-time + " 检查"; font-size: 11px; color: Theme.text-3; vertical-alignment: center; }
+                        VerticalLayout { alignment: center; Btn { text: root.checking ? "检查中…" : "重新检查"; enabled: !root.checking; clicked => { root.recheck(); } } }
+                    }
+                    if root.diag-error != "": Note { text: root.diag-error; color: Theme.danger; }
+                    if root.problems < 0 && root.diag-error == "": Note { text: "正在检查…"; }
+                    if root.dry-run-forced: Note { text: "已开启演练模式（LANCAT_FIX_DRY_RUN）：修复只显示将要执行的命令，不做修改。"; }
+                    for c in root.checks: CheckRow {
+                        c: c;
+                        busy: root.fix-busy;
+                        confirming: root.confirming;
+                        fix(id, dry) => { root.confirming = ""; root.run-fix(id, dry); }
+                        confirm(id) => { root.confirming = id; }
+                        cancel-confirm => { root.confirming = ""; }
+                    }
+                }
+            }
+            Section {
+                title: "停靠";
+                Row {
+                    label: "屏幕边缘";
+                    VerticalLayout {
+                        alignment: center;
+                        Seg {
+                            items: [{ v: "left", l: "左" }, { v: "right", l: "右" }, { v: "top", l: "上" }, { v: "bottom", l: "下" }];
+                            value: root.dock-edge;
+                            pick(v) => { root.set-edge(v); }
+                        }
+                    }
+                }
+                Row {
+                    label: "位置";
+                    VerticalLayout { alignment: center; Slider { minimum: 0; maximum: 1; step: 0.01; value <=> root.dock-offset; changed => { root.save(); } } }
+                    Em { text: round(root.dock-offset * 100) + "%"; }
+                }
+                Row {
+                    label: "隐藏条长度";
+                    VerticalLayout { alignment: center; Slider { minimum: 60; maximum: 800; step: 10; value <=> root.dock-length; changed => { root.save(); } } }
+                    Em { text: round(root.dock-length) + "px"; }
+                }
+                if root.monitors.length > 1: Row {
+                    label: "显示器";
+                    VerticalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: ml.preferred-width + 16px;
+                            height: 24px;
+                            border-radius: 6px;
+                            background: Theme.glass-strong-solid;
+                            border-width: 0.5px;
+                            border-color: Theme.glass-border;
+                            ml := Text { text: root.monitors[root.dock-monitor]; font-size: 12px; color: Theme.text; }
+                            TouchArea { clicked => { root.set-monitor(mod(root.dock-monitor + 1, root.monitors.length)); } }
+                        }
+                    }
+                }
+                Row {
+                    label: "悬停弹出延迟";
+                    VerticalLayout { alignment: center; Slider { minimum: 0; maximum: 800; step: 10; value <=> root.hover-delay; changed => { root.save(); } } }
+                    Em { text: round(root.hover-delay) + "ms"; }
+                }
+                Row {
+                    label: "离开后收起延迟";
+                    VerticalLayout { alignment: center; Slider { minimum: 200; maximum: 5000; step: 50; value <=> root.collapse-delay; changed => { root.save(); } } }
+                    Em { text: round(root.collapse-delay) + "ms"; }
+                }
+                Row {
+                    label: "收起后释放面板";
+                    last: true;
+                    VerticalLayout { alignment: center; Slider { minimum: 0; maximum: 7200; step: 60; value <=> root.keep-alive; changed => { root.save(); } } }
+                    Em { text: root.keep-alive == 0 ? "常驻" : (root.keep-alive < 60 ? round(root.keep-alive) + "s" : round(root.keep-alive / 60) + " 分钟"); }
+                }
+                Note { text: "面板收起后会释放渲染缓冲（内存交还系统），再次弹出几乎是瞬间；超过这个时间连同界面数据一起释放，下次弹出重新构建。设为 0 表示常驻。"; }
+            }
+            Section {
+                title: "接收";
+                Row {
+                    label: "接收目录";
+                    Text { text: root.recv-dir; font-size: 11px; font-family: "Cascadia Code"; color: Theme.text-2; overflow: elide; vertical-alignment: center; max-width: 300px; }
+                }
+                Rectangle {
+                    height: 34px;
+                    HorizontalLayout {
+                        alignment: end;
+                        spacing: 6px;
+                        VerticalLayout { alignment: center; Btn { text: "选择…"; clicked => { root.pick-dir(); } } }
+                        if root.recv-custom: VerticalLayout { alignment: center; Btn { text: "恢复默认（下载）"; clicked => { root.reset-dir(); } } }
+                    }
+                }
+                Row {
+                    label: "单文件大小上限";
+                    last: true;
+                    VerticalLayout { alignment: center; Field { width: 90px; height: 26px; text <=> root.max-file-mb; edited => { root.save(); } } }
+                    Em { text: "MB（0 = 不限）"; }
+                }
+                Note { text: "收到的文件直接保存、自动重名，永远不会被自动打开或执行。"; }
+            }
+            Section {
+                title: "设备与黑名单";
+                if root.devices.length == 0: Note { text: "还没有发现其他设备。"; }
+                for d in root.devices: Rectangle {
+                    min-height: 38px;
+                    HorizontalLayout {
+                        spacing: 9px;
+                        VerticalLayout { alignment: center; Rectangle { width: 8px; height: 8px; border-radius: 4px; background: d.online ? Theme.online : Theme.text-3; } }
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Text { text: d.name; font-size: 12.5px; color: Theme.text; overflow: elide; }
+                            Text { text: d.sub; font-size: 10.5px; color: Theme.text-3; overflow: elide; }
+                        }
+                        VerticalLayout { alignment: center; Btn { text: d.blocked ? "取消拉黑" : "拉黑"; danger: !d.blocked; clicked => { root.toggle-block(d.id); } } }
+                    }
+                    Rectangle { y: parent.height - 0.5px; height: 0.5px; background: Theme.sep; }
+                }
+                VerticalLayout {
+                    padding-top: 8px;
+                    padding-bottom: 2px;
+                    spacing: 5px;
+                    Text { text: "按 IP 拉黑（每行一个）"; font-size: 12.5px; color: Theme.text; }
+                    Field { height: 46px; multi: true; mono: true; text <=> root.blocked-ips; placeholder: "192.168.1.66"; edited => { root.save(); } }
+                }
+                if root.manual-peers.length > 0: VerticalLayout {
+                    padding-top: 8px;
+                    spacing: 5px;
+                    Text { text: "手动添加的设备（每 5 秒探测一次）"; font-size: 12.5px; color: Theme.text; }
+                    for a in root.manual-peers: HorizontalLayout {
+                        height: 30px;
+                        Text { text: a; font-size: 11px; font-family: "Cascadia Code"; color: Theme.text-2; vertical-alignment: center; horizontal-stretch: 1; }
+                        VerticalLayout { alignment: center; Btn { text: "移除"; clicked => { root.remove-manual(a); } } }
+                    }
+                }
+            }
+            Section {
+                title: "通用";
+                Row {
+                    label: "开机自动启动";
+                    VerticalLayout { alignment: center; Switch { on: root.autostart; enabled: root.autostart-enabled; toggled => { root.toggle-autostart(); } } }
+                }
+                Row {
+                    label: "外观";
+                    last: true;
+                    VerticalLayout {
+                        alignment: center;
+                        Seg {
+                            items: [{ v: "system", l: "跟随系统" }, { v: "light", l: "浅色" }, { v: "dark", l: "深色" }];
+                            value: root.theme;
+                            pick(v) => { root.set-theme(v); }
+                        }
+                    }
+                }
+            }
+            Section {
+                title: "数据";
+                Row {
+                    label: "聊天记录永久保存在本机";
+                    last: true;
+                    VerticalLayout { alignment: center; Btn { text: root.confirm-clear ? "再点一次确认清空" : "清空全部聊天记录"; danger: true; clicked => { root.clear-all(); } } }
+                }
+            }
+            Section {
+                title: "关于";
+                Text { text: "Lancat " + root.me-ver + " · " + root.me-os + " · 局域网零配置快传"; font-size: 12.5px; color: Theme.text; wrap: word-wrap; }
+                Note {
+                    text: "内置 " + root.emoji-count + " 个动态表情来自 Google Noto Animated Emoji，以 CC BY 4.0 许可使用（https://creativecommons.org/licenses/by/4.0/）。";
+                }
+            }
+        }
+    }
+}

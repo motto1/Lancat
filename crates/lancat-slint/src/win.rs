@@ -108,6 +108,8 @@ impl Win32Platform {
 }
 
 thread_local! {
+    /// 下一个创建的窗口是普通窗口（设置页）：`with_normal_window(|| SettingsWindow::new())`
+    static NEXT_NORMAL: Cell<bool> = const { Cell::new(false) };
     static WINDOWS: RefCell<Vec<(isize, Weak<Win32Window>)>> = const { RefCell::new(Vec::new()) };
     /// 面板窗口（第一个创建的窗口）。
     static PANEL: RefCell<Weak<Win32Window>> = const { RefCell::new(Weak::new()) };
@@ -193,6 +195,9 @@ pub struct Win32Window {
     surrogate: Cell<u16>,
     ime_rect: Cell<(i32, i32, i32, i32)>,
     first_paint_logged: Cell<bool>,
+    /// 普通窗口（设置页）：有标题栏、可调大小、可激活；面板/停靠逻辑不作用于它
+    normal: bool,
+    shown_once: Cell<bool>,
     alpha: Cell<u8>,
     fade_gen: Cell<u64>,
 }
@@ -216,6 +221,8 @@ impl Win32Window {
             first_paint_logged: Cell::new(false),
             alpha: Cell::new(0),
             fade_gen: Cell::new(0),
+            normal: NEXT_NORMAL.with(|n| n.replace(false)),
+            shown_once: Cell::new(false),
         });
         unsafe {
             let inst: HINSTANCE = GetModuleHandleW(None).map_err(|e| e.to_string())?.into();
@@ -229,20 +236,27 @@ impl Win32Window {
                 ..Default::default()
             };
             RegisterClassExW(&wc);
-            let ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED;
-            let h = CreateWindowExW(ex, CLASS, w!("Lancat"), WS_POPUP, 0, 0, 360, 520, None, None, Some(inst), None).map_err(|e| e.to_string())?;
+            let (ex, style) = if rc.normal { (WINDOW_EX_STYLE(0), WS_OVERLAPPEDWINDOW) } else { (WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, WS_POPUP) };
+            let h = CreateWindowExW(ex, CLASS, w!("Lancat"), style, 0, 0, 480, 620, None, None, Some(inst), None).map_err(|e| e.to_string())?;
             rc.hwnd.set(h);
             WINDOWS.with(|w| w.borrow_mut().push((h.0 as isize, Rc::downgrade(&rc))));
             PANEL.with(|p| {
-                if p.borrow().upgrade().is_none() {
+                if !rc.normal && p.borrow().upgrade().is_none() {
                     *p.borrow_mut() = Rc::downgrade(&rc);
                 }
             });
-            let _ = SetLayeredWindowAttributes(h, COLORREF(0), 0, LWA_ALPHA);
+            if !rc.normal {
+                let _ = SetLayeredWindowAttributes(h, COLORREF(0), 0, LWA_ALPHA);
+            }
             let scale = GetDpiForWindow(h) as f32 / 96.0;
             rc.scale.set(scale);
             rc.window.dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor: scale });
-            setup_material(h, crate::theme_is_dark("system"));
+            if !rc.normal {
+                setup_material(h, crate::theme_is_dark("system"));
+            } else {
+                let dark: i32 = crate::theme_is_dark("system") as i32;
+                let _ = DwmSetWindowAttribute(h, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as *const _, 4);
+            }
         }
         Ok(rc)
     }
@@ -339,6 +353,21 @@ impl WindowAdapter for Win32Window {
     fn set_visible(&self, visible: bool) -> Result<(), slint::PlatformError> {
         self.visible.set(visible);
         let h = self.hwnd.get();
+        if self.normal {
+            unsafe {
+                if visible {
+                    if !self.shown_once.replace(true) {
+                        center_normal(self);
+                    }
+                    let _ = ShowWindow(h, SW_SHOW);
+                    let _ = SetForegroundWindow(h);
+                } else {
+                    let _ = ShowWindow(h, SW_HIDE);
+                }
+            }
+            self.needs_redraw.set(true);
+            return Ok(());
+        }
         if visible && dock_mode() {
             // 停放：已映射、alpha 0、点击穿透；dock::open_panel 时再定位并淡入
             set_layered(h, true);
@@ -380,6 +409,13 @@ impl WindowAdapter for Win32Window {
         }
     }
     fn update_window_properties(&self, props: slint::platform::WindowProperties<'_>) {
+        if self.normal {
+            let t: Vec<u16> = props.title().encode_utf16().chain(Some(0)).collect();
+            unsafe {
+                let _ = SetWindowTextW(self.hwnd.get(), PCWSTR(t.as_ptr()));
+            }
+            return;
+        }
         // fixed-size panel: take the preferred size from the layout
         let c = props.layout_constraints();
         let s = self.scale.get();
@@ -500,6 +536,12 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             LRESULT(0)
         }
         WM_MOUSEACTIVATE => LRESULT(MA_ACTIVATE as isize),
+        WM_GETMINMAXINFO if w.normal => {
+            let mi = &mut *(lp.0 as *mut MINMAXINFO);
+            let s = w.scale.get();
+            mi.ptMinTrackSize = POINT { x: (420.0 * s) as i32, y: (480.0 * s) as i32 };
+            LRESULT(0)
+        }
         WM_MOUSEMOVE => {
             if !w.tracking.replace(true) {
                 let mut t = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: h, dwHoverTime: 0 };
@@ -614,6 +656,7 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             w.ime_dispatch(InternalKeyEvent { event_type: KeyEventType::UpdateComposition, preedit_text: "".into(), ..Default::default() });
             LRESULT(0)
         }
+        WM_SETTINGCHANGE if w.normal => DefWindowProcW(h, msg, wp, lp),
         WM_SETTINGCHANGE => {
             // ImmersiveColorSet: system light/dark or accent changed
             refresh_material_hwnd(h, crate::theme_is_dark("system"));
@@ -853,5 +896,39 @@ pub fn panel_focus() -> Option<isize> {
         }
         let _ = SetFocus(Some(h));
         (!prev.0.is_null()).then_some(prev.0 as isize)
+    }
+}
+
+/// 在 f 里创建的 Slint 窗口是普通窗口（标题栏、可调大小、显示时激活），用于设置页。
+pub fn with_normal_window<R>(f: impl FnOnce() -> R) -> R {
+    NEXT_NORMAL.with(|n| n.set(true));
+    let r = f();
+    NEXT_NORMAL.with(|n| n.set(false));
+    r
+}
+
+fn center_normal(w: &Win32Window) {
+    unsafe {
+        let mut wa = RECT::default();
+        let _ = SystemParametersInfoW(SPI_GETWORKAREA, 0, Some(&mut wa as *mut _ as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+        let s = w.scale.get();
+        // 客户区 480×620（旧版设置窗口 inner_size），加上边框
+        let mut r = RECT { left: 0, top: 0, right: (480.0 * s) as i32, bottom: (620.0 * s) as i32 };
+        let _ = AdjustWindowRectExForDpi(&mut r, WS_OVERLAPPEDWINDOW, false, WINDOW_EX_STYLE(0), GetDpiForWindow(w.hwnd.get()));
+        let (ww, wh) = (r.right - r.left, r.bottom - r.top);
+        let x = wa.left + (wa.right - wa.left - ww) / 2;
+        let y = wa.top + (wa.bottom - wa.top - wh) / 2;
+        let _ = SetWindowPos(w.hwnd.get(), None, x, y, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+/// 设置窗口（所有普通窗口）的标题栏深浅色跟随应用主题
+pub fn set_normal_dark(dark: bool) {
+    let wins: Vec<Rc<Win32Window>> = WINDOWS.with(|w| w.borrow().iter().filter_map(|(_, w)| w.upgrade()).filter(|w| w.normal).collect());
+    for w in wins {
+        let d: i32 = dark as i32;
+        unsafe {
+            let _ = DwmSetWindowAttribute(w.hwnd.get(), DWMWA_USE_IMMERSIVE_DARK_MODE, &d as *const _ as *const _, 4);
+        }
     }
 }

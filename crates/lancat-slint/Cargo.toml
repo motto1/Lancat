@@ -19,21 +19,29 @@ serde_json = "1"
 log = "0.4"
 env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
 dirs = "7"
+# Lottie 表情：ThorVG（源码编译，CPU 光栅；bindgen 需要 libclang，Windows 在 C:\Program Files\LLVM）
+thorvg-sys = { version = "=0.3.2", default-features = false, features = ["vendored", "lottie"] }
+flate2 = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # 阶段 3 之前 Linux 先用 winit 后端跑通界面；之后换成自写 SCTK layer-shell Platform
 slint = { version = "=1.18.1", default-features = false, features = ["backend-winit", "renderer-winit-software"] }
-# 阶段 3：自写 Wayland 后端（wlr-layer-shell + wl_shm），API 按 0.21.1 的 examples/simple_layer.rs 核实
-smithay-client-toolkit = { version = "=0.21.1", default-features = false }
+# 自写 Wayland 后端（wlr-layer-shell + wl_shm + text-input-v3），API 按 SCTK 0.21.1 源码核实
+# 键盘用 xkbcommon（系统 libxkbcommon，含 compose）；不要 calloop（事件循环是自己写的 poll）
+smithay-client-toolkit = { version = "=0.21.1", default-features = false, features = ["xkbcommon"] }
 wayland-client = "0.31"
+# zwp_text_input_v3（输入法）在 unstable 里
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Input_Ime", "Win32_UI_HiDpi", "Win32_UI_Controls", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Registry", "Win32_System_DataExchange", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_DirectWrite", "Win32_Graphics_Dxgi_Common", "Win32_Security", "Win32_UI_Shell", "Win32_System_ProcessStatus"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Input_Ime", "Win32_UI_HiDpi", "Win32_UI_Controls", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Registry", "Win32_System_DataExchange", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_DirectWrite", "Win32_Graphics_Dxgi_Common", "Win32_Security", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_System_ProcessStatus", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_System_Memory", "Win32_System_Diagnostics_ToolHelp", "Win32_NetworkManagement_WindowsFirewall", "Win32_Networking_NetworkListManager", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
 # D2D 点坐标类型（toast 绘制，与 src-tauri 相同）
 windows-numerics = "0.2"
 
 [build-dependencies]
 slint-build = "=1.18.1"
+flate2 = "1"
 
 [profile.release]
 opt-level = "z"

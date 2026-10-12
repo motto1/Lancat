@@ -119,8 +119,12 @@ pub struct Hooks {
     pub on_drag_hint: Box<dyn Fn(Option<usize>)>,
     /// 松手：文件 + 面板客户区逻辑坐标（停靠条上松手时为 None）
     pub on_drop: Box<dyn Fn(Vec<String>, Option<(f32, f32)>)>,
+    /// 拖动中：面板客户区逻辑坐标（命中测试 DropPicker 槽位）
+    pub on_drag_over: Box<dyn Fn(f32, f32)>,
     /// `--settings`
     pub on_settings: Box<dyn Fn()>,
+    /// 钉住状态变化（标题栏图钉、托盘菜单）
+    pub on_pinned: Box<dyn Fn(bool)>,
 }
 
 struct Dock {
@@ -190,6 +194,18 @@ fn monitors() -> Vec<Monitor> {
     }
     v.sort_by_key(|(primary, _)| !*primary);
     v.into_iter().map(|(_, m)| m).collect()
+}
+
+/// 设置页「显示器」下拉：名称（宽×高）· 主（0 = 主显示器）
+pub fn monitor_labels() -> Vec<String> {
+    monitors()
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let (w, h) = (m.full.right - m.full.left, m.full.bottom - m.full.top);
+            format!("显示器 {}（{w}×{h}）{}", i + 1, if i == 0 { " · 主" } else { "" })
+        })
+        .collect()
 }
 
 fn hover_delay() -> u64 {
@@ -345,6 +361,7 @@ pub fn set_pinned(p: bool) {
         // 取消钉住时光标已在外面：从现在起重新计时收起
         d.leave_since = None;
     });
+    hook(|h| (h.on_pinned)(p));
 }
 
 pub fn pinned() -> bool {
@@ -482,15 +499,24 @@ pub fn on_incoming(m: &lancat_core::Message) {
 /// 拖放（drop.rs 已离开 COM 调用）。
 pub fn on_drag(ev: DragEvent) {
     match ev {
-        DragEvent::Enter { panel, n, .. } => {
+        DragEvent::Enter { panel, n, x, y } => {
             with(|d| d.dragging_files = true);
             if !panel {
                 // 文件碰到停靠条：立刻打开（旧版同样 open_panel("drag")）
                 open_panel("drag");
             }
             hook(|h| (h.on_drag_hint)(Some(n)));
+            if panel {
+                if let Some(s) = crate::win::panel_scale() {
+                    hook(|h| (h.on_drag_over)(x as f32 / s, y as f32 / s));
+                }
+            }
         }
-        DragEvent::Over { .. } => {}
+        DragEvent::Over { x, y } => {
+            if let Some(s) = crate::win::panel_scale() {
+                hook(|h| (h.on_drag_over)(x as f32 / s, y as f32 / s));
+            }
+        }
         DragEvent::Leave { panel } => {
             if panel {
                 with(|d| d.dragging_files = false);

@@ -1,67 +1,104 @@
-// Lancat 面板（Slint 版）骨架：会话列表 + 聊天页 + 输入框。
-// 视觉 token 取自 src/styles/global.css（见 docs/slint/inventory.md §5）。
+// Lancat 面板（Slint 版）：标题栏 + 横幅 + 侧栏 + 会话 + 输入栏 + 表情面板，另有设置窗口（settings.slint）。
+// 视觉 token / 尺寸逐项取自旧版 src/styles/global.css 与各 Svelte 组件（见 docs/slint/inventory.md）。
+
+import { Icons } from "icons.slint";
+import { Theme, Icon, IconButton, Btn } from "common.slint";
+export { Theme } from "common.slint";
+export { Icons } from "icons.slint";
+export { SettingsWindow, DiagCheck, DevItem } from "settings.slint";
 
 export struct PeerItem {
     id: string,
     name: string,
-    initial: string,
-    tint: color,
+    initials: string,
+    c1: color,          // 头像渐变顶部（color-mix(c 82%, white)）
+    c2: color,          // 头像渐变底部（hsl(h 70% 55%)）
     online: bool,
     unread: int,
+    blocked: bool,
+    picked: bool,       // Shift 多选
+    os: string,
 }
 
 export struct MsgItem {
     id: string,
     outgoing: bool,
-    kind: string,      // text | emoji | file
+    kind: string,       // text | sticker | file
     text: string,
     status: string,
-    first: bool,       // first of a group (tail corner)
+    first: bool,        // 组首条（尾角 5px，上边距 8px）
+    sep: string,        // 这条之前的时间分隔（空 = 无）
+    sticker: image,
+    has-sticker: bool,
+    ficon: string,      // 文件图标路径（Icons.*）
     fname: string,
-    fmeta: string,
-    progress: float,   // 0..1, <0 = no bar
+    fmeta: string,      // "1.2 MB · 35% · "
+    fst: string,        // 状态 / 速度部分（失败时红色）
+    failed: bool,
+    cancelled: bool,
+    why: string,        // 失败原因下的办法
+    fixlink: bool,      // 本机问题：「去修复」
+    progress: float,    // 0..1；<0 不显示进度条
+    paused: bool,
+    act1: string,       // pause | play | retry | ""
+    act2: string,       // cancel | reveal | ""
 }
 
-export global Theme {
-    in-out property <bool> dark: false;
-    in-out property <bool> native-glass: true;
-    in-out property <color> accent: #0a84ff;
-    out property <color> accent-contrast: #ffffff;
-    out property <color> glass: native-glass
-        ? (dark ? rgba(30, 30, 34, 0.38) : rgba(246, 246, 248, 0.42))
-        : (dark ? rgba(36, 36, 40, 0.82) : rgba(246, 246, 248, 0.86));
-    out property <color> glass-strong: dark ? rgba(44, 44, 48, 0.94) : rgba(252, 252, 253, 0.94);
-    out property <color> glass-border: dark ? rgba(255, 255, 255, 0.12) : rgba(0, 0, 0, 0.1);
-    out property <color> sidebar: dark ? rgba(255, 255, 255, 0.04) : rgba(0, 0, 0, 0.035);
-    out property <color> text: dark ? #f5f5f7 : #1d1d1f;
-    out property <color> text-2: dark ? rgba(235, 235, 245, 0.68) : rgba(60, 60, 67, 0.72);
-    out property <color> text-3: dark ? rgba(235, 235, 245, 0.38) : rgba(60, 60, 67, 0.45);
-    out property <color> sep: dark ? rgba(255, 255, 255, 0.09) : rgba(0, 0, 0, 0.08);
-    out property <color> bubble-in: dark ? rgba(255, 255, 255, 0.1) : rgba(0, 0, 0, 0.06);
-    out property <color> hover: dark ? rgba(255, 255, 255, 0.07) : rgba(0, 0, 0, 0.05);
-    out property <color> field: dark ? rgba(255, 255, 255, 0.07) : rgba(255, 255, 255, 0.7);
-    out property <color> rim-top: dark ? rgba(255, 255, 255, 0.22) : rgba(255, 255, 255, 0.85);
-    out property <color> online: #30d158;
-    out property <color> danger: #ff3b30;
-    out property <duration> dur-fast: 120ms;
-    out property <duration> dur: 160ms;
-    out property <duration> dur-slow: 220ms;
+export struct EmojiCell {
+    key: string,        // noto 码点或 "s:<sticker id>"
+    img: image,
+    title: string,
+}
+
+export struct EmojiSection {
+    id: string,
+    label: string,
+    cells: [EmojiCell],
+    stickers: bool,     // 贴纸分区：导入按钮 + 空态说明
+    note: string,       // 空态说明 / 搜索无结果
+}
+
+export struct DropSlot {
+    key: string,        // peer:<id> | all
+    name: string,
+    initials: string,
+    os: string,
+    c1: color,
+    c2: color,
+    all: bool,
 }
 
 component Avatar inherits Rectangle {
     in property <PeerItem> peer;
-    in property <bool> active;
     in property <bool> all;
-    width: 38px;
-    height: 38px;
-    border-radius: 19px;
-    background: all ? (active ? Theme.accent : Theme.hover) : peer.tint;
-    opacity: (all || peer.online) ? 1 : 0.45;
-    Text {
-        text: all ? "全" : peer.initial;
-        color: all ? (active ? Theme.accent-contrast : Theme.text-2) : #ffffff;
+    in property <bool> active;
+    in property <length> size: 38px;
+    width: size;
+    height: size;
+    border-radius: size / 2;
+    background: all ? (active ? Theme.accent : Theme.hover) : @linear-gradient(180deg, peer.c1 0%, peer.c2 100%);
+    border-width: all ? 0.5px : 0px;
+    border-color: Theme.glass-border;
+    if !all: Rectangle {
+        // inset 0 .5px 0 rgba(255,255,255,.4)
+        y: 0;
+        x: parent.width * 0.2;
+        width: parent.width * 0.6;
+        height: 0.5px;
+        background: rgba(255, 255, 255, 0.4);
+    }
+    if !all: Text {
+        text: root.peer.initials;
+        color: #ffffff;
         font-size: 13px;
         font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    if all: Icon {
+        d: Icons.grid;
+        size: 17px;
+        color: root.active ? Theme.accent-contrast : Theme.text-2;
     }
 }
 
@@ -69,140 +106,470 @@ component SidebarItem inherits Rectangle {
     in property <PeerItem> peer;
     in property <bool> active;
     in property <bool> all;
-    callback clicked();
-    height: 62px;
-    border-radius: 10px;
-    background: ta.has-hover ? Theme.hover : transparent;
-    animate background { duration: Theme.dur-fast; }
-    ta := TouchArea { clicked => { root.clicked(); } }
-    VerticalLayout {
-        alignment: center;
-        spacing: 3px;
-        HorizontalLayout {
-            alignment: center;
-            ring := Rectangle {
-                width: 46px;
-                height: 46px;
-                border-radius: 23px;
-                border-width: active ? 2px : 0px;
-                border-color: Theme.accent;
-                av := Avatar {
-                    peer: root.peer;
-                    active: root.active;
-                    all: root.all;
-                    transform-scale: ta.pressed ? 0.94 : (ta.has-hover ? 1.05 : 1.0);
-                    animate transform-scale { duration: Theme.dur; easing: cubic-bezier(0.2, 0.9, 0.3, 1.4); }
-                }
-                if !root.all && root.peer.online: Rectangle {
-                    x: parent.width - 14px;
-                    y: parent.height - 14px;
-                    width: 11px;
-                    height: 11px;
-                    border-radius: 5.5px;
-                    background: Theme.online;
-                    border-width: 2px;
-                    border-color: Theme.glass-strong;
-                }
-                if !root.all && root.peer.unread > 0: Rectangle {
-                    x: parent.width - self.width + 2px;
-                    y: 0px;
-                    min-width: 17px;
-                    height: 17px;
-                    border-radius: 8.5px;
-                    background: Theme.danger;
-                    border-width: 1.5px;
-                    border-color: Theme.glass-strong;
-                    HorizontalLayout {
-                        padding-left: 4px;
-                        padding-right: 4px;
-                        Text {
-                            text: root.peer.unread > 99 ? "99+" : root.peer.unread;
-                            color: #ffffff;
-                            font-size: 10px;
-                            font-weight: 600;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                    }
-                }
+    in property <bool> drop-hot;
+    callback clicked(bool /* shift */);
+    callback menu(length, length);
+    height: 63px;   // padding 5 + 38 + gap 3 + label ~12 + padding 5
+    ta := TouchArea {
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.up && e.button == PointerEventButton.left {
+                root.clicked(e.modifiers.shift || e.modifiers.control);
+            }
+            if e.kind == PointerEventKind.down && e.button == PointerEventButton.right && !root.all {
+                root.menu(self.mouse-x, self.mouse-y);
             }
         }
-        Text {
-            text: root.all ? "全部" : root.peer.name;
-            font-size: 10px;
-            color: root.active ? Theme.text : Theme.text-2;
-            font-weight: root.active ? 500 : 400;
-            horizontal-alignment: center;
-            overflow: elide;
-            max-width: 58px;
+    }
+    ring := Rectangle {
+        x: (parent.width - 46px) / 2;
+        y: 1px;
+        width: 46px;
+        height: 46px;
+        border-radius: 23px;
+        // box-shadow 0 0 0 2px glass-strong, 0 0 0 4px accent
+        background: (root.active || root.peer.picked || root.drop-hot) ? Theme.accent : transparent;
+        Rectangle {
+            x: 2px;
+            y: 2px;
+            width: 42px;
+            height: 42px;
+            border-radius: 21px;
+            background: (root.active || root.peer.picked || root.drop-hot) ? Theme.glass-strong-solid : transparent;
+        }
+        av := Avatar {
+            x: 4px;
+            y: 4px;
+            peer: root.peer;
+            all: root.all;
+            active: root.active;
+            opacity: (root.all || root.peer.online) ? 1 : 0.45;
+            animate opacity { duration: Theme.dur; }
+        }
+        if !root.all && root.peer.online: Rectangle {
+            x: 4px + 38px - 11px + 1px;
+            y: 4px + 38px - 11px + 1px;
+            width: 11px;
+            height: 11px;
+            border-radius: 5.5px;
+            background: Theme.online;
+            border-width: 2px;
+            border-color: Theme.glass-strong-solid;
+        }
+        if !root.all && root.peer.unread > 0 && !root.peer.blocked: Rectangle {
+            x: 4px + 38px + 6px - self.width;
+            y: 4px - 4px;
+            width: max(17px, badge-t.preferred-width + 8px + 3px);
+            height: 17px;
+            border-radius: 8.5px;
+            background: Theme.danger;
+            border-width: 1.5px;
+            border-color: Theme.glass-strong-solid;
+            badge-t := Text {
+                text: root.peer.unread > 99 ? "99+" : root.peer.unread;
+                color: #ffffff;
+                font-size: 10px;
+                font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+        if root.peer.picked: Rectangle {
+            x: 4px - 3px;
+            y: 4px + 38px + 2px - 15px;
+            width: 15px;
+            height: 15px;
+            border-radius: 7.5px;
+            background: Theme.accent;
+            border-width: 1.5px;
+            border-color: Theme.glass-strong-solid;
+            Icon { d: Icons.check; size: 10px; sw: 3; color: Theme.accent-contrast; }
         }
     }
-}
-
-component IconButton inherits Rectangle {
-    in property <string> glyph;
-    in property <bool> spin;
-    callback clicked();
-    width: 30px;
-    height: 30px;
-    border-radius: 8px;
-    background: ta.has-hover ? Theme.hover : transparent;
-    animate background { duration: Theme.dur-fast; }
-    ta := TouchArea { clicked => { root.clicked(); } }
     Text {
-        text: root.glyph;
-        font-size: 15px;
-        color: root.spin ? Theme.accent : Theme.text-2;
+        y: 1px + 46px - 4px + 3px + 3px;
+        x: 4px;
+        width: parent.width - 8px;
+        text: root.all ? "全部" : root.peer.name;
+        font-size: 10px;
+        color: root.active ? Theme.text : Theme.text-2;
+        font-weight: root.active ? 500 : 400;
+        horizontal-alignment: center;
+        overflow: elide;
     }
 }
 
-component Bubble inherits Rectangle {
+component MenuItem inherits Rectangle {
+    in property <string> icon;
+    in property <string> label;
+    in property <bool> danger;
+    callback clicked();
+    height: 27px;
+    border-radius: 6px;
+    background: ta.has-hover ? Theme.accent : transparent;
+    ta := TouchArea { clicked => { root.clicked(); } }
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 9px;
+        spacing: 8px;
+        alignment: start;
+        Icon { y: (parent.height - 14px) / 2; d: root.icon; size: 14px; color: ta.has-hover ? Theme.accent-contrast : (root.danger ? Theme.danger : Theme.text); }
+        Text {
+            text: root.label;
+            font-size: 12.5px;
+            vertical-alignment: center;
+            color: ta.has-hover ? Theme.accent-contrast : (root.danger ? Theme.danger : Theme.text);
+        }
+    }
+}
+
+component StateIcon inherits Rectangle {
+    in property <string> status;
+    width: 12px;
+    height: 12px;
+    if status == "pending": Icon { d: Icons.clock; size: 11px; color: Theme.text-3; }
+    if status == "sent": Icon { d: Icons.check; size: 11px; color: Theme.text-3; }
+    if status == "delivered": Icon { d: Icons.checks; size: 12px; color: Theme.text-3; }
+    if status == "failed": Icon { d: Icons.alert; size: 11px; color: Theme.text-3; }
+}
+
+component FileCard inherits Rectangle {
     in property <MsgItem> m;
-    in property <length> avail;
-    // the row
-    height: body.preferred-height + (m.first ? 8px : 2px);
-    body := Rectangle {
-        y: m.first ? 8px : 2px;
-        x: m.outgoing ? parent.width - self.width : 0px;
-        width: min(lay.preferred-width, root.avail * 0.78);
-        height: lay.preferred-height;
-        border-radius: 16px;
-        border-bottom-left-radius: (m.first && !m.outgoing) ? 5px : 16px;
-        border-bottom-right-radius: (m.first && m.outgoing) ? 5px : 16px;
-        background: m.kind == "file"
-            ? (m.outgoing ? Theme.accent.with-alpha(0.14) : Theme.bubble-in)
-            : (m.outgoing ? Theme.accent : Theme.bubble-in);
-        lay := VerticalLayout {
-            padding-left: 10px;
-            padding-right: 10px;
-            padding-top: 6px;
-            padding-bottom: 6px;
-            spacing: 3px;
-            if m.kind != "file": Text {
-                text: m.text;
-                wrap: word-wrap;
-                font-size: m.kind == "emoji" ? 34px : 13px;
-                color: m.outgoing && m.kind != "emoji" ? Theme.accent-contrast : Theme.text;
+    callback action(string);
+    callback fix();
+    width: 210px;
+    out property <length> h: lay.preferred-height;
+    border-radius: 14px;
+    background: m.outgoing ? Theme.accent.with-alpha(0.14) : Theme.bubble-in;
+    border-width: 0.5px;
+    border-color: m.failed ? Theme.danger.with-alpha(0.5) : Theme.sep;
+    opacity: m.cancelled ? 0.6 : 1;
+    lay := HorizontalLayout {
+        padding-top: 9px;
+        padding-bottom: 9px;
+        padding-left: 10px;
+        padding-right: 8px;
+        spacing: 9px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 34px;
+                height: 34px;
+                border-radius: 8px;
+                background: Theme.field;
+                Icon { d: root.m.ficon; size: 22px; sw: 1.5; color: Theme.accent; }
             }
-            if m.kind == "file": VerticalLayout {
-                spacing: 2px;
-                Text { text: "📄 " + m.fname; font-size: 12.5px; font-weight: 500; color: Theme.text; overflow: elide; }
-                Text { text: m.fmeta; font-size: 10.5px; color: m.status == "failed" ? Theme.danger : Theme.text-2; }
-                if m.progress >= 0: Rectangle {
+        }
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 0px;
+            Text { text: root.m.fname; font-size: 12.5px; font-weight: 500; color: Theme.text; overflow: elide; }
+            HorizontalLayout {
+                spacing: 0px;
+                Text { text: root.m.fmeta; font-size: 10.5px; color: Theme.text-2; }
+                Text { text: root.m.fst; font-size: 10.5px; color: root.m.failed ? Theme.danger : Theme.text-2; overflow: elide; horizontal-stretch: 1; }
+            }
+            if root.m.why != "" || root.m.fixlink: HorizontalLayout {
+                padding-top: 3px;
+                Text { text: root.m.why; font-size: 10.5px; color: Theme.text-2; wrap: word-wrap; horizontal-stretch: 1; }
+            }
+            if root.m.fixlink: HorizontalLayout {
+                alignment: start;
+                Rectangle {
+                    width: fl.preferred-width;
+                    height: fl.preferred-height;
+                    fl := Text { text: "去修复"; font-size: 10.5px; font-weight: 500; color: Theme.accent; }
+                    TouchArea { clicked => { root.fix(); } }
+                }
+            }
+            if root.m.progress >= 0: Rectangle {
+                height: 4px + 5px;
+                Rectangle {
+                    y: 5px;
                     height: 4px;
                     border-radius: 2px;
                     background: Theme.sep;
                     Rectangle {
                         x: 0;
-                        width: parent.width * clamp(m.progress, 0, 1);
+                        width: parent.width * clamp(root.m.progress, 0, 1);
                         border-radius: 2px;
-                        background: Theme.accent;
+                        background: root.m.paused ? Theme.text-2 : Theme.accent;
                         animate width { duration: 200ms; }
                     }
                 }
             }
         }
+        if root.m.act1 != "": VerticalLayout {
+            alignment: center;
+            IconButton {
+                d: root.m.act1 == "pause" ? Icons.pause : (root.m.act1 == "play" ? Icons.play : Icons.retry);
+                icon-size: root.m.act1 == "play" ? 14px : 15px;
+                clicked => { root.action(root.m.act1); }
+            }
+        }
+        if root.m.act2 != "": VerticalLayout {
+            alignment: center;
+            IconButton {
+                d: root.m.act2 == "cancel" ? Icons.x : Icons.reveal;
+                icon-size: 15px;
+                clicked => { root.action(root.m.act2); }
+            }
+        }
     }
+}
+
+component MessageRow inherits Rectangle {
+    in property <MsgItem> m;
+    in property <length> avail;
+    callback action(string, string);
+    callback fix();
+    callback sticker-hover(string, bool);
+    property <length> top: (m.sep != "" ? sep-h : 0px) + (m.first ? 8px : 2px);
+    property <length> sep-h: 10px + 13px + 6px;
+    property <length> body-h: m.kind == "sticker" ? 160px : (m.kind == "file" ? fc.h : bubble.height);
+    height: top + body-h;
+    if m.sep != "": Text {
+        y: 10px;
+        width: parent.width;
+        height: 13px;
+        text: root.m.sep;
+        font-size: 10.5px;
+        font-weight: 500;
+        color: Theme.text-3;
+        horizontal-alignment: center;
+    }
+    // 状态小图标（发出的文字/贴纸）
+    if m.outgoing && m.kind != "file": StateIcon {
+        status: root.m.status;
+        x: root.width - root.body-w - 4px - 12px;
+        y: root.top + root.body-h - 12px - 2px;
+    }
+    property <length> body-w: m.kind == "sticker" ? 160px : (m.kind == "file" ? 210px : bubble.width);
+    bubble := Rectangle {
+        visible: root.m.kind == "text";
+        y: root.top;
+        x: root.m.outgoing ? root.width - self.width : 0px;
+        width: root.m.kind == "text" ? min(txt.preferred-width + 20px, (root.avail - 16px) * 0.78) : 0px;
+        height: root.m.kind == "text" ? txt.preferred-height + 12px : 0px;
+        border-radius: 16px;
+        border-bottom-left-radius: (root.m.first && !root.m.outgoing) ? 5px : 16px;
+        border-bottom-right-radius: (root.m.first && root.m.outgoing) ? 5px : 16px;
+        background: root.m.outgoing ? Theme.accent : Theme.bubble-in;
+        txt := Text {
+            x: 10px;
+            y: 6px;
+            width: parent.width - 20px;
+            text: root.m.kind == "text" ? root.m.text : "";
+            wrap: word-wrap;
+            font-size: 13px;
+            color: root.m.outgoing ? Theme.accent-contrast : Theme.text;
+        }
+    }
+    if m.kind == "sticker": Rectangle {
+        y: root.top;
+        x: root.m.outgoing ? root.width - 160px : 0px;
+        width: 160px;
+        height: 160px;
+        if root.m.has-sticker: Image {
+            width: 160px;
+            height: 160px;
+            source: root.m.sticker;
+            image-fit: contain;
+        }
+        if !root.m.has-sticker: Text {
+            text: root.m.text;
+            font-size: 96px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        sta := TouchArea {
+            changed has-hover => { root.sticker-hover(root.m.id, self.has-hover); }
+        }
+    }
+    fc := FileCard {
+        visible: root.m.kind == "file";
+        y: root.top;
+        x: root.m.outgoing ? root.width - 210px : 0px;
+        height: root.m.kind == "file" ? self.h : 0px;
+        m: root.m;
+        action(a) => { root.action(root.m.id, a); }
+        fix => { root.fix(); }
+    }
+}
+
+component EmojiGrid inherits Rectangle {
+    in property <[EmojiCell]> cells;
+    in property <int> cols;
+    in property <length> cw;
+    in property <string> hovered;
+    in property <image> hover-img;
+    callback pick(string);
+    callback hover(string, bool);
+    callback remove(string);
+    height: ceil(cells.length / max(1, cols)) * 38px;
+    for c[i] in cells: Rectangle {
+        x: mod(i, root.cols) * root.cw;
+        y: floor(i / root.cols) * 38px;
+        width: root.cw;
+        height: 38px;
+        border-radius: 9px;
+        background: cta.has-hover ? Theme.hover : transparent;
+        animate background { duration: Theme.dur-fast; }
+        Image {
+            width: cta.has-hover ? 30px : 27px;
+            height: self.width;
+            source: (root.hovered == c.key && cta.has-hover) ? root.hover-img : c.img;
+            image-fit: contain;
+            animate width { duration: Theme.dur; easing: cubic-bezier(0.2, 0.9, 0.3, 1.4); }
+        }
+        cta := TouchArea {
+            changed has-hover => { root.hover(c.key, self.has-hover); }
+            pointer-event(e) => {
+                if e.kind == PointerEventKind.up && e.button == PointerEventButton.left { root.pick(c.key); }
+                if e.kind == PointerEventKind.up && e.button == PointerEventButton.right { root.remove(c.key); }
+            }
+        }
+    }
+}
+
+component EmojiPanel inherits Rectangle {
+    in property <[EmojiSection]> sections;
+    in property <string> active-tab;
+    in property <string> hovered;
+    in property <image> hover-img;
+    in property <bool> importing;
+    in-out property <string> query;
+    in-out property <length> scroll-y <=> gs.content-y;
+    out property <int> cols: floor((gs.width - 12px) / 36px);
+    callback pick(string);
+    callback hover(string, bool);
+    callback remove(string);
+    callback search(string);
+    callback jump(string);
+    callback import();
+    callback close();
+    border-radius: 14px;
+    background: Theme.glass-strong-solid;
+    border-width: 0.5px;
+    border-color: Theme.glass-border;
+    TouchArea {}   // 面板内点击不穿透到下面
+    VerticalLayout {
+        // search
+        Rectangle {
+            height: 4px + 8px + 22px;
+            Rectangle {
+                x: 8px;
+                y: 8px;
+                width: parent.width - 16px;
+                height: 22px;
+                border-radius: 8px;
+                background: Theme.hover;
+                Icon { x: 9px; d: Icons.search; size: 13px; color: Theme.text-3; }
+                q := TextInput {
+                    x: 9px + 13px + 6px;
+                    width: parent.width - 9px - 13px - 6px - 9px;
+                    height: parent.height;
+                    vertical-alignment: center;
+                    font-size: 12px;
+                    color: Theme.text;
+                    text <=> root.query;
+                    selection-background-color: Theme.accent.with-alpha(0.35);
+                    edited => { root.search(self.text); }
+                    key-pressed(e) => {
+                        if e.text == Key.Escape { root.close(); return accept; }
+                        reject
+                    }
+                }
+                if root.query == "": Text {
+                    x: q.x;
+                    height: parent.height;
+                    vertical-alignment: center;
+                    text: "搜索表情（中文 / English）";
+                    color: Theme.text-3;
+                    font-size: 12px;
+                }
+            }
+        }
+        gs := Flickable {
+            vertical-stretch: 1;
+            content-height: gcol.preferred-height;
+            gcol := VerticalLayout {
+                padding-left: 6px;
+                padding-right: 6px;
+                padding-bottom: 6px;
+                for s in root.sections: VerticalLayout {
+                    if s.label != "": HorizontalLayout {
+                        padding-top: 8px;
+                        padding-bottom: 4px;
+                        padding-left: 4px;
+                        padding-right: 4px;
+                        Text { text: s.label; font-size: 10.5px; font-weight: 600; color: Theme.text-3; vertical-alignment: center; horizontal-stretch: 1; }
+                        if s.stickers: Rectangle {
+                            width: imp.preferred-width + 16px;
+                            height: 18px;
+                            border-radius: 5px;
+                            background: ita.has-hover ? Theme.hover : transparent;
+                            HorizontalLayout {
+                                padding-left: 6px;
+                                padding-right: 6px;
+                                spacing: 3px;
+                                Icon { y: (parent.height - 12px) / 2; d: Icons.upload; size: 12px; color: Theme.accent; }
+                                imp := Text { text: root.importing ? "导入中…" : "导入 .tgs"; font-size: 10.5px; font-weight: 600; color: Theme.accent; vertical-alignment: center; }
+                            }
+                            ita := TouchArea { clicked => { if !root.importing { root.import(); } } }
+                        }
+                    }
+                    if s.cells.length > 0: EmojiGrid {
+                        cells: s.cells;
+                        cols: max(1, root.cols);
+                        cw: (gs.width - 12px) / max(1, root.cols);
+                        hovered: root.hovered;
+                        hover-img: root.hover-img;
+                        pick(k) => { root.pick(k); }
+                        hover(k, h) => { root.hover(k, h); }
+                        remove(k) => { root.remove(k); }
+                    }
+                    if s.note != "": Text {
+                        text: s.note;
+                        wrap: word-wrap;
+                        font-size: 11.5px;
+                        color: Theme.text-3;
+                        horizontal-alignment: center;
+                        height: self.preferred-height + 16px;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+        // tabs
+        Rectangle {
+            height: 34px;
+            Rectangle { y: 0; height: 0.5px; background: Theme.sep; }
+            HorizontalLayout {
+                padding-left: 6px;
+                padding-right: 6px;
+                padding-top: 4px;
+                padding-bottom: 4px;
+                spacing: 2px;
+                for t in [
+                    { id: "recent", icon: Icons.clock2 },
+                    { id: "smileys", icon: Icons.smile },
+                    { id: "gestures", icon: Icons.hand },
+                    { id: "hearts", icon: Icons.heart },
+                    { id: "celebrate", icon: Icons.flag },
+                    { id: "animals", icon: Icons.paw },
+                    { id: "stickers", icon: Icons.sticker },
+                ]: Rectangle {
+                    horizontal-stretch: 1;
+                    border-radius: 7px;
+                    background: (root.active-tab == t.id && root.query == "") ? Theme.accent.with-alpha(0.14) : (tta.has-hover ? Theme.hover : transparent);
+                    Icon { d: t.icon; size: 15px; color: (root.active-tab == t.id && root.query == "") ? Theme.accent : Theme.text-2; }
+                    tta := TouchArea { clicked => { root.jump(t.id); } }
+                }
+            }
+        }
+    }
+    public function focus-search() { q.focus(); }
 }
 
 export component PanelWindow inherits Window {
@@ -217,31 +584,85 @@ export component PanelWindow inherits Window {
 
     in property <[PeerItem]> peers;
     in property <[MsgItem]> messages;
-    in property <string> selected-id;   // "" = 全部
+    in property <bool> broadcast;
+    in property <string> current-id;          // 当前会话（单个）
     in property <string> header-title: "Lancat";
     in property <string> subtitle;
     in property <bool> subtitle-accent;
     in property <bool> refreshing;
+    in property <bool> pinned;
+    in property <int> problems;               // 诊断问题数：齿轮红点
+    in property <string> banner-title;        // 空 = 无横幅
+    in property <string> banner-detail;
     in property <string> toast;
+    in property <bool> no-peers;              // 一台设备都没有：空态
+    in property <string> me-name;
+    in property <bool> panel-visible: true;  // 收起时停掉一切持续动画
+    in property <int> online-count;
+    in property <string> placeholder: "发消息…";
+    in property <bool> can-send: true;
     in-out property <string> draft;
-    /// 拖着文件进来时的提示（空 = 不在拖）
-    in property <string> drop-hint;
+    in-out property <string> manual-addr;
+    in property <bool> adding;
+    // 拖拽
+    in property <bool> dragging;
+    in property <string> drop-key;            // peer:<id> | all | conversation | ""
+    in property <[DropSlot]> drop-slots;
+    in property <int> drag-count;
+    // 表情
+    in-out property <bool> emoji-open;
+    in property <[EmojiSection]> emoji-sections;
+    in property <string> emoji-tab: "recent";
+    in property <string> emoji-hovered;
+    in property <image> emoji-hover-img;
+    in property <bool> importing;
+    in-out property <string> emoji-query;
+    in-out property <length> emoji-scroll;
+    out property <int> emoji-cols: ep.cols;
+    // 菜单
+    in-out property <bool> attach-open;
+    in-out property <string> menu-peer;       // 右键菜单的设备 id（空 = 关）
+    in property <bool> menu-blocked;
+    in-out property <length> menu-x;
+    in-out property <length> menu-y;
     out property <bool> composer-focused: input.has-focus;
+    out property <length> sidebar-w: 66px;
+    out property <length> header-h: 46px;
+    out property <length> list-content-h: list.content-height;
 
-    callback select-peer(string);
+    callback select-peer(string, bool);
+    callback select-all();
     callback send-text(string);
     callback typing();
+    callback composer-blur();
     callback refresh();
+    callback toggle-pin();
     callback open-settings();
     callback escape();
     callback header-pressed();
+    callback peer-menu(string, length, length);
+    callback menu-action(string);
+    callback attach(bool);
+    callback file-action(string, string);
+    callback open-diag();
+    callback dismiss-banner();
+    callback add-manual(string);
+    callback emoji-pick(string);
+    callback emoji-hover(string, bool);
+    callback emoji-remove(string);
+    callback emoji-search(string);
+    callback emoji-jump(string);
+    callback emoji-import();
+    callback emoji-toggled(bool);
+    callback sticker-hover(string, bool);
+    callback scrolled(length, length, length);
 
-    // glass tint (the native Acrylic behind it is the blur), 8px DWM corner
+    // 玻璃底色（下面是原生 Acrylic 模糊），DWM 8px 圆角
     Rectangle {
         background: Theme.glass;
         border-radius: 8px;
     }
-    // specular rim on top (Windows glass cue)
+    // 顶部高光（Windows 玻璃）
     Rectangle {
         y: 0;
         height: 1px;
@@ -250,181 +671,524 @@ export component PanelWindow inherits Window {
         background: Theme.rim-top;
     }
 
-    HorizontalLayout {
-        // sidebar
+    VerticalLayout {
+        // ---- header：整宽 ----
         Rectangle {
-            width: 66px;
-            background: Theme.sidebar;
-            Rectangle { x: parent.width - 0.5px; width: 0.5px; background: Theme.sep; }
-            Flickable {
-                content-height: col.preferred-height;
-                col := VerticalLayout {
+            height: 46px;
+            TouchArea {
+                pointer-event(e) => {
+                    if e.kind == PointerEventKind.down && e.button == PointerEventButton.left { root.header-pressed(); }
+                }
+            }
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 10px;
+                spacing: 4px;
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 1;
+                    Text { text: root.header-title; font-size: 13px; font-weight: 600; color: Theme.text; overflow: elide; }
+                    Text { text: root.subtitle; font-size: 11px; color: root.subtitle-accent ? Theme.accent : Theme.text-2; overflow: elide; }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    IconButton { d: Icons.retry; on: root.refreshing; clicked => { root.refresh(); } }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    IconButton { d: Icons.pin; on: root.pinned; clicked => { root.toggle-pin(); } }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 26px;
+                        height: 26px;
+                        IconButton { d: Icons.gear; clicked => { if root.problems > 0 { root.open-diag(); } else { root.open-settings(); } } }
+                        if root.problems > 0: Rectangle {
+                            x: 26px - 3px - 7px;
+                            y: 3px;
+                            width: 7px + 3px;
+                            height: 7px + 3px;
+                            border-radius: 5px;
+                            background: Theme.glass-strong-solid;
+                            Rectangle { width: 7px; height: 7px; border-radius: 3.5px; background: Theme.danger; }
+                        }
+                    }
+                }
+            }
+            Rectangle { y: parent.height - 0.5px; height: 0.5px; background: Theme.sep; }
+        }
+        // ---- banner ----
+        if root.banner-title != "": Rectangle {
+            height: 6px + bl.preferred-height;
+            bg := Rectangle {
+                x: 8px;
+                y: 6px;
+                width: parent.width - 16px;
+                height: bl.preferred-height;
+                border-radius: 10px;
+                background: #ff9f0a.with-alpha(0.14);
+                border-width: 0.5px;
+                border-color: #ff9f0a.with-alpha(0.45);
+                bl := HorizontalLayout {
+                    padding-top: 6px;
+                    padding-bottom: 6px;
+                    padding-left: 9px;
+                    padding-right: 6px;
+                    spacing: 8px;
+                    VerticalLayout { alignment: center; Icon { d: Icons.alert; size: 15px; sw: 1.9; color: Theme.dark ? #ffb340 : #e08600; } }
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 1;
+                        Text { text: root.banner-title; font-size: 12px; font-weight: 600; color: Theme.text; overflow: elide; }
+                        if root.banner-detail != "": Text { text: root.banner-detail; font-size: 10.5px; color: Theme.text-2; overflow: elide; }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: go.preferred-width + 20px;
+                            height: 21px;
+                            border-radius: 6px;
+                            background: gta.has-hover ? Theme.accent.brighter(0.08) : Theme.accent;
+                            go := Text { text: "去修复"; font-size: 11.5px; font-weight: 500; color: Theme.accent-contrast; }
+                            gta := TouchArea { clicked => { root.open-diag(); } }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        IconButton { width: 22px; height: 22px; d: Icons.x; icon-size: 13px; clicked => { root.dismiss-banner(); } }
+                    }
+                }
+            }
+        }
+        // ---- body ----
+        HorizontalLayout {
+            vertical-stretch: 1;
+            // sidebar
+            Rectangle {
+                width: 66px;
+                background: Theme.sidebar;
+                Rectangle { x: parent.width - 0.5px; width: 0.5px; background: Theme.sep; }
+                VerticalLayout {
                     padding-top: 8px;
                     padding-bottom: 8px;
-                    padding-left: 4px;
-                    padding-right: 4px;
-                    spacing: 0px;
                     SidebarItem {
                         all: true;
-                        active: root.selected-id == "";
-                        clicked => { root.select-peer(""); }
+                        active: root.broadcast;
+                        drop-hot: root.drop-key == "all";
+                        clicked => { root.select-all(); }
                     }
-                    Rectangle { height: 11px; Rectangle { height: 0.5px; x: 10px; width: parent.width - 20px; background: Theme.sep; } }
-                    for p in root.peers: SidebarItem {
-                        peer: p;
-                        active: root.selected-id == p.id;
-                        clicked => { root.select-peer(p.id); }
+                    Rectangle {
+                        height: 4px + 0.5px + 6px;
+                        Rectangle { y: 4px; height: 0.5px; x: 14px; width: parent.width - 28px; background: Theme.sep; }
                     }
-                }
-            }
-        }
-        // main column
-        VerticalLayout {
-            // header
-            Rectangle {
-                height: 46px;
-                // 按住标题栏拖动 = 移动停靠条（dock::begin_move）；按钮在上层，照常点击
-                TouchArea {
-                    pointer-event(e) => {
-                        if e.kind == PointerEventKind.down && e.button == PointerEventButton.left { root.header-pressed(); }
-                    }
-                }
-                HorizontalLayout {
-                    padding-left: 14px;
-                    padding-right: 10px;
-                    spacing: 4px;
-                    VerticalLayout {
-                        alignment: center;
-                        Text { text: root.header-title; font-size: 13px; font-weight: 600; color: Theme.text; overflow: elide; }
-                        if root.subtitle != "": Text { text: root.subtitle; font-size: 11px; color: root.subtitle-accent ? Theme.accent : Theme.text-2; overflow: elide; }
-                    }
-                    VerticalLayout {
-                        alignment: center;
-                        IconButton { glyph: "⟳"; spin: root.refreshing; clicked => { root.refresh(); } }
-                    }
-                    VerticalLayout {
-                        alignment: center;
-                        IconButton { glyph: "⚙"; clicked => { root.open-settings(); } }
-                    }
-                }
-                Rectangle { y: parent.height - 0.5px; height: 0.5px; background: Theme.sep; }
-            }
-            // conversation
-            list := Flickable {
-                vertical-stretch: 1;
-                content-height: msgcol.preferred-height;
-                msgcol := VerticalLayout {
-                    padding-left: 10px;
-                    padding-right: 10px;
-                    padding-top: 4px;
-                    padding-bottom: 6px;
-                    alignment: end;
-                    min-height: list.height;
-                    for m in root.messages: Bubble { m: m; avail: list.width - 20px; }
-                }
-            }
-            // composer
-            Rectangle {
-                Rectangle { y: 0; height: 0.5px; background: Theme.sep; }
-                HorizontalLayout {
-                    padding-left: 6px;
-                    padding-right: 8px;
-                    padding-top: 8px;
-                    padding-bottom: 9px;
-                    spacing: 2px;
-                    alignment: stretch;
-                    VerticalLayout { alignment: end; IconButton { glyph: "+"; } }
-                    VerticalLayout { alignment: end; IconButton { glyph: "☺"; } }
-                    field := Rectangle {
-                        horizontal-stretch: 1;
-                        height: max(30px, min(96px, input.preferred-height + 12px));
-                        border-radius: 15px;
-                        background: Theme.field;
-                        border-width: 0.5px;
-                        border-color: input.has-focus ? Theme.accent.with-alpha(0.6) : Theme.glass-border;
-                        keys := FocusScope {
-                            capture-key-pressed(event) => {
-                                if event.text == Key.Return && !event.modifiers.shift {
-                                    if root.draft != "" { root.send-text(root.draft); root.draft = ""; }
-                                    return accept;
-                                }
-                                if event.text == Key.Escape { root.escape(); return accept; }
-                                reject
+                    side := Flickable {
+                        vertical-stretch: 1;
+                        content-height: col.preferred-height;
+                        col := VerticalLayout {
+                            for p in root.peers: SidebarItem {
+                                peer: p;
+                                active: !root.broadcast && root.current-id == p.id;
+                                drop-hot: root.drop-key == "peer:" + p.id;
+                                clicked(shift) => { root.select-peer(p.id, shift); }
+                                menu(x, y) => { root.peer-menu(p.id, self.absolute-position.x + x, self.absolute-position.y + y); }
                             }
-                            input := TextInput {
-                                x: 11px;
-                                y: 6px;
-                                width: parent.width - 22px;
-                                single-line: false;
-                                wrap: word-wrap;
-                                font-size: 13px;
+                        }
+                    }
+                }
+            }
+            // main column
+            main := Rectangle {
+                horizontal-stretch: 1;
+                VerticalLayout {
+                    width: parent.width;
+                    height: parent.height;
+                    visible: root.no-peers;
+                    alignment: center;
+                    padding: 20px;
+                    spacing: 6px;
+                    HorizontalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 88px;
+                            height: 88px + 8px;
+                            for r[i] in [0, 1, 2]: Rectangle {
+                                property <float> ph: root.panel-visible && root.no-peers ? mod(animation-tick() / 2400ms + i / 3, 1) : 0.5;
+                                width: 88px * (0.45 + 0.55 * ph);
+                                height: self.width;
+                                x: (88px - self.width) / 2;
+                                y: (88px - self.width) / 2;
+                                border-radius: self.width / 2;
+                                border-width: 1.5px;
+                                border-color: Theme.accent;
+                                opacity: 0.7 * (1 - ph);
+                            }
+                            Rectangle {
+                                x: 22px;
+                                y: 22px;
+                                width: 44px;
+                                height: 44px;
+                                border-radius: 22px;
+                                background: Theme.accent;
+                                Icon { d: Icons.radar; size: 22px; color: Theme.accent-contrast; }
+                            }
+                        }
+                    }
+                    Text { text: "正在寻找局域网内的设备…"; font-weight: 600; font-size: 13.5px; color: Theme.text; horizontal-alignment: center; }
+                    HorizontalLayout {
+                        alignment: center;
+                        Text {
+                            width: min(230px, self.preferred-width);
+                            text: "在其他电脑上打开 Lancat，它们会自动出现在左侧。" + (root.me-name != "" ? "本机名为「" + root.me-name + "」。" : "");
+                            wrap: word-wrap;
+                            font-size: 11.5px;
+                            color: Theme.text-2;
+                            horizontal-alignment: center;
+                        }
+                    }
+                    HorizontalLayout {
+                        alignment: center;
+                        padding-top: 12px;
+                        spacing: 6px;
+                        Rectangle {
+                            width: 170px;
+                            height: 26px;
+                            border-radius: 7px;
+                            background: Theme.field;
+                            border-width: 0.5px;
+                            border-color: Theme.glass-border;
+                            mi := TextInput {
+                                x: 9px;
+                                width: parent.width - 18px;
+                                height: parent.height;
+                                vertical-alignment: center;
+                                font-size: 12px;
                                 color: Theme.text;
-                                selection-background-color: Theme.accent.with-alpha(0.35);
-                                text <=> root.draft;
-                                edited => { root.typing(); }
+                                text <=> root.manual-addr;
+                                accepted => { root.add-manual(self.text); }
                             }
+                            if root.manual-addr == "": Text { x: 9px; text: "手动添加：192.168.1.20"; font-size: 12px; color: Theme.text-3; }
                         }
-                        if root.draft == "" && !input.has-focus: Text {
-                            x: 11px;
-                            text: "发消息…";
-                            color: Theme.text-3;
-                            font-size: 13px;
-                        }
-                    }
-                    VerticalLayout {
-                        alignment: end;
-                        send := Rectangle {
-                            width: 30px;
-                            height: 30px;
-                            border-radius: 15px;
+                        Rectangle {
+                            width: 28px;
+                            height: 26px;
+                            border-radius: 7px;
                             background: Theme.accent;
-                            opacity: root.draft != "" ? 1 : 0.35;
-                            transform-scale: root.draft != "" ? (sta.pressed ? 0.9 : 1.0) : 0.88;
-                            animate opacity { duration: Theme.dur; }
-                            animate transform-scale { duration: Theme.dur-slow; easing: cubic-bezier(0.2, 0.9, 0.3, 1.4); }
-                            Text { text: "↑"; color: Theme.accent-contrast; font-size: 15px; font-weight: 700; }
-                            sta := TouchArea {
-                                clicked => { if root.draft != "" { root.send-text(root.draft); root.draft = ""; } }
+                            opacity: root.adding ? 0.5 : 1;
+                            Icon { d: Icons.plus; size: 14px; color: Theme.accent-contrast; }
+                            TouchArea { clicked => { if !root.adding { root.add-manual(root.manual-addr); } } }
+                        }
+                    }
+                }
+                VerticalLayout {
+                    width: parent.width;
+                    height: parent.height;
+                    visible: !root.no-peers;
+                    // conversation
+                    list := Flickable {
+                        vertical-stretch: 1;
+                        // 不让内容的尺寸约束回流到布局（msgcol 的 min-height 取 list.height）
+                        min-height: 0px;
+                        preferred-height: 0px;
+                        max-height: 100000px;
+                        content-height: msgcol.preferred-height;
+                        changed content-y => { root.scrolled(self.content-y, self.height, self.content-height); }
+                        msgcol := VerticalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            padding-top: 2px;
+                            padding-bottom: 6px;
+                            alignment: end;
+                            min-height: list.height;
+                            if root.broadcast || root.messages.length == 0: VerticalLayout {
+                                alignment: center;
+                                min-height: list.height - 8px;
+                                padding-left: 18px;
+                                padding-right: 18px;
+                                spacing: 4px;
+                                Text {
+                                    text: root.broadcast ? "群发模式" : "还没有消息";
+                                    font-size: 14px;
+                                    font-weight: 600;
+                                    color: Theme.text-2;
+                                    horizontal-alignment: center;
+                                }
+                                Text {
+                                    text: root.broadcast ? "输入的消息、表情和拖进来的文件会发给全部 " + root.online-count + " 台在线设备，并分别记入各自的会话。" : "把文件拖到这里或头像上即可发送，无需对方确认。";
+                                    wrap: word-wrap;
+                                    font-size: 12px;
+                                    color: Theme.text-3;
+                                    horizontal-alignment: center;
+                                }
+                            }
+                            if !root.broadcast: VerticalLayout {
+                                for m in root.messages: MessageRow {
+                                    m: m;
+                                    avail: list.width - 20px;
+                                    action(id, a) => { root.file-action(id, a); }
+                                    fix => { root.open-diag(); }
+                                    sticker-hover(id, h) => { root.sticker-hover(id, h); }
+                                }
                             }
                         }
                     }
+                    // composer
+                    Rectangle {
+                        height: max(30px, fieldbox.height) + 8px + 9px;
+                        Rectangle { y: 0; height: 0.5px; background: Theme.sep; }
+                        HorizontalLayout {
+                            padding-left: 6px;
+                            padding-right: 8px;
+                            padding-top: 8px;
+                            padding-bottom: 9px;
+                            spacing: 2px;
+                            VerticalLayout {
+                                alignment: end;
+                                IconButton {
+                                    width: 30px;
+                                    height: 30px;
+                                    d: Icons.smile;
+                                    icon-size: 18px;
+                                    on: root.emoji-open;
+                                    enabled: root.can-send;
+                                    clicked => {
+                                        root.attach-open = false;
+                                        root.emoji-open = !root.emoji-open;
+                                        root.emoji-toggled(root.emoji-open);
+                                    }
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: end;
+                                IconButton {
+                                    width: 30px;
+                                    height: 30px;
+                                    d: Icons.clip;
+                                    icon-size: 17px;
+                                    enabled: root.can-send;
+                                    clicked => {
+                                        if root.emoji-open { root.emoji-open = false; root.emoji-toggled(false); }
+                                        root.attach-open = !root.attach-open;
+                                    }
+                                }
+                            }
+                            fieldbox := Rectangle {
+                                horizontal-stretch: 1;
+                                height: min(96px, max(30px, input.preferred-height + 12px));
+                                border-radius: 15px;
+                                background: Theme.field;
+                                border-width: 0.5px;
+                                border-color: Theme.glass-border;
+                                opacity: root.can-send ? 1 : 0.45;
+                                // focus 光环：0 0 0 3px accent 35%
+                                Rectangle {
+                                    x: -3px;
+                                    y: -3px;
+                                    width: parent.width + 6px;
+                                    height: parent.height + 6px;
+                                    border-radius: 18px;
+                                    border-width: 3px;
+                                    border-color: Theme.accent.with-alpha(input.has-focus ? 0.35 : 0);
+                                    animate border-color { duration: Theme.dur-fast; }
+                                }
+                                keys := FocusScope {
+                                    capture-key-pressed(event) => {
+                                        if event.text == Key.Return && !event.modifiers.shift {
+                                            if root.draft != "" && root.can-send { root.send-text(root.draft); root.draft = ""; }
+                                            return accept;
+                                        }
+                                        if event.text == Key.Escape {
+                                            if root.emoji-open { root.emoji-open = false; root.emoji-toggled(false); return accept; }
+                                            root.escape();
+                                            return accept;
+                                        }
+                                        reject
+                                    }
+                                    input := TextInput {
+                                        x: 11px;
+                                        y: 6px;
+                                        width: parent.width - 22px;
+                                        single-line: false;
+                                        wrap: word-wrap;
+                                        font-size: 13px;
+                                        enabled: root.can-send;
+                                        color: Theme.text;
+                                        selection-background-color: Theme.accent.with-alpha(0.35);
+                                        text <=> root.draft;
+                                        edited => { root.typing(); }
+                                        changed has-focus => { if !self.has-focus { root.composer-blur(); } }
+                                    }
+                                }
+                                if root.draft == "": Text {
+                                    x: 11px;
+                                    y: 6px;
+                                    text: root.placeholder;
+                                    color: Theme.text-3;
+                                    font-size: 13px;
+                                    overflow: elide;
+                                    width: parent.width - 22px;
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: end;
+                                padding-left: 4px;
+                                send := Rectangle {
+                                    width: 30px;
+                                    height: 30px;
+                                    border-radius: 15px;
+                                    background: Theme.accent;
+                                    opacity: root.draft != "" ? 1 : 0.35;
+                                    animate opacity { duration: Theme.dur; }
+                                    Icon { d: Icons.send; size: 14px; sw: 2.2; color: Theme.accent-contrast; }
+                                    sta := TouchArea {
+                                        clicked => { if root.draft != "" && root.can-send { root.send-text(root.draft); root.draft = ""; } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // 拖到会话区：虚线框（Slint 无虚线，用 2px 实线 85%）
+                if root.drop-key == "conversation": Rectangle {
+                    x: 6px;
+                    y: 6px;
+                    width: parent.width - 12px;
+                    height: parent.height - 12px;
+                    border-radius: 12px;
+                    border-width: 2px;
+                    border-color: Theme.accent.with-alpha(0.85);
                 }
             }
         }
     }
 
-    if root.drop-hint != "": Rectangle {
-        x: 6px;
-        y: 6px;
-        width: parent.width - 12px;
-        height: parent.height - 12px;
-        border-radius: 12px;
-        border-width: 2px;
-        border-color: Theme.accent;
-        background: Theme.accent.with-alpha(0.08);
-        Rectangle {
-            width: min(dh.preferred-width + 28px, parent.width - 24px);
-            height: 34px;
-            border-radius: 17px;
-            background: Theme.glass-strong;
-            dh := Text { text: root.drop-hint; color: Theme.text; font-size: 12.5px; font-weight: 500; overflow: elide; }
+    // ---- 弹出层 ----
+    if root.attach-open || root.menu-peer != "" || root.emoji-open: TouchArea {
+        clicked => {
+            root.attach-open = false;
+            root.menu-peer = "";
+            if root.emoji-open { root.emoji-open = false; root.emoji-toggled(false); }
         }
     }
+    if root.attach-open: Rectangle {
+        x: 66px + 6px + 30px + 2px;
+        y: root.height - 9px - 30px - 6px - self.height;
+        width: 120px;
+        height: 4px * 2 + 27px * 2;
+        border-radius: 9px;
+        background: Theme.glass-strong-solid;
+        border-width: 0.5px;
+        border-color: Theme.glass-border;
+        VerticalLayout {
+            padding: 4px;
+            MenuItem { icon: Icons.doc; label: "文件…"; clicked => { root.attach-open = false; root.attach(false); } }
+            MenuItem { icon: Icons.folder; label: "文件夹…"; clicked => { root.attach-open = false; root.attach(true); } }
+        }
+    }
+    if root.menu-peer != "": Rectangle {
+        x: min(root.menu-x, 220px);
+        y: min(root.menu-y, 420px);
+        width: 150px;
+        height: 5px * 2 + 27px * 3;
+        border-radius: 10px;
+        background: Theme.glass-strong-solid;
+        border-width: 0.5px;
+        border-color: Theme.glass-border;
+        VerticalLayout {
+            padding: 5px;
+            MenuItem { icon: Icons.block; label: root.menu-blocked ? "取消拉黑" : "拉黑此设备"; clicked => { root.menu-action("block"); } }
+            MenuItem { icon: Icons.trash; label: "清空聊天记录"; clicked => { root.menu-action("clear"); } }
+            MenuItem { icon: Icons.x; label: "删除设备"; danger: true; clicked => { root.menu-action("forget"); } }
+        }
+    }
+    ep := EmojiPanel {
+        visible: root.emoji-open;
+        x: 66px + 6px;
+        y: root.height - (30px + 8px + 9px) - 6px - 288px;
+        width: root.width - 66px - 12px;
+        height: 288px;
+        sections: root.emoji-sections;
+        active-tab: root.emoji-tab;
+        hovered: root.emoji-hovered;
+        hover-img: root.emoji-hover-img;
+        importing: root.importing;
+        query <=> root.emoji-query;
+        scroll-y <=> root.emoji-scroll;
+        pick(k) => { root.emoji-pick(k); }
+        hover(k, h) => { root.emoji-hover(k, h); }
+        remove(k) => { root.emoji-remove(k); }
+        search(q) => { root.emoji-search(q); }
+        jump(t) => { root.emoji-jump(t); }
+        import => { root.emoji-import(); }
+        close => { root.emoji-open = false; root.emoji-toggled(false); }
+    }
+
+    // ---- 拖拽选择（DropPicker）：槽位几何固定（Rust 端 drop_hit 用同一公式命中测试）----
+    if root.dragging: Rectangle {
+        background: Theme.glass-strong-solid.with-alpha(0.55);
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: parent.height / 2 - 20px - 18px - 30px;
+            width: hint.preferred-width + 28px;
+            height: 30px;
+            border-radius: 15px;
+            background: Theme.glass-strong-solid;
+            border-width: 0.5px;
+            border-color: Theme.glass-border;
+            hint := Text {
+                text: root.drop-focus-name != "" ? "松开发送给 " + root.drop-focus-name : (root.drop-slots.length > 0 ? "拖到头像上发送" + (root.drag-count > 0 ? " " + root.drag-count + " 项" : "") : "没有在线设备");
+                font-size: 12.5px;
+                font-weight: 500;
+                color: Theme.text;
+            }
+        }
+        for s[i] in root.drop-slots: Rectangle {
+            property <bool> hot: root.drop-key == s.key;
+            x: (root.width - root.drop-slots.length * 72px - (root.drop-slots.length - 1) * 8px) / 2 + i * 80px;
+            y: root.height / 2 - 20px;
+            width: 72px;
+            height: 100px;
+            border-radius: 12px;
+            background: hot ? Theme.accent.with-alpha(0.12) : transparent;
+            Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: 8px + (56px - self.width) / 2;
+                width: hot ? 62px : 56px;
+                height: self.width;
+                border-radius: self.width / 2;
+                background: s.all ? Theme.hover : @linear-gradient(180deg, s.c1 0%, s.c2 100%);
+                border-width: hot ? 3px : 0px;
+                border-color: Theme.accent;
+                animate width { duration: Theme.dur; easing: cubic-bezier(0.2, 0.9, 0.3, 1.4); }
+                Text { text: s.all ? "全部" : s.initials; color: s.all ? Theme.text : #ffffff; font-size: s.all ? 13px : 17px; font-weight: 600; }
+            }
+            Text { y: 8px + 56px + 4px; width: parent.width; text: s.name; font-size: 11.5px; font-weight: 500; color: Theme.text; horizontal-alignment: center; overflow: elide; }
+            Text { y: 8px + 56px + 4px + 15px; width: parent.width; text: s.os; font-size: 10px; color: Theme.text-2; horizontal-alignment: center; }
+        }
+    }
+    in property <string> drop-focus-name;
 
     if root.toast != "": Rectangle {
-        y: parent.height - 70px;
+        y: parent.height - 64px - 30px;
         x: (parent.width - self.width) / 2;
         width: min(tt.preferred-width + 24px, parent.width * 0.8);
         height: 30px;
         border-radius: 10px;
         background: rgba(0, 0, 0, 0.42);
-        tt := Text { text: root.toast; color: #ffffff; font-size: 12px; }
+        Rectangle { y: 0; x: 6px; width: parent.width - 12px; height: 1px; background: rgba(255, 255, 255, 0.28); }
+        tt := Text { text: root.toast; color: #ffffff; font-size: 12px; overflow: elide; width: parent.width - 24px; horizontal-alignment: center; }
     }
 
     public function scroll-to-end() {
         list.content-y = min(0px, list.height - list.content-height);
     }
+    public function keep-scroll(delta: length) {
+        list.content-y = list.content-y - delta;
+    }
     public function focus-input() {
         input.focus();
+    }
+    public function focus-emoji-search() {
+        ep.focus-search();
     }
 }

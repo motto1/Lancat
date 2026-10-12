@@ -1,0 +1,109 @@
+// 共用：主题 token（src/styles/global.css）、线条图标、图标按钮、设置页按钮。
+
+export global Theme {
+    in-out property <bool> dark: false;
+    in-out property <bool> native-glass: true;
+    in-out property <color> accent: #0a84ff;
+    out property <color> accent-contrast: #ffffff;
+    out property <color> glass: native-glass
+        ? (dark ? rgba(30, 30, 34, 0.38) : rgba(246, 246, 248, 0.42))
+        : (dark ? rgba(36, 36, 40, 0.82) : rgba(246, 246, 248, 0.86));
+    out property <color> glass-strong: dark ? rgba(44, 44, 48, 0.94) : rgba(252, 252, 253, 0.94);
+    // 弹出层/描边用的不透明版本（软件渲染下半透明叠半透明会发灰）
+    out property <color> glass-strong-solid: dark ? #2c2c30 : #fcfcfd;
+    out property <color> glass-border: dark ? rgba(255, 255, 255, 0.12) : rgba(0, 0, 0, 0.1);
+    out property <color> sidebar: dark ? rgba(255, 255, 255, 0.04) : rgba(0, 0, 0, 0.035);
+    out property <color> text: dark ? #f5f5f7 : #1d1d1f;
+    out property <color> text-2: dark ? rgba(235, 235, 245, 0.68) : rgba(60, 60, 67, 0.72);
+    out property <color> text-3: dark ? rgba(235, 235, 245, 0.38) : rgba(60, 60, 67, 0.45);
+    out property <color> sep: dark ? rgba(255, 255, 255, 0.09) : rgba(0, 0, 0, 0.08);
+    out property <color> bubble-in: dark ? rgba(255, 255, 255, 0.1) : rgba(0, 0, 0, 0.06);
+    out property <color> hover: dark ? rgba(255, 255, 255, 0.07) : rgba(0, 0, 0, 0.05);
+    out property <color> field: dark ? rgba(255, 255, 255, 0.07) : rgba(255, 255, 255, 0.7);
+    out property <color> rim-top: dark ? rgba(255, 255, 255, 0.22) : rgba(255, 255, 255, 0.85);
+    out property <color> online: #30d158;
+    out property <color> danger: #ff3b30;
+    out property <color> warn: #ff9f0a;
+    out property <duration> dur-fast: 120ms;
+    out property <duration> dur: 160ms;
+    out property <duration> dur-slow: 220ms;
+}
+
+/// 24×24 线条图标（与旧版 Icon.svelte 相同：stroke-linecap/linejoin round，stroke 1.7）
+export component Icon inherits Path {
+    in property <string> d;
+    in property <length> size: 16px;
+    in property <float> sw: 1.7;
+    in property <color> color: Theme.text-2;
+    width: size;
+    height: size;
+    commands: d;
+    viewbox-x: 0;
+    viewbox-y: 0;
+    viewbox-width: 24;
+    viewbox-height: 24;
+    fill: transparent;
+    stroke: color;
+    stroke-width: size * sw / 24;
+    stroke-line-cap: round;
+    stroke-line-join: round;
+}
+
+/// .icon-btn：26×26 圆角 7，悬停 --hover 底 + 文字色，.on = accent
+export component IconButton inherits Rectangle {
+    in property <string> d;
+    in property <length> icon-size: 15px;
+    in property <bool> on;
+    in property <bool> enabled: true;
+    callback clicked();
+    width: 26px;
+    height: 26px;
+    border-radius: 7px;
+    background: (ta.has-hover && enabled) ? Theme.hover : transparent;
+    opacity: enabled ? 1 : 0.45;
+    animate background { duration: Theme.dur-fast; }
+    Icon {
+        d: root.d;
+        size: root.icon-size;
+        color: root.on ? Theme.accent : ((ta.has-hover && root.enabled) ? Theme.text : Theme.text-2);
+        animate color { duration: Theme.dur-fast; }
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+/// 设置页 .btn（primary / danger 变体）
+export component Btn inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary;
+    in property <bool> danger;
+    in property <bool> enabled: true;
+    in property <string> icon;
+    callback clicked();
+    height: 24px;
+    width: lay.preferred-width;
+    border-radius: 6px;
+    background: primary ? (ta.pressed ? Theme.accent.darker(0.1) : (ta.has-hover ? Theme.accent.brighter(0.08) : Theme.accent))
+        : (ta.pressed ? Theme.sep : (ta.has-hover ? Theme.hover : Theme.glass-strong-solid));
+    border-width: primary ? 0px : 0.5px;
+    border-color: Theme.glass-border;
+    opacity: enabled ? 1 : 0.5;
+    lay := HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 4px;
+        if root.icon != "": Icon { y: (parent.height - 12px) / 2; d: root.icon; size: 12px; sw: 2; color: root.primary ? Theme.accent-contrast : Theme.text; }
+        Text {
+            text: root.text;
+            font-size: 12px;
+            vertical-alignment: center;
+            color: root.primary ? Theme.accent-contrast : (root.danger ? Theme.danger : Theme.text);
+        }
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
