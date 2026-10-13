@@ -231,7 +231,10 @@ component SidebarItem inherits Rectangle {
     in property <bool> drop-hot;
     callback clicked(bool /* shift */);
     callback menu(length, length);
-    height: 64px;   // padding 5 + 38 + gap 3 + 标签 13 + padding 5
+    // padding 5 + 38 + gap 3 + 标签 13（Linux：按回退字体算的行框，中文名 15）+ padding 5
+    property <string> label: root.all ? "全部" : root.peer.name;
+    property <length> label-h: Fx.lb(10px, root.label, 13px);
+    height: 5px + 38px + 3px + root.label-h + 5px;
     property <float> k: root.drop-hot ? 1.18 : (ta.pressed ? 0.94 : (ta.has-hover ? 1.05 : 1));
     animate k { duration: 160ms; easing: cubic-bezier(0.2, 0.9, 0.3, 1.4); }
     ta := TipArea {
@@ -259,7 +262,9 @@ component SidebarItem inherits Rectangle {
         y: 5px + 38px + 3px;
         x: 4px;
         width: parent.width - 8px;
-        text: root.all ? "全部" : root.peer.name;
+        height: Fx.lb(10px, root.label, self.preferred-height);
+        vertical-alignment: center;
+        text: root.label;
         font-size: 10px;
         color: root.active ? Theme.text : Theme.text-2;
         font-weight: root.active ? 500 : 400;
@@ -275,8 +280,8 @@ component MenuItem inherits Rectangle {
     in property <length> pad: 9px;
     in property <length> gap: 8px;
     callback clicked();
-    // padding 6 + 12.5px 中文 normal 行高 16.67（YaHei 回退撑高行框，实测旧版行距 43 物理像素 @1.5x）
-    height: 28.67px;
+    // padding 6 + 12.5px 中文 normal 行高 16.67（YaHei 回退撑高行框，实测旧版行距 43 物理像素 @1.5x）；Linux 按 Noto CJK 算
+    height: 12px + Fx.lb(12.5px, root.label, 16.67px);
     border-radius: 6px;
     background: ta.has-hover ? Theme.accent : transparent;
     ta := TouchArea { clicked => { root.clicked(); } }
@@ -349,8 +354,8 @@ component FileCard inherits Rectangle {
             alignment: center;
             spacing: 0px;
             Rectangle {
-                height: fnm.preferred-height;
-                fnm := Text { width: parent.width; text: root.m.fname; font-size: 12.5px * root.k; font-weight: 500; color: Theme.text; overflow: elide; }
+                height: Fx.lb(12.5px * root.k, root.m.fname, fnm.preferred-height);
+                fnm := Text { width: parent.width; height: parent.height; vertical-alignment: center; text: root.m.fname; font-size: 12.5px * root.k; font-weight: 500; color: Theme.text; overflow: elide; }
                 // 文件名可选中：选中时换成只读输入框（省略号版本留给静止态）
                 SelText {
                     width: parent.width;
@@ -364,7 +369,7 @@ component FileCard inherits Rectangle {
             }
             HorizontalLayout {
                 spacing: 0px;
-                Text { text: root.m.fmeta; font-size: 10.5px * root.k; color: Theme.text-2; }
+                Text { text: root.m.fmeta; font-size: 10.5px * root.k; color: Theme.text-2; height: Fx.lb(10.5px * root.k, self.text, self.preferred-height); vertical-alignment: center; }
                 Rectangle {
                     horizontal-stretch: 1;
                     height: fst.preferred-height;
@@ -453,7 +458,8 @@ component MessageRow inherits Rectangle {
     property <length> dy: 8px * (1 - e);
     opacity: clamp(e, 0, 1);
     // 时间分隔：10.5px Segoe UI Variable Text 的 normal 行高 ≈ 12.67（实测旧版行距），文字按基线从顶排
-    property <length> sep-h: 10px + 12.67px + 6px;
+    property <length> sep-lh: Fx.lb(10.5px, root.m.sep, 12.67px);
+    property <length> sep-h: 10px + root.sep-lh + 6px;
     property <length> top: (m.sep != "" ? sep-h : 0px) + (m.first ? 8px : 2px);
     property <length> nat-w: m.kind == "sticker" ? 160px : (m.kind == "file" ? 210px : min(mw.preferred-width + 20px, root.avail * 0.78));
     // 行高：旧版 line-height 1.38（13px → 17.94px/行）。Slint 的行高取字体自身的度量（首行 l1、之后每行 l2-l1），
@@ -487,7 +493,7 @@ component MessageRow inherits Rectangle {
         // 行框 12.67 居中，再上提 2：与旧版同一基线（1.5x 实测）
         y: 8px;
         width: parent.width;
-        height: 12.67px;
+        height: root.sep-lh;
         text: root.m.sep;
         font-size: 10.5px;
         font-weight: 500;
@@ -707,7 +713,7 @@ component EmojiPanel inherits Rectangle {
                             padding-bottom: 4px;
                             padding-left: 4px;
                             padding-right: 4px;
-                            Text { text: s.label; font-size: 10.5px; font-weight: 600; letter-spacing: 0.21px; color: Theme.text-3; vertical-alignment: center; horizontal-stretch: 1; }
+                            Text { text: s.label; font-size: 10.5px; font-weight: 600; letter-spacing: 0.21px; color: Theme.text-3; vertical-alignment: center; horizontal-stretch: 1; height: Fx.lb(10.5px, self.text, self.preferred-height); }
                             if s.stickers: Rectangle {
                                 width: imp.preferred-width + 12px + 12px + 4px;
                                 height: 18px;
@@ -763,7 +769,7 @@ component EmojiPanel inherits Rectangle {
         // 标签栏：space-around，padding 4 6 6，顶边线；tab 30×26 r7 text-3；on：accent + scale 1.06
         Rectangle {
             height: 4px + 26px + 6px;
-            Rectangle { y: 0; height: 0.5px; background: Theme.sep; }
+            Rectangle { y: 0; height: Fx.hair; background: Theme.sep; }
             HorizontalLayout {
                 padding-left: 6px;
                 padding-right: 6px;
@@ -1001,17 +1007,22 @@ export component PanelWindow inherits Window {
     callback scrolled(length, length, length);
 
     // ---------------- 合成层（src/compose.rs）：窗口逻辑坐标，按合成顺序 ----------------
-    property <length> ep-x: 66px + 6px;
-    property <length> ep-y: 520px - composer-h - 6px - 288px;
-    property <length> ep-w: 360px - 66px - 12px;
-    property <length> am-x: 66px + 6px + 30px + 2px;
-    property <length> am-h: 4px * 2 + 28.67px * 2;
-    property <length> am-y: 520px - 9px - 36px - am-h;
-    property <length> mn-x: min(menu-x - frame, 220px);
-    property <length> mn-y: min(menu-y - frame, 420px);
-    property <length> mn-h: 5px * 2 + 28.67px * 3;
+    // Linux：外壳边框占布局（shell-bw），弹层按内容区（外壳的 padding box）定位
+    property <length> ep-x: root.shell-bw + 66px + 6px;
+    property <length> ep-y: 520px - root.shell-bw - composer-h - 6px - 288px;
+    property <length> ep-w: 360px - 2 * root.shell-bw - 66px - 12px;
+    property <length> am-x: root.shell-bw + 66px + 6px + 30px + 2px;
+    // 菜单条目：padding 6 + 12.5px 中文行框（Windows 量得 16.67；Linux 按 Noto CJK 算）
+    property <length> mi-h: 12px + Fx.lb(12.5px, "文件", 16.67px);
+    property <length> am-h: 4px * 2 + root.mi-h * 2;
+    property <length> am-y: 520px - root.shell-bw - 9px - 36px - am-h;
+    // 旧版右键菜单是 position:fixed，left/top = clientX/Y（钳到 220/420）；Linux 外壳有 backdrop-filter，
+    // fixed 元素以外壳为包含块，所以菜单比光标偏右下一个外框 + 边框（Windows 没有外框，等于光标处）
+    property <length> mn-x: min(menu-x - (root.frame > 0 ? 0px : frame), 220px) + root.shell-bw;
+    property <length> mn-y: min(menu-y - (root.frame > 0 ? 0px : frame), 420px) + root.shell-bw;
+    property <length> mn-h: 5px * 2 + root.mi-h * 3;
     property <length> toast-w: min(toast-t.preferred-width + 24px, 360px * 0.8);
-    property <length> toast-h: toast-t.preferred-height + 14px;
+    property <length> toast-h: Fx.lb(12px, root.toast, toast-t.preferred-height) + 14px;
     // .glass 弹层（表情面板 / 附件菜单 / 右键菜单）：无原生材质时 backdrop-filter: blur(30px) saturate(180%)；
     // Windows（native-glass）旧版关掉了 backdrop-filter，靠窗口的 Acrylic
     property <length> pop-blur: Theme.native-glass ? 0px : 30px;
@@ -1021,16 +1032,19 @@ export component PanelWindow inherits Window {
         { id: 3, shown: attach-open, x: frame + am-x, y: frame + am-y, w: 120px, h: am-h, r: 9px, blur: pop-blur, sat: pop-sat, lq: 0px, parent: 0 },
         { id: 5, shown: dragging, x: frame, y: frame, w: 360px, h: 520px, r: 14px, blur: 14px, sat: 1.6, lq: 0px, parent: 0 },
         { id: 6, shown: dragging, x: frame + (360px - pick-hint-w) / 2, y: frame + pick-top, w: pick-hint-w, h: pick-hint-h, r: 15px, blur: 4px, sat: 1.7, lq: 14px, parent: 5 },
-        { id: 7, shown: toast != "", x: frame + (360px - toast-w) / 2, y: frame + 520px - 64px - toast-h, w: toast-w, h: toast-h, r: 10px, blur: 5px, sat: 1.7, lq: 12px, parent: 0 },
+        { id: 7, shown: toast != "", x: frame + (360px - toast-w) / 2, y: frame + 520px - root.shell-bw - 64px - toast-h, w: toast-w, h: toast-h, r: 10px, blur: 5px, sat: 1.7, lq: 12px, parent: 0 },
         { id: 8, shown: Theme.native-glass && frame == 0, x: 0, y: 0, w: 360px, h: 520px, r: 0px, blur: 0px, sat: 1, lq: 0px, parent: 0 },
         { id: 4, shown: menu-peer != "", x: frame + mn-x, y: frame + mn-y, w: 150px, h: mn-h, r: 10px, blur: pop-blur, sat: pop-sat, lq: 0px, parent: 0 },
         { id: 9, shown: Tip.shown, x: 0, y: 0, w: root.width, h: root.height, r: 0px, blur: 0px, sat: 1, lq: 0px, parent: 0 },
     ];
 
-    property <length> composer-h: max(30px, fieldbox.height) + 8px + 9px;
+    // Linux：border-top .5px 画成 1 设备像素且占布局（Windows 的数值是量好的，不加）
+    property <length> composer-bt: root.frame > 0 ? Fx.hair : 0px;
+    property <length> composer-h: max(30px, fieldbox.height) + 8px + 9px + root.composer-bt;
     property <length> banner-h: root.banner-title != "" ? 6px + bl-h : 0px;
     property <length> bl-h: 33px;
 
+    property <length> shell-bw: root.frame > 0 ? Fx.hair : 0px;
     // ---------------- 基底 ----------------
     Rectangle {
         visible: Fx.base();
@@ -1065,10 +1079,11 @@ export component PanelWindow inherits Window {
         animate dk { duration: 320ms; easing: cubic-bezier(0.2, 0.9, 0.3, 1); }
         content := Rectangle {
             visible: Fx.base();
+            // Linux 外壳 .5px 边框（画成 1 设备像素）占布局：内容缩进一圈（border-box）
             x: (360px - self.width) / 2;
             y: (520px - self.height) / 2;
-            width: 360px * shell.dk;
-            height: 520px * shell.dk;
+            width: (360px - 2 * root.shell-bw) * shell.dk;
+            height: (520px - 2 * root.shell-bw) * shell.dk;
             VerticalLayout {
                 // ---- header ----
                 Rectangle {
@@ -1089,8 +1104,8 @@ export component PanelWindow inherits Window {
                             // 实测旧版（1.5x）：标题高 1、状态行高 2 物理像素 → 行距 -0.67、整体上移 0.67
                             spacing: -0.67px;
                             padding-bottom: 2px;
-                            Text { text: root.header-title; font-size: 13px; font-weight: 600; letter-spacing: -0.13px; color: Theme.text; overflow: elide; }
-                            Text { text: root.subtitle; font-size: 11px; color: root.subtitle-accent ? Theme.accent : Theme.text-2; overflow: elide; }
+                            Text { text: root.header-title; font-size: 13px; font-weight: 600; letter-spacing: -0.13px; color: Theme.text; overflow: elide; height: Fx.lb(13px, self.text, self.preferred-height); vertical-alignment: center; }
+                            Text { text: root.subtitle; font-size: 11px; color: root.subtitle-accent ? Theme.accent : Theme.text-2; overflow: elide; height: Fx.lb(11px, self.text, self.preferred-height); vertical-alignment: center; }
                         }
                         VerticalLayout {
                             alignment: center;
@@ -1134,7 +1149,7 @@ export component PanelWindow inherits Window {
                             }
                         }
                     }
-                    Rectangle { y: parent.height - 0.5px; height: 0.5px; background: Theme.sep; }
+                    Rectangle { y: parent.height - Fx.hair; height: Fx.hair; background: Theme.sep; }
                 }
                 // ---- banner ----
                 if root.banner-title != "": Rectangle {
@@ -1211,7 +1226,7 @@ export component PanelWindow inherits Window {
                         width: 66px;
                         background: Theme.sidebar;
                         border-bottom-left-radius: 14px;
-                        Rectangle { x: parent.width - 0.5px; width: 0.5px; background: Theme.sep; }
+                        Rectangle { x: parent.width - Fx.hair; width: Fx.hair; background: Theme.sep; }
                         VerticalLayout {
                             padding-top: 8px;
                             padding-bottom: 8px;
@@ -1222,8 +1237,8 @@ export component PanelWindow inherits Window {
                                 clicked => { input.clear-focus(); root.select-all(); }   // 旧版点侧栏按钮会夺走输入框焦点
                             }
                             Rectangle {
-                                height: 4px + 0.5px + 6px;
-                                Rectangle { y: 4px; height: 0.5px; x: 14px; width: parent.width - 28px; background: Theme.sep; }
+                                height: 4px + Fx.hair + 6px;
+                                Rectangle { y: 4px; height: Fx.hair; x: 14px; width: parent.width - 28px; background: Theme.sep; }
                             }
                             side := Flickable {
                                 vertical-stretch: 1;
@@ -1283,7 +1298,7 @@ export component PanelWindow inherits Window {
                                     }
                                 }
                             }
-                            Text { text: "正在寻找局域网内的设备…"; font-weight: 600; font-size: 13.5px; color: Theme.text; horizontal-alignment: center; }
+                            Text { text: "正在寻找局域网内的设备…"; font-weight: 600; font-size: 13.5px; color: Theme.text; horizontal-alignment: center; height: Fx.lb(13.5px, self.text, self.preferred-height); vertical-alignment: center; }
                             HorizontalLayout {
                                 alignment: center;
                                 Text {
@@ -1411,11 +1426,11 @@ export component PanelWindow inherits Window {
                             // ---- composer ----
                             Rectangle {
                                 height: root.composer-h;
-                                Rectangle { y: 0; height: 0.5px; background: Theme.sep; }
+                                Rectangle { y: 0; height: Fx.hair; background: Theme.sep; }
                                 HorizontalLayout {
                                     padding-left: 6px;
                                     padding-right: 8px;
-                                    padding-top: 8px;
+                                    padding-top: 8px + root.composer-bt;
                                     padding-bottom: 9px;
                                     spacing: 2px;
                                     VerticalLayout {
@@ -1701,7 +1716,7 @@ export component PanelWindow inherits Window {
         if root.toast != "": Rectangle {
             visible: Fx.layer(7);
             x: (360px - root.toast-w) / 2;
-            y: 520px - 64px - root.toast-h;
+            y: 520px - root.shell-bw - 64px - root.toast-h;
             width: root.toast-w;
             height: root.toast-h;
             Shadow { kind: "toast"; ew: parent.width; eh: parent.height; r: 10px; }
@@ -1792,9 +1807,9 @@ export component PanelWindow inherits Window {
             }
         }
         // 附件按钮 / 表情按钮自己切换（旧版 stopPropagation）
-        let in-composer-btns = y >= 520px - 9px - 30px && y < 520px - 9px && x >= 66px + 6px && x < 66px + 6px + 30px + 2px + 30px;
-        let on-emoji-btn = in-composer-btns && x < 66px + 6px + 30px;
-        let on-attach-btn = in-composer-btns && x >= 66px + 6px + 32px;
+        let in-composer-btns = y >= 520px - root.shell-bw - 9px - 30px && y < 520px - root.shell-bw - 9px && x >= root.shell-bw + 66px + 6px && x < root.shell-bw + 66px + 6px + 30px + 2px + 30px;
+        let on-emoji-btn = in-composer-btns && x < root.shell-bw + 66px + 6px + 30px;
+        let on-attach-btn = in-composer-btns && x >= root.shell-bw + 66px + 6px + 32px;
         if root.attach-open && !on-attach-btn {
             if !(x >= root.am-x && x < root.am-x + 120px && y >= root.am-y && y < root.am-y + root.am-h) {
                 root.attach-open = false;

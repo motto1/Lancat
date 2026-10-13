@@ -24,7 +24,7 @@ pub struct SettingsCtl {
 /// toLocaleTimeString([], { hour, minute, second: "2-digit" })
 fn fmt_hms(ts: i64) -> String {
     use chrono::{Local, TimeZone};
-    Local.timestamp_millis_opt(ts).single().map(|d| d.format("%H:%M:%S").to_string()).unwrap_or_default()
+    Local.timestamp_millis_opt(ts).single().map(|d| d.format(crate::time_fmt(true)).to_string()).unwrap_or_default()
 }
 
 impl SettingsCtl {
@@ -79,6 +79,8 @@ impl SettingsCtl {
         }
         let _ = self.win.show();
         self.win.global::<crate::Fx>().set_dpr(self.win.window().scale_factor());
+        #[cfg(target_os = "linux")]
+        self.win.global::<crate::Fx>().set_hair(1.0 / self.win.window().scale_factor().max(1.0));
         // 旧版：打开设置页就检查一次（DiagSection onMount）；从「去修复」打开时滚过去再查
         self.recheck();
         if goto_diag {
@@ -302,7 +304,37 @@ fn ctl(f: impl FnOnce(&mut SettingsCtl)) {
     });
 }
 
+/// compositor 要客户端自己画装饰（Wayland，niri 没开 prefer-no-csd）：显示旧版 GTK 那条标题栏
+#[cfg(target_os = "linux")]
+pub fn wl_decor(csd: bool, maximized: bool) {
+    crate::post(move |app| {
+        if let Some(sc) = app.settings.as_ref() {
+            sc.win.set_csd(csd);
+            sc.win.set_csd_maximized(maximized);
+        }
+    });
+}
+
 fn wire(w: &SettingsWindow) {
+    // 自绘标题栏：0 拖动 1 最小化 2 最大化/还原 3 关闭 4 窗口菜单（x, y）
+    w.on_csd_act(|a, _x, _y| {
+        #[cfg(target_os = "linux")]
+        {
+            use crate::wl::{push, Cmd, TopAct};
+            match a {
+                0 => push(Cmd::TopAct(TopAct::Move)),
+                1 => push(Cmd::TopAct(TopAct::Minimize)),
+                2 => push(Cmd::TopAct(TopAct::Maximize)),
+                4 => push(Cmd::TopAct(TopAct::Menu(_x as i32, _y as i32))),
+                _ => {}
+            }
+        }
+        if a == 3 {
+            ctl(|sc| {
+                let _ = sc.win.hide();
+            });
+        }
+    });
     w.on_save(|| {
         ctl(|sc| {
             // 防抖 250 ms（旧版 save()）

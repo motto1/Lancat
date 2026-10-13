@@ -209,6 +209,7 @@ pub fn render(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize,
             set_flags(&[]);
         }
         if WAS.with(|w| w.replace(false)) {
+            set_flags(&[]);
             // 上一帧是合成的：渲染器记的「上一帧」不是缓冲里的内容 → 整帧重画一次
             clear(buf);
             renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
@@ -260,6 +261,10 @@ pub fn render(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize,
             }
         }
     });
+    // 帧与帧之间回到普通遍：否则基底一直是 visible:false，期间来的指针 / 按键事件会让 Slint 把
+    // 「变得不可见」的焦点项（输入框、表情搜索框）夺走焦点（toast 的背景模糊会让合成持续 2.6 s）。
+    // 由此引起的重绘请求由调用方丢掉（Out::Full 之后清 needs_redraw）。
+    fx.set_pass(0);
     if reused {
         renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
     }

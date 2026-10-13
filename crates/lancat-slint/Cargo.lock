@@ -2626,6 +2626,7 @@ dependencies = [
  "slint",
  "slint-build",
  "smithay-client-toolkit 0.21.1",
+ "swash",
  "thorvg-sys",
  "tokio",
  "wayland-client",

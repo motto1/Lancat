@@ -40,6 +40,8 @@ export global Theme {
 /// 软件渲染器做不到的效果，由 Rust（src/fx.rs）补上。
 export global Fx {
     in-out property <float> dpr: 1;
+    /// CSS 0.5px 细线：浏览器把不足 1 设备像素的边框画成 1 设备像素。Windows 保持量好的 0.5px，Linux 设为 1 物理像素（src/fx.rs）
+    in-out property <length> hair: 0.5px;
     // 合成：0 = 普通单遍渲染；1 = 只画基底（活动层隐藏）；n ≥ 2 = 只画第 n 层（src/compose.rs）
     in-out property <int> pass: 0;
     in-out property <bool> a2;
@@ -59,6 +61,8 @@ export global Fx {
     pure callback dash-rect(length, length, length, float) -> string;
     /// 自定义填充图（径向渐变高光、Windows 玻璃的 sheen/rim……）
     pure callback paint(string, length, length, color, bool, float) -> image;
+    /// 旧版 line-height: normal 的行框高度（字号、内容、Windows 上量好的值）：Linux 按 WebKitGTK 的字体回退与取整算（src/metrics.rs）
+    pure callback lb(length, string, length) -> length;
     /// 命名缓动曲线 y(x)（cubic-bezier 精确求解）
     pure callback ease(string, float) -> float;
 

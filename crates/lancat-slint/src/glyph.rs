@@ -3,7 +3,7 @@
 //! 旧版表情格静止时画的是系统彩色字形（font-size 25px，"Segoe UI Emoji"），悬停才换 Lottie。
 //! Slint 软件渲染器画不了彩色字形，所以在 Windows 上用 Direct2D 软件光栅 + DirectWrite
 //! （D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT）把字形画进 px×px 的位图，和 toast 同一套做法。
-//! 其他平台返回 None，调用方退回 Lottie 首帧。
+//! Linux 用 fontconfig 找同一串字体、swash 整形与光栅；其他平台返回 None，调用方退回 Lottie 首帧。
 
 /// `ch` 画在 px×px（物理像素）的方块里，字号 `font_px`（物理像素），水平垂直居中。
 #[cfg(windows)]
@@ -111,7 +111,96 @@ pub fn render(ch: &str, px: u32, font_px: f32) -> Option<Vec<u8>> {
     })
 }
 
-#[cfg(not(windows))]
+/// Linux：按旧版 CSS 的字体顺序（"Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji"）用 fontconfig 找字体文件，
+/// swash 整形（ZWJ / 肤色 / 旗帜靠 GSUB 连字）+ 缩放（CBDT 位图 Mitchell 缩放，COLRv0 彩色轮廓），墨迹居中。
+#[cfg(target_os = "linux")]
+pub fn render(ch: &str, px: u32, font_px: f32) -> Option<Vec<u8>> {
+    use std::cell::RefCell;
+    use std::sync::OnceLock;
+    use swash::scale::{image::Content, Render, ScaleContext, Source, StrikeWith};
+    use swash::shape::ShapeContext;
+    use swash::zeno::Format;
+    use swash::FontRef;
+
+    static FONT: OnceLock<Option<(Vec<u8>, usize)>> = OnceLock::new();
+    thread_local! {
+        static CTX: RefCell<(ShapeContext, ScaleContext)> = RefCell::new((ShapeContext::new(), ScaleContext::new()));
+    }
+    if px == 0 || px > 1024 {
+        return None;
+    }
+    let (data, index) = FONT
+        .get_or_init(|| {
+            for fam in ["Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji"] {
+                let out = std::process::Command::new("fc-match").args(["-f", "%{family}\t%{file}\t%{index}", fam]).output().ok()?;
+                let line = String::from_utf8_lossy(&out.stdout).to_string();
+                let mut it = line.split('\t');
+                let (f, file, idx) = (it.next().unwrap_or(""), it.next().unwrap_or(""), it.next().unwrap_or("0"));
+                if !f.split(',').any(|x| x.trim() == fam) {
+                    continue;
+                }
+                if let Ok(d) = std::fs::read(file) {
+                    log::info!("glyph: emoji font {fam} ({file})");
+                    return Some((d, idx.trim().parse().unwrap_or(0)));
+                }
+            }
+            log::warn!("glyph: no color emoji font; falling back to Lottie first frame");
+            None
+        })
+        .as_ref()?;
+    let font = FontRef::from_index(data, *index)?;
+    CTX.with(|c| {
+        let (shape, scale) = &mut *c.borrow_mut();
+        let mut gids = Vec::new();
+        let mut shaper = shape.builder(font).size(font_px).build();
+        shaper.add_str(ch);
+        shaper.shape_with(|cl| gids.extend(cl.glyphs.iter().map(|g| g.id)));
+        // 一个 emoji 应该整形成一个字形；整形不出来（0 号字形或多个）说明字体不支持这个序列
+        if gids.len() != 1 || gids[0] == 0 {
+            return None;
+        }
+        let mut scaler = scale.builder(font).size(font_px).hint(false).build();
+        let img = Render::new(&[Source::ColorBitmap(StrikeWith::BestFit), Source::ColorOutline(0), Source::Outline])
+            .format(Format::Alpha)
+            .render(&mut scaler, gids[0])?;
+        let (w, h) = (img.placement.width as i32, img.placement.height as i32);
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let s = px as i32;
+        let (ox, oy) = ((s - w) / 2, (s - h) / 2);
+        let mut v = vec![0u8; (s * s * 4) as usize];
+        for y in 0..h {
+            let dy = y + oy;
+            if dy < 0 || dy >= s {
+                continue;
+            }
+            for x in 0..w {
+                let dx = x + ox;
+                if dx < 0 || dx >= s {
+                    continue;
+                }
+                let o = ((dy * s + dx) * 4) as usize;
+                let i = (y * w + x) as usize;
+                match img.content {
+                    Content::Color => {
+                        let p = &img.data[i * 4..i * 4 + 4];
+                        let a = p[3] as u32;
+                        v[o] = (p[0] as u32 * a / 255) as u8;
+                        v[o + 1] = (p[1] as u32 * a / 255) as u8;
+                        v[o + 2] = (p[2] as u32 * a / 255) as u8;
+                        v[o + 3] = a as u8;
+                    }
+                    Content::Mask => v[o + 3] = img.data[i],
+                    Content::SubpixelMask => v[o + 3] = img.data[i * 4 + 3],
+                }
+            }
+        }
+        Some(v)
+    })
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn render(_ch: &str, _px: u32, _font_px: f32) -> Option<Vec<u8>> {
     None
 }

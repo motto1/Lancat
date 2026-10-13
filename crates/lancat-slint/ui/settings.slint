@@ -40,6 +40,8 @@ export struct DiagCheck {
 component Section inherits Rectangle {
     in property <string> title;
     in property <float> flash;          // 跳到诊断时的闪烁环（1 → 0）
+    // h2 行框：Windows 量得 15；Linux 按 Noto CJK 算（中文标题 16）
+    property <length> h2-lh: Fx.lb(11px, root.title, 15px);
     background: Theme.field;
     border-width: 1phx;
     border-color: Theme.glass-border;
@@ -62,11 +64,11 @@ component Section inherits Rectangle {
         padding-bottom: 10px;
         // h2：margin 8 0 4，行框 15 —— 文字在行框（不是整个 27 高）里居中，实测与旧版同一基线
         if root.title != "": Rectangle {
-            height: 8px + 15px + 4px;
+            height: 8px + root.h2-lh + 4px;
             Text {
                 y: 8px;
                 width: parent.width;
-                height: 15px;
+                height: root.h2-lh;
                 text: root.title;
                 font-size: 11px;
                 font-weight: 600;
@@ -90,7 +92,7 @@ component Row inherits Rectangle {
         Text { text: root.label; font-size: 13px; color: Theme.text; vertical-alignment: center; horizontal-stretch: 1; }
         @children
     }
-    if !root.last: Rectangle { y: parent.height - 0.5px; height: 0.5px; background: Theme.sep; }
+    if !root.last: Rectangle { y: parent.height - Fx.hair; height: Fx.hair; background: Theme.sep; }
 }
 
 /// input / textarea：.5 边 glass-strong 底 r6 padding 4 8 12.5px；focus 0 0 0 3px accent 35%（无过渡）
@@ -592,15 +594,69 @@ component CheckRow inherits Rectangle {
             }
         }
     }
-    if !root.last: Rectangle { y: parent.height - 0.5px; height: 0.5px; background: Theme.sep; }
+    if !root.last: Rectangle { y: parent.height - Fx.hair; height: Fx.hair; background: Theme.sep; }
+}
+
+// GTK（adw-gtk3 / Breeze）客户端装饰标题栏，按旧版在 niri 上的截图量：高 36 + 底边 1，
+// 背景 #fff8f8、底边 #e1dbdb、标题 Noto Sans 粗体 10pt 居中、右侧三个 24px 圆钮（#e9e2e2，间距 38，右边距 8）
+component CsdButton inherits Rectangle {
+    callback clicked();
+    width: 24px;
+    height: 24px;
+    border-radius: 12px;
+    background: ta.pressed ? #d2cbcb : (ta.has-hover ? #ddd6d6 : #e9e2e2);
+    ta := TouchArea { clicked => { root.clicked(); } }
+}
+
+component CsdBar inherits Rectangle {
+    in property <string> title;
+    in property <bool> maximized;
+    callback act(int, length, length);
+    height: 37px;
+    background: #fff8f8;
+    property <duration> last-click: 0ms;
+    TouchArea {
+        height: 36px;
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down && e.button == PointerEventButton.left {
+                // 双击 = 最大化 / 还原（GTK 默认），单击按住 = 拖动
+                if animation-tick() - root.last-click < 400ms {
+                    root.last-click = 0ms;
+                    root.act(2, self.mouse-x, self.mouse-y);
+                } else {
+                    root.last-click = animation-tick();
+                    root.act(0, self.mouse-x, self.mouse-y);
+                }
+            }
+            if e.kind == PointerEventKind.down && e.button == PointerEventButton.right {
+                root.act(4, self.mouse-x, self.mouse-y);
+            }
+        }
+    }
+    Text {
+        y: 0px;
+        height: 36px;
+        width: parent.width;
+        text: root.title;
+        font-family: "Noto Sans";
+        font-size: 13.33px;
+        font-weight: 700;
+        color: #2f2f30;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    CsdButton { x: parent.width - 9px - 24px - 38px * 2; y: 6px; clicked => { root.act(1, 0, 0); } }
+    CsdButton { x: parent.width - 9px - 24px - 38px; y: 6px; clicked => { root.act(2, 0, 0); } }
+    CsdButton { x: parent.width - 9px - 24px; y: 6px; clicked => { root.act(3, 0, 0); } }
+    Rectangle { y: 36px; height: 1px; background: #e1dbdb; }
 }
 
 export component SettingsWindow inherits Window {
     title: "Lancat 设置";
     preferred-width: 480px;
-    preferred-height: 620px;
+    preferred-height: 620px + root.csd-h;
     min-width: 420px;
-    min-height: 480px;
+    min-height: 480px + root.csd-h;
     background: Theme.glass-strong-solid;
     default-font-size: 13px;
     default-font-family: "Segoe UI Variable Text";
@@ -673,8 +729,15 @@ export component SettingsWindow inherits Window {
     callback run-fix(string, bool);
 
     property <bool> mon-open;
+    // Wayland 下 compositor 要客户端自己画装饰：旧版是 GTK 的标题栏（36 + 底边 1，标题居中加粗，右侧三个圆钮）
+    in property <bool> csd;
+    in property <bool> csd-maximized;
+    callback csd-act(int, length, length);
+    property <length> csd-h: root.csd ? 37px : 0px;
 
     hov := TouchArea {
+    y: root.csd-h;
+    height: parent.height - root.csd-h;
     fl := Flickable {
         width: parent.width;
         height: parent.height;
@@ -904,7 +967,7 @@ export component SettingsWindow inherits Window {
                         }
                         VerticalLayout { alignment: center; Btn { text: d.blocked ? "取消拉黑" : "拉黑"; danger: !d.blocked; clicked => { root.toggle-block(d.id); } } }
                     }
-                    Rectangle { y: parent.height - 0.5px; height: 0.5px; background: Theme.sep; }
+                    Rectangle { y: parent.height - Fx.hair; height: Fx.hair; background: Theme.sep; }
                 }
                 VerticalLayout {
                     padding-top: 8px;
@@ -975,11 +1038,20 @@ export component SettingsWindow inherits Window {
     }
     sb := ScrollBar {
         x: parent.width - self.width;
-        height: parent.height;
+        y: root.csd-h;
+        height: parent.height - root.csd-h;
         view-h: fl.height;
         content-h: fl.content-height;
         pos <=> fl.content-y;
         hovered: hov.has-hover || self.hov;
+    }
+    if root.csd: CsdBar {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        title: root.title;
+        maximized: root.csd-maximized;
+        act(a, x, y) => { root.csd-act(a, x, y); }
     }
     TipBubble {
         win-w: root.width;

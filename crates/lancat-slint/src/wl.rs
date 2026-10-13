@@ -54,7 +54,7 @@ use smithay_client_toolkit::{
     shell::{
         wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure},
         xdg::{
-            window::{Window as XdgWindow, WindowConfigure, WindowDecorations, WindowHandler},
+            window::{DecorationMode, Window as XdgWindow, WindowConfigure, WindowDecorations, WindowHandler},
             XdgShell,
         },
         WaylandSurface,
@@ -109,6 +109,17 @@ pub enum Cmd {
     PanelFocus,
     /// 普通窗口（按 WlWindow.id）显示 / 隐藏
     Top(usize, bool),
+    /// 客户端自绘标题栏上的操作，作用在最近一次被按下的普通窗口上
+    TopAct(TopAct),
+}
+
+/// 自绘标题栏（compositor 要求客户端装饰时，旧版 GTK 窗口画的那条标题栏）的操作
+#[derive(Clone, Copy, Debug)]
+pub enum TopAct {
+    Move,
+    Minimize,
+    Maximize,
+    Menu(i32, i32),
 }
 
 thread_local! {
@@ -183,6 +194,8 @@ pub struct WlWindow {
     pref: Cell<(u32, u32)>,
     min: Cell<(u32, u32)>,
     props_dirty: Cell<bool>,
+    /// 已把装饰模式告诉过界面（每次显示后的第一次 configure 都要告诉）
+    decor_told: Cell<bool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -298,6 +311,9 @@ struct StripSurf {
 struct TopSurf {
     xdg: XdgWindow,
     configured: bool,
+    /// compositor 要客户端自己画装饰（niri 没开 prefer-no-csd 时）/ 当前是否最大化
+    csd: bool,
+    maximized: bool,
     width: u32,
     height: u32,
     buf: Vec<Bgra>,
@@ -322,6 +338,9 @@ struct State {
     strip: Option<StripSurf>,
     strip_look: StripLook,
     pointer: Option<wl_pointer::WlPointer>,
+    seat: Option<wl_seat::WlSeat>,
+    /// 最近一次在普通窗口上按下：窗口 id + serial（xdg move / 窗口菜单要用）
+    top_press: Option<(usize, u32)>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     kb_on_panel: bool,
     repeat: Option<(u32, u32)>,
@@ -480,6 +499,8 @@ impl WlPlatform {
             strip: None,
             strip_look: StripLook { edge: "right".into(), unread: false, open: false, hovering: false, accent: (10.0 / 255.0, 132.0 / 255.0, 1.0), phase: 0.0 },
             pointer: None,
+            seat: None,
+            top_press: None,
             keyboard: None,
             kb_on_panel: false,
             repeat: Some((25, 600)),
@@ -538,6 +559,7 @@ impl slint::platform::Platform for WlPlatform {
             pref: Cell::new((w0, h0)),
             min: Cell::new((0, 0)),
             props_dirty: Cell::new(false),
+            decor_told: Cell::new(false),
         });
         w.id.set(Rc::as_ptr(&w) as *const u8 as usize);
         w.window.dispatch_event(WindowEvent::Resized { size: slint::LogicalSize::new(w0 as f32, h0 as f32) });
@@ -754,9 +776,13 @@ impl State {
                 }
             }
             Cmd::Top(id, true) => self.show_top(id),
+            Cmd::TopAct(a) => self.top_act(a),
             Cmd::Top(id, false) => {
                 if let Some(t) = self.tops.iter_mut().find(|t| t.id == id) {
                     t.surf = None;
+                    if let Some(w) = t.win.upgrade() {
+                        w.decor_told.set(false);
+                    }
                 }
                 if self.kb_top == Some(id) {
                     self.kb_top = None;
@@ -958,7 +984,7 @@ impl State {
         xw.commit();
         w.props_dirty.set(false);
         let (pw, ph) = w.pref.get();
-        t.surf = Some(TopSurf { xdg: xw, configured: false, width: pw.max(1), height: ph.max(1), buf: Vec::new() });
+        t.surf = Some(TopSurf { xdg: xw, configured: false, csd: false, maximized: false, width: pw.max(1), height: ph.max(1), buf: Vec::new() });
     }
 
     fn draw_tops(&mut self) {
@@ -1021,10 +1047,17 @@ impl WindowHandler for State {
         ts.width = c.new_size.0.map(|v| v.get()).unwrap_or(if ts.configured { ts.width } else { pw }).max(mw).max(1);
         ts.height = c.new_size.1.map(|v| v.get()).unwrap_or(if ts.configured { ts.height } else { ph }).max(mh).max(1);
         ts.configured = true;
+        let (csd, maxi) = (matches!(c.decoration_mode, DecorationMode::Client), c.is_maximized());
+        let decor_changed = (csd, maxi) != (ts.csd, ts.maximized) || !w.decor_told.replace(true);
+        ts.csd = csd;
+        ts.maximized = maxi;
         let (lw, lh) = (ts.width, ts.height);
         w.size.set(PhysicalSize::new(lw * sc, lh * sc));
         w.window.dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor: sc as f32 });
         w.window.dispatch_event(WindowEvent::Resized { size: slint::LogicalSize::new(lw as f32, lh as f32) });
+        if decor_changed {
+            crate::settings_ui::wl_decor(csd, maxi);
+        }
         w.needs_redraw.set(true);
         self.draw_top(id, &w, sc);
     }
@@ -1297,6 +1330,7 @@ impl SeatHandler for State {
         &mut self.seat_state
     }
     fn new_seat(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.seat.get_or_insert_with(|| seat.clone());
         if self.data_device.is_none() {
             if let Some(m) = self.ddm.as_ref() {
                 self.data_device = Some(m.get_data_device(qh, &seat));
@@ -1309,6 +1343,7 @@ impl SeatHandler for State {
         }
     }
     fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, cap: Capability) {
+        self.seat.get_or_insert_with(|| seat.clone());
         if self.data_device.is_none() {
             if let Some(m) = self.ddm.as_ref() {
                 self.data_device = Some(m.get_data_device(qh, &seat));
@@ -1425,12 +1460,40 @@ impl State {
                 crate::note_pointer(true, -1000.0, -1000.0, false);
                 w.window.dispatch_event(WindowEvent::PointerExited);
             }
-            PointerEventKind::Press { button: b, .. } => w.window.dispatch_event(WindowEvent::PointerPressed { position, button: button(b) }),
+            PointerEventKind::Press { button: b, serial, .. } => {
+                self.top_press = Some((id, serial));
+                w.window.dispatch_event(WindowEvent::PointerPressed { position, button: button(b) })
+            }
             PointerEventKind::Release { button: b, .. } => w.window.dispatch_event(WindowEvent::PointerReleased { position, button: button(b) }),
             PointerEventKind::Axis { horizontal, vertical, .. } => {
                 let dy = if vertical.absolute != 0.0 { vertical.absolute } else { vertical.discrete as f64 * 10.0 };
                 let dx = if horizontal.absolute != 0.0 { horizontal.absolute } else { horizontal.discrete as f64 * 10.0 };
                 w.window.dispatch_event(WindowEvent::PointerScrolled { position, delta_x: -dx as f32 * 4.0, delta_y: -dy as f32 * 4.0 })
+            }
+        }
+    }
+
+    fn top_act(&mut self, a: TopAct) {
+        let Some((id, serial)) = self.top_press else { return };
+        let Some(ts) = self.tops.iter().find(|t| t.id == id).and_then(|t| t.surf.as_ref()) else { return };
+        match a {
+            TopAct::Move => {
+                if let Some(seat) = self.seat.as_ref() {
+                    ts.xdg.move_(seat, serial);
+                }
+            }
+            TopAct::Menu(x, y) => {
+                if let Some(seat) = self.seat.as_ref() {
+                    ts.xdg.show_window_menu(seat, serial, (x, y));
+                }
+            }
+            TopAct::Minimize => ts.xdg.set_minimized(),
+            TopAct::Maximize => {
+                if ts.maximized {
+                    ts.xdg.unset_maximized();
+                } else {
+                    ts.xdg.set_maximized();
+                }
             }
         }
     }
@@ -1504,6 +1567,7 @@ thread_local! {
 
 impl KeyboardHandler for State {
     fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, surface: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {
+        log::debug!("wl keyboard enter");
         if let Some(id) = self.top_of_surface(surface) {
             self.kb_top = Some(id);
             if let Some(w) = self.top_window(id) {
@@ -1525,6 +1589,7 @@ impl KeyboardHandler for State {
         crate::dock::wl_panel_keyboard(true);
     }
     fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, surface: &wl_surface::WlSurface, _: u32) {
+        log::debug!("wl keyboard leave");
         if let Some(id) = self.kb_top.filter(|id| self.top_of_surface(surface) == Some(*id) || !self.kb_on_panel) {
             self.kb_top = None;
             REPEAT.with(|r| *r.borrow_mut() = None);

@@ -22,6 +22,7 @@ mod emoji;
 mod emoji_catalog;
 mod filedlg;
 mod glyph;
+mod metrics;
 #[macro_use]
 mod fx;
 mod icons;
@@ -192,12 +193,58 @@ pub(crate) fn human(n: u64) -> String {
     }
 }
 
+/// 旧版 toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"}) 跟系统语言走：
+/// Windows 上是界面语言（中文 → 24 小时制），Linux 的 WebKitGTK 读 LC_ALL / LC_TIME / LANG，en_US 一类是 "10:10 AM"。
+pub(crate) fn time_fmt(secs: bool) -> &'static str {
+    use std::sync::OnceLock;
+    static H12: OnceLock<bool> = OnceLock::new();
+    let h12 = *H12.get_or_init(|| {
+        if cfg!(windows) {
+            return false;
+        }
+        let loc = ["LC_ALL", "LC_TIME", "LANG"].iter().find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty())).unwrap_or_default();
+        let tag = loc.split(['.', '@']).next().unwrap_or("");
+        // 没设语言（或 C / POSIX）时 WebKitGTK 的 navigator.language 是 en-US
+        matches!(tag, "" | "C" | "POSIX" | "en_US" | "en_CA" | "en_AU" | "en_NZ" | "en_IN" | "en_PH")
+    });
+    match (h12, secs) {
+        (true, false) => "%I:%M %p",
+        (true, true) => "%I:%M:%S %p",
+        (false, false) => "%H:%M",
+        (false, true) => "%H:%M:%S",
+    }
+}
+
+/// 旧版 dock.rs 启动时的一次性迁移：默认「收起后释放」从 60 s（及 Windows 曾用的 1800 s）改为常驻（0）；
+/// 用户自己选过的值不动。两版共用同一个数据库，标记键也相同（keep_alive_v2 / keep_alive_v3）。
+fn migrate_keep_alive(node: &Node) {
+    let st = &node.store;
+    #[cfg(windows)]
+    if st.kv_get("keep_alive_v2").ok().flatten().is_none() {
+        let _ = st.kv_set("keep_alive_v2", "1");
+        let mut s = node.settings();
+        if s.panel_keep_alive_s == 60 {
+            s.panel_keep_alive_s = 1800;
+            let _ = node.set_settings(s);
+        }
+    }
+    if st.kv_get("keep_alive_v3").ok().flatten().is_none() {
+        let _ = st.kv_set("keep_alive_v3", "1");
+        let mut s = node.settings();
+        let hit = if cfg!(windows) { s.panel_keep_alive_s == 1800 } else { s.panel_keep_alive_s == 60 || s.panel_keep_alive_s == 1800 };
+        if hit {
+            s.panel_keep_alive_s = 0;
+            let _ = node.set_settings(s);
+        }
+    }
+}
+
 /// formatTime：今天 HH:MM / 昨天 HH:MM / M月D日 HH:MM（本地时区）
 pub(crate) fn format_time(ts: i64) -> String {
     use chrono::{Datelike, Local, TimeZone};
     let Some(d) = Local.timestamp_millis_opt(ts).single() else { return String::new() };
     let now = Local::now();
-    let hm = d.format("%H:%M").to_string();
+    let hm = d.format(time_fmt(false)).to_string();
     if d.date_naive() == now.date_naive() {
         return hm;
     }
@@ -431,6 +478,9 @@ impl App {
         ui.set_current_id(self.current.clone().into());
         // composer placeholder / disabled
         let t = self.targets();
+        if ui.get_can_send() != !t.is_empty() {
+            log::debug!("can-send -> {}", !t.is_empty());
+        }
         ui.set_can_send(!t.is_empty());
         ui.set_placeholder(
             if t.is_empty() {
@@ -1369,6 +1419,7 @@ fn wire_ui(ui: &PanelWindow) {
         with_app(|app| app.on_typing());
     });
     ui.on_composer_blur(|| {
+        log::debug!("composer blur");
         with_app(|app| app.stop_typing());
     });
     ui.on_refresh(|| {
@@ -1526,6 +1577,7 @@ fn main() {
     let wanted_port = cfg.port;
     let node = rt.block_on(Node::start(cfg)).expect("start lancat node");
     log::info!("node started in {} ms", t0().elapsed().as_millis());
+    migrate_keep_alive(&node);
 
     let ui = PanelWindow::new().expect("create panel");
     install_fx!(ui, false);
@@ -1939,4 +1991,6 @@ pub(crate) fn escape_key() {
 pub(crate) fn dpr_changed() {
     let Some(ui) = with_app(|app| app.ui()).flatten() else { return };
     ui.global::<Fx>().set_dpr(ui.window().scale_factor());
+    #[cfg(target_os = "linux")]
+    ui.global::<Fx>().set_hair(1.0 / ui.window().scale_factor().max(1.0));
 }

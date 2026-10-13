@@ -771,7 +771,10 @@ macro_rules! install_fx {
         g.on_dash_rect(|w, h, r, width| slint::SharedString::from($crate::fx::dash_rect(w, h, r, width)));
         g.on_paint(|kind, w, h, col, dark, dpr| $crate::fx::paint(kind.as_str(), w, h, col, dark, dpr));
         g.on_ease(|name, x| $crate::fx::ease(name.as_str(), x));
+        g.on_lb(|size, text, win| $crate::metrics::line_box(size, text.as_str(), win));
         g.set_dpr($c.window().scale_factor());
+        #[cfg(target_os = "linux")]
+        g.set_hair(1.0 / $c.window().scale_factor().max(1.0));
     }};
 }
 
