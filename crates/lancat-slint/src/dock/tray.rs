@@ -50,7 +50,7 @@ fn hwnd() -> Option<HWND> {
 }
 
 /// 从 .ico 里挑最接近 `want` 像素的那一张建 HICON（PNG 压缩的条目 CreateIconFromResourceEx 也认）。
-fn load_icon(want: u32) -> Option<HICON> {
+pub(crate) fn load_icon(want: u32) -> Option<HICON> {
     let d = ICO;
     if d.len() < 6 {
         return None;

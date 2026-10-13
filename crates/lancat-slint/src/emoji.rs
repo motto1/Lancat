@@ -150,6 +150,8 @@ struct Job {
 enum PosterSrc {
     Noto(String),
     Json(String),
+    /// 表情面板静止格：系统彩色字形（旧版 .glyph，25px）；画不出来时退回 Lottie 首帧
+    Glyph { ch: String, code: String, font_px: f32 },
 }
 
 fn poster_cache_dir() -> PathBuf {
@@ -169,8 +171,17 @@ fn spawn_worker() -> mpsc::Sender<Job> {
                     let json = match job.src {
                         PosterSrc::Noto(code) => noto_json(&code),
                         PosterSrc::Json(j) => Some(j),
+                        PosterSrc::Glyph { ch, code, font_px } => match crate::glyph::render(&ch, px, font_px) {
+                            Some(b) => {
+                                buf = Some(b);
+                                None
+                            }
+                            None => noto_json(&code),
+                        },
                     };
-                    buf = json.and_then(|j| Player::new(&j, px)).map(|mut p| p.render_raw(0.0));
+                    if buf.is_none() {
+                        buf = json.and_then(|j| Player::new(&j, px)).map(|mut p| p.render_raw(0.0));
+                    }
                     if let (Some(b), Some(path)) = (buf.as_ref(), job.cache.as_ref()) {
                         if let Some(dir) = path.parent() {
                             let _ = std::fs::create_dir_all(dir);
@@ -238,9 +249,12 @@ pub struct EmojiState {
     /// 表情网格的列数（Slint 按面板宽度算好报过来）
     cols: usize,
     prewarmed: bool,
+    released: bool,
 }
 
 const GRID_PX: f32 = 30.0;
+/// 旧版 .glyph { font-size: 25px }
+const GLYPH_FONT: f32 = 25.0;
 
 impl EmojiState {
     pub fn new(node: Arc<Node>, s: &Settings) -> Self {
@@ -263,6 +277,7 @@ impl EmojiState {
             rebuild_queued: false,
             cols: 7,
             prewarmed: false,
+            released: false,
         }
     }
 
@@ -297,6 +312,21 @@ impl EmojiState {
         None
     }
 
+    /// 表情面板静止格：彩色字形（Windows），其他平台退回 Lottie 首帧
+    fn glyph(&mut self, em: &crate::emoji_catalog::Emoji, px: u32) -> Option<slint::Image> {
+        let key = format!("glyph:{}:{px}", em.code);
+        if let Some(i) = self.posters.get(&key) {
+            return Some(i.clone());
+        }
+        if self.pending.insert(key.clone()) {
+            let safe = em.code.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect::<String>();
+            let cache = Some(poster_cache_dir().join(format!("glyph{}-{safe}-{px}.rgba", if cfg!(windows) { "w" } else { "" })));
+            let src = PosterSrc::Glyph { ch: em.ch.to_string(), code: em.code.to_string(), font_px: GLYPH_FONT * scale() };
+            let _ = self.worker.send(Job { key, src, px, cache });
+        }
+        None
+    }
+
     /// 面板第一次弹出后在后台把表情面板的首帧都备好（旧版是彩色字形，打开即满；这里首帧要渲染）
     pub fn prewarm(&mut self) {
         if self.prewarmed {
@@ -308,8 +338,7 @@ impl EmojiState {
         codes.extend(EMOJI.iter().map(|e| e.code.to_string()));
         for code in codes {
             if let Some(em) = by_code(&code) {
-                let e = EmojiPayload { kind: "noto".into(), code: em.code.into(), alt: em.ch.into(), data: None };
-                let _ = self.poster(&e, px);
+                let _ = self.glyph(em, px);
             }
         }
     }
@@ -352,8 +381,7 @@ impl EmojiState {
         }
         let px = (GRID_PX * scale()) as u32;
         let em = by_code(key)?;
-        let e = EmojiPayload { kind: "noto".into(), code: em.code.into(), alt: em.ch.into(), data: None };
-        let img = self.poster(&e, px).unwrap_or_default();
+        let img = self.glyph(em, px).unwrap_or_default();
         Some(EmojiCell { key: key.into(), img, title: em.kw.split(' ').next().unwrap_or("").into(), h: 38.0, ..Default::default() })
     }
 
@@ -527,6 +555,23 @@ impl EmojiState {
         self.playing.clear();
     }
 
+    /// 收起超过 keep-alive：丢掉解码好的首帧 / 字形和正在播的贴纸（磁盘缓存还在，下次打开表情面板几乎零成本重建）
+    pub fn release(&mut self) {
+        self.posters.clear();
+        self.pending.clear();
+        self.chat.clear();
+        self.playing.clear();
+        self.hover = None;
+        self.timer.stop();
+        self.prewarmed = false;
+        self.released = true;
+    }
+
+    /// 释放过：下次弹出时让聊天里的贴纸重新取首帧
+    pub fn take_released(&mut self) -> bool {
+        std::mem::take(&mut self.released)
+    }
+
     /// 面板收起：全部暂停（状态保留，旧版 setLottieActive(false)）
     pub fn pause_all(&mut self) {
         self.paused = true;
@@ -610,7 +655,7 @@ impl crate::App {
     }
 
     /// 海报到了：刷新还没有图的贴纸行
-    fn refresh_stickers(&mut self) {
+    pub(crate) fn refresh_stickers(&mut self) {
         let ids: Vec<usize> = (0..self.msgs.len()).filter(|&i| self.sticker_of(&self.msgs[i]).is_some()).collect();
         for i in ids {
             if self.emoji.chat.contains_key(&self.msgs[i].id) {

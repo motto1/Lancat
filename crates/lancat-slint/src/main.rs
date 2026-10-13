@@ -21,6 +21,7 @@ use dock_wl as dock;
 mod emoji;
 mod emoji_catalog;
 mod filedlg;
+mod glyph;
 #[macro_use]
 mod fx;
 mod icons;
@@ -88,6 +89,8 @@ pub(crate) struct App {
     /// 会话滚动在底部附近：新消息跟随到底
     stick: bool,
     toast_timer: slint::Timer,
+    /// 收起后释放（旧版 panel_keep_alive_s：收起这么久后销毁网页进程）：这里释放表情 / 贴纸缓存并修剪工作集
+    release_timer: slint::Timer,
     pub(crate) emoji: emoji::EmojiState,
     pub(crate) settings: Option<settings_ui::SettingsCtl>,
 }
@@ -1045,13 +1048,40 @@ impl App {
         if v {
             self.mark_read_if_visible();
             self.emoji.resume_all();
+            if self.emoji.take_released() {
+                self.refresh_stickers();
+            }
             // 弹出动画之后再在后台备表情面板的首帧（只做一次；有磁盘缓存时几乎是零成本）
             slint::Timer::single_shot(Duration::from_millis(600), || {
                 with_app(|app| app.emoji.prewarm());
             });
+            self.release_timer.stop();
         } else {
             self.emoji.pause_all();
             self.stop_typing();
+            // 收起动画（≈140 ms）之后把工作集还给系统；常驻内存只剩下次弹出要用的
+            slint::Timer::single_shot(Duration::from_millis(400), || {
+                with_app(|app| {
+                    if !app.visible {
+                        #[cfg(windows)]
+                        win::trim_working_set();
+                    }
+                });
+            });
+            // 设置「收起后释放面板」：0 = 常驻
+            let ka = self.node.settings().panel_keep_alive_s;
+            if ka > 0 {
+                self.release_timer.start(slint::TimerMode::SingleShot, Duration::from_secs(ka), || {
+                    with_app(|app| {
+                        if !app.visible {
+                            log::info!("panel hidden for keep-alive period: releasing caches");
+                            app.emoji.release();
+                            #[cfg(windows)]
+                            win::trim_working_set();
+                        }
+                    });
+                });
+            }
         }
     }
 
@@ -1213,7 +1243,13 @@ pub(crate) fn open_settings(goto_diag: bool) {
         let dark = app.ui().map(|u| u.global::<Theme>().get_dark()).unwrap_or(false);
         if let Some(sc) = app.settings.as_mut() {
             sc.set_dark(dark);
-            sc.show(goto_diag, &app.peers);
+            if goto_diag && sc.is_open() {
+                // 已经开着（旧版 lancat://goto-diag）：不重新加载，只滚到诊断 + 闪烁 + 重新检查，并提到前台
+                sc.raise();
+                sc.goto_diag();
+            } else {
+                sc.show(goto_diag, &app.peers);
+            }
         }
     });
 }
@@ -1533,6 +1569,7 @@ fn main() {
         dialog_open: false,
         visible: !dock_mode(),
         toast_timer: Default::default(),
+        release_timer: Default::default(),
         emoji: emoji::EmojiState::new(node.clone(), &settings),
         settings: None,
         stick: true,

@@ -60,14 +60,20 @@ component Section inherits Rectangle {
         padding-right: 14px;
         padding-top: 6px;
         padding-bottom: 10px;
-        if root.title != "": Text {
-            text: root.title;
-            font-size: 11px;
-            font-weight: 600;
-            letter-spacing: 0.66px;
-            color: Theme.text-3;
+        // h2：margin 8 0 4，行框 15 —— 文字在行框（不是整个 27 高）里居中，实测与旧版同一基线
+        if root.title != "": Rectangle {
             height: 8px + 15px + 4px;
-            vertical-alignment: center;
+            Text {
+                y: 8px;
+                width: parent.width;
+                height: 15px;
+                text: root.title;
+                font-size: 11px;
+                font-weight: 600;
+                letter-spacing: 0.66px;
+                color: Theme.text-3;
+                vertical-alignment: center;
+            }
         }
         @children
     }
@@ -411,10 +417,13 @@ component CheckRow inherits Rectangle {
             }
             VerticalLayout {
                 horizontal-stretch: 1;
-                spacing: 1px;
+                // margin-top 1；再加 1：说明行比旧版高 2 物理像素（1.5x 实测）
+                spacing: 2px;
                 HorizontalLayout {
                     spacing: 6px;
                     alignment: start;
+                    // .title 行框：12.5px 中文 normal 行高 16.67（> 徽标 16），每项因此比按 16 排高 0.67
+                    min-height: 16.67px;
                     Text { text: root.c.title; font-size: 12.5px; font-weight: 500; color: Theme.text; vertical-alignment: center; }
                     VerticalLayout {
                         alignment: center;
@@ -432,7 +441,17 @@ component CheckRow inherits Rectangle {
                         }
                     }
                 }
-                Text { text: root.c.summary; font-size: 11.5px; color: Theme.text-2; wrap: word-wrap; }
+                // .summary：11.5px line-height 1.45（16.675/行）。Slint 行距取字体度量（11.5px ≈ 14.67/行，实测 1.5x 截图），
+                // 按行数换成 CSS 的总高度，文字在里面居中：首行逐像素对齐，之后每行差 ≤1px，不再逐行累积
+                sm := Text {
+                    property <int> lines: max(1, round(self.preferred-height / 14.67px));
+                    text: root.c.summary;
+                    font-size: 11.5px;
+                    color: Theme.text-2;
+                    wrap: word-wrap;
+                    height: self.lines * 11.5px * 1.45;
+                    vertical-alignment: center;
+                }
             }
             if root.c.detail != "" || root.c.help != "": VerticalLayout {
                 alignment: start;
@@ -715,7 +734,8 @@ export component SettingsWindow inherits Window {
                 VerticalLayout {
                     HorizontalLayout {
                         spacing: 8px;
-                        padding-top: 8px;
+                        // .head margin 8 0 4；外加 1px：旧版按钮与下面各项都比按 8 排低 1.5 物理像素（1.5x 实测）
+                        padding-top: 9px;
                         padding-bottom: 4px;
                         Text { text: "权限与诊断"; font-size: 11px; font-weight: 600; letter-spacing: 0.66px; color: Theme.text-3; vertical-alignment: center; }
                         if root.problems >= 0: Text {

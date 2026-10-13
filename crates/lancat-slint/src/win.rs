@@ -245,6 +245,12 @@ impl Win32Window {
             } else {
                 let dark: i32 = crate::theme_is_dark("system") as i32;
                 let _ = DwmSetWindowAttribute(h, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as *const _, 4);
+                // 标题栏 / 任务栏图标：旧版（Tauri）窗口带应用图标，不设就是系统默认空白图标
+                for (kind, base) in [(ICON_SMALL, 16.0f32), (ICON_BIG, 32.0f32)] {
+                    if let Some(ic) = crate::dock::tray::load_icon((base * scale).round() as u32) {
+                        SendMessageW(h, WM_SETICON, Some(WPARAM(kind as usize)), Some(LPARAM(ic.0 as isize)));
+                    }
+                }
             }
         }
         Ok(rc)

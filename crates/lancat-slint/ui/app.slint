@@ -275,7 +275,8 @@ component MenuItem inherits Rectangle {
     in property <length> pad: 9px;
     in property <length> gap: 8px;
     callback clicked();
-    height: 28px;
+    // padding 6 + 12.5px 中文 normal 行高 16.67（YaHei 回退撑高行框，实测旧版行距 43 物理像素 @1.5x）
+    height: 28.67px;
     border-radius: 6px;
     background: ta.has-hover ? Theme.accent : transparent;
     ta := TouchArea { clicked => { root.clicked(); } }
@@ -451,7 +452,8 @@ component MessageRow inherits Rectangle {
     property <float> k: 0.97 + 0.03 * e;
     property <length> dy: 8px * (1 - e);
     opacity: clamp(e, 0, 1);
-    property <length> sep-h: 10px + 14px + 6px;
+    // 时间分隔：10.5px Segoe UI Variable Text 的 normal 行高 ≈ 12.67（实测旧版行距），文字按基线从顶排
+    property <length> sep-h: 10px + 12.67px + 6px;
     property <length> top: (m.sep != "" ? sep-h : 0px) + (m.first ? 8px : 2px);
     property <length> nat-w: m.kind == "sticker" ? 160px : (m.kind == "file" ? 210px : min(mw.preferred-width + 20px, root.avail * 0.78));
     // 行高：旧版 line-height 1.38（13px → 17.94px/行）。Slint 的行高取字体自身的度量（首行 l1、之后每行 l2-l1），
@@ -482,9 +484,10 @@ component MessageRow inherits Rectangle {
         }
     }
     if m.sep != "": Text {
-        y: 10px;
+        // 行框 12.67 居中，再上提 2：与旧版同一基线（1.5x 实测）
+        y: 8px;
         width: parent.width;
-        height: 14px;
+        height: 12.67px;
         text: root.m.sep;
         font-size: 10.5px;
         font-weight: 500;
@@ -638,13 +641,14 @@ component EmojiPanel inherits Rectangle {
     VerticalLayout {
         // 搜索：margin 8 8 4，padding 4 9，r8，hover 底
         Rectangle {
-            // 输入框 12px 字、normal 行高 16 + padding 4×2 = 24
-            height: 8px + 24px + 4px;
+            // 实测旧版（1.5x 截图）：面板 1px 边框 + margin 8 → 框顶 9；输入框 12px 字 normal 行高 18 + padding 4×2 = 26
+            // 底 margin 4 + 1：旧版网格再低 1.5 物理像素（1.5x 实测）
+            height: 9px + 26px + 5px;
             Rectangle {
                 x: 8px;
-                y: 8px;
+                y: 9px;
                 width: parent.width - 16px;
-                height: 24px;
+                height: 26px;
                 border-radius: 8px;
                 background: Theme.hover;
                 Icon { x: 9px; d: Icons.search; size: 13px; color: Theme.text-3; }
@@ -1001,11 +1005,11 @@ export component PanelWindow inherits Window {
     property <length> ep-y: 520px - composer-h - 6px - 288px;
     property <length> ep-w: 360px - 66px - 12px;
     property <length> am-x: 66px + 6px + 30px + 2px;
-    property <length> am-h: 4px * 2 + 28px * 2;
+    property <length> am-h: 4px * 2 + 28.67px * 2;
     property <length> am-y: 520px - 9px - 36px - am-h;
     property <length> mn-x: min(menu-x - frame, 220px);
     property <length> mn-y: min(menu-y - frame, 420px);
-    property <length> mn-h: 5px * 2 + 28px * 3;
+    property <length> mn-h: 5px * 2 + 28.67px * 3;
     property <length> toast-w: min(toast-t.preferred-width + 24px, 360px * 0.8);
     property <length> toast-h: toast-t.preferred-height + 14px;
     // .glass 弹层（表情面板 / 附件菜单 / 右键菜单）：无原生材质时 backdrop-filter: blur(30px) saturate(180%)；
@@ -1082,6 +1086,9 @@ export component PanelWindow inherits Window {
                         VerticalLayout {
                             alignment: center;
                             horizontal-stretch: 1;
+                            // 实测旧版（1.5x）：标题高 1、状态行高 2 物理像素 → 行距 -0.67、整体上移 0.67
+                            spacing: -0.67px;
+                            padding-bottom: 2px;
                             Text { text: root.header-title; font-size: 13px; font-weight: 600; letter-spacing: -0.13px; color: Theme.text; overflow: elide; }
                             Text { text: root.subtitle; font-size: 11px; color: root.subtitle-accent ? Theme.accent : Theme.text-2; overflow: elide; }
                         }
@@ -1212,7 +1219,7 @@ export component PanelWindow inherits Window {
                                 all: true;
                                 active: root.broadcast;
                                 drop-hot: root.drop-key == "all";
-                                clicked => { root.select-all(); }
+                                clicked => { input.clear-focus(); root.select-all(); }   // 旧版点侧栏按钮会夺走输入框焦点
                             }
                             Rectangle {
                                 height: 4px + 0.5px + 6px;
@@ -1230,7 +1237,7 @@ export component PanelWindow inherits Window {
                                         peer: p;
                                         active: !root.broadcast && root.current-id == p.id;
                                         drop-hot: root.drop-key == "peer:" + p.id;
-                                        clicked(shift) => { root.select-peer(p.id, shift); }
+                                        clicked(shift) => { input.clear-focus(); root.select-peer(p.id, shift); }
                                         menu(x, y) => { root.peer-menu(p.id, self.absolute-position.x + x, self.absolute-position.y + y); }
                                     }
                                 }
@@ -1622,7 +1629,10 @@ export component PanelWindow inherits Window {
             Shadow { kind: "glass-inset"; ew: parent.width; eh: parent.height; r: 9px; }
             TouchArea {}
             VerticalLayout {
+                // padding 4；条目整体上提 1（旧版文字比按 4 排高 2~3 物理像素，1.5x 实测），框高不变
                 padding: 4px;
+                padding-top: 3px;
+                padding-bottom: 5px;
                 MenuItem { icon: Icons.doc; label: "文件…"; pad: 8px; gap: 7px; clicked => { root.attach-open = false; root.attach(false); } }
                 MenuItem { icon: Icons.folder; label: "文件夹…"; pad: 8px; gap: 7px; clicked => { root.attach-open = false; root.attach(true); } }
             }

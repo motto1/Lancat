@@ -60,8 +60,10 @@ impl SettingsCtl {
 
     pub fn set_dark(&self, dark: bool) {
         self.win.global::<Theme>().set_dark(dark);
+        // 标题栏跟系统深浅色走，不跟应用主题（旧版 Tauri 窗口就是这样：应用深色、系统浅色时标题栏仍是浅色）
+        let _ = dark;
         #[cfg(windows)]
-        crate::win::set_normal_dark(dark);
+        crate::win::set_normal_dark(crate::theme_is_dark("system"));
     }
 
     pub fn show(&mut self, goto_diag: bool, peers: &[PeerView]) {
@@ -87,6 +89,15 @@ impl SettingsCtl {
                 }
             });
         }
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.win.window().is_visible()
+    }
+
+    /// 已开着的设置窗口提到前台（show() 对已显示的窗口会激活它）
+    pub fn raise(&self) {
+        let _ = self.win.show();
     }
 
     /// 已经开着时再次被要求跳到诊断（lancat://goto-diag）：滚过去 + 闪烁 + 重新检查
