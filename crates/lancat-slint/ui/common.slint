@@ -42,6 +42,12 @@ export global Fx {
     in-out property <float> dpr: 1;
     /// CSS 0.5px 细线：浏览器把不足 1 设备像素的边框画成 1 设备像素。Windows 保持量好的 0.5px，Linux 设为 1 物理像素（src/fx.rs）
     in-out property <length> hair: 0.5px;
+    /// 细线边框在布局里占的宽：Windows 0（按 1.5x 截图量好的数值里已含），Linux = 1 物理像素（WebKitGTK 把 0.5px 边框取整成 1 设备像素并计入盒子）
+    in-out property <length> hair-box: 0px;
+    /// Linux：旧版是 WebKitGTK（原生表单控件走 RenderThemeAdwaita）
+    in-out property <bool> gtk;
+    /// 默认字体族（Linux 由 src/metrics.rs 按旧版 WebKitGTK 的选择改写）
+    in-out property <string> font: "Segoe UI Variable Text";
     // 合成：0 = 普通单遍渲染；1 = 只画基底（活动层隐藏）；n ≥ 2 = 只画第 n 层（src/compose.rs）
     in-out property <int> pass: 0;
     in-out property <bool> a2;
@@ -63,6 +69,8 @@ export global Fx {
     pure callback paint(string, length, length, color, bool, float) -> image;
     /// 旧版 line-height: normal 的行框高度（字号、内容、Windows 上量好的值）：Linux 按 WebKitGTK 的字体回退与取整算（src/metrics.rs）
     pure callback lb(length, string, length) -> length;
+    /// 旧版数字 line-height（如 1.38）的行高：Chromium = 字号×系数；WebKitGTK = 取整字号×系数后截断为整数（src/metrics.rs）
+    pure callback lh(length, float) -> length;
     /// 命名缓动曲线 y(x)（cubic-bezier 精确求解）
     pure callback ease(string, float) -> float;
 
@@ -112,6 +120,18 @@ export global Tip {
     in-out property <length> rh;
     /// Rust（main.rs tip_valid）：指针（平台层记录的真实位置）还在这个矩形里吗
     callback valid(length, length, length, length) -> bool;
+    /// Linux：旧版是 WebKitGTK，title 提示是 GTK 原生 tooltip（GTK 主题的样式、500 ms、按下带提示的元素后
+    /// 直到指针离开窗口都不再出现）。src/fx.rs 在 Linux 上打开。
+    in-out property <bool> gtk;
+    in-out property <bool> block-all;
+    in-out property <string> gtk-font: "Sans";
+    in-out property <length> gtk-size: 13.33px;
+    /// GTK 主题 tooltip 的颜色（Breeze：rgba(0,0,0,.8) 底、白 10% 细边、白字；按主题文件读，读不到用 Breeze）
+    in-out property <color> gtk-bg: rgba(0, 0, 0, 0.8);
+    in-out property <color> gtk-border: rgba(255, 255, 255, 0.1);
+    in-out property <color> gtk-fg: #ffffff;
+    /// pango 的行高（字体 ascent/descent 向上取整，行内有中文时按回退字体撑高）
+    pure callback gtk-line(string) -> length;
 }
 
 export component TipArea inherits TouchArea {
@@ -130,7 +150,7 @@ export component TipArea inherits TouchArea {
             Tip.rw = self.width;
             Tip.rh = self.height;
             Tip.shown = false;
-            if root.tip != Tip.blocked {
+            if root.tip != Tip.blocked && !Tip.block-all {
                 Tip.blocked = "";
                 Tip.pending = true;
             } else {
@@ -146,6 +166,7 @@ export component TipArea inherits TouchArea {
     changed pressed => {
         if self.pressed && root.tip != "" {
             Tip.blocked = root.tip;
+            if Tip.gtk { Tip.block-all = true; }
         }
         if Tip.owner == root.me {
             Tip.pending = false;
@@ -170,27 +191,53 @@ export component TipBubble inherits Rectangle {
     in property <length> win-w;
     in property <length> win-h;
     visible: Tip.shown && Tip.text != "";
-    property <length> bw: min(tt.preferred-width + 16px, win-w - 8px);
-    property <length> bh: tt.preferred-height + 8px;
-    x: max(4px, min(Tip.x, win-w - bw - 4px));
-    y: Tip.y + 20px + bh > win-h - 4px ? max(4px, Tip.y - bh - 6px) : Tip.y + 20px;
+    // Windows（WebView2 的系统 tooltip）
+    property <length> bw: Tip.gtk ? gt.preferred-width + 2 * (12px + 1px) : min(tt.preferred-width + 16px, win-w - 8px);
+    property <length> gl: Tip.gtk-line(Tip.text);
+    property <int> glines: max(1, round(gt.preferred-height / max(1px, gl)));
+    property <length> bh: Tip.gtk ? glines * gl + 2 * (13px + 1px) : tt.preferred-height + 8px;
+    // GTK：居中在指针下方 20px，超出输出边时贴边滑动（xdg_popup slide）
+    x: Tip.gtk ? clamp(Tip.x - bw / 2, 0px, max(0px, win-w - bw)) : max(4px, min(Tip.x, win-w - bw - 4px));
+    y: Tip.gtk ? (Tip.y + 20px + bh > win-h - 7px ? max(7px, Tip.y - bh - 4px) : Tip.y + 20px) : (Tip.y + 20px + bh > win-h - 4px ? max(4px, Tip.y - bh - 6px) : Tip.y + 20px);
     width: bw;
     height: bh;
-    border-radius: 4px;
-    background: Theme.dark ? #2b2b2b : #f9f9f9;
-    border-width: 1px;
+    border-radius: Tip.gtk ? 5px : 4px;
+    background: Tip.gtk ? Tip.gtk-border : (Theme.dark ? #2b2b2b : #f9f9f9);
+    border-width: Tip.gtk ? 0px : 1px;
     border-color: Theme.dark ? rgba(255, 255, 255, 0.12) : rgba(0, 0, 0, 0.12);
+    if Tip.gtk: Rectangle {
+        x: 1px;
+        y: 1px;
+        width: parent.width - 2px;
+        height: parent.height - 2px;
+        border-radius: 4px;
+        background: Tip.gtk-bg;
+    }
     tt := Text {
+        visible: !Tip.gtk;
         x: 8px;
         width: parent.width - 16px;
-        text: Tip.text;
+        text: Tip.gtk ? "" : Tip.text;
         font-size: 12px;
         wrap: word-wrap;
         color: Theme.dark ? #ffffff : #1a1a1a;
         vertical-alignment: center;
     }
+    // 自然行高 → pango 行高
+    gm := Text { visible: false; text: "x"; font-family: Tip.gtk-font; font-size: Tip.gtk-size; }
+    gt := Text {
+        visible: Tip.gtk;
+        x: 13px;
+        y: 14px;
+        text: Tip.gtk ? Tip.text : "";
+        font-family: Tip.gtk-font;
+        font-size: Tip.gtk-size;
+        color: Tip.gtk-fg;
+        wrap: no-wrap;
+        line-height-factor: root.gl / max(1px, gm.preferred-height);
+    }
     Timer {
-        interval: 600ms;
+        interval: Tip.gtk ? 500ms : 600ms;
         running: Tip.pending;
         triggered => {
             Tip.pending = false;
@@ -266,7 +313,8 @@ export component Btn inherits Rectangle {
     in property <string> icon;
     callback clicked();
     width: lay.preferred-width;
-    height: 25px;
+    // Windows 量得 25；Linux（WebKitGTK）：padding 4 + 12px 行框 + 4 + 0.5px 边 ×2（各占 1 设备像素）
+    height: Fx.gtk ? 8px + Fx.lb(12px, root.text, 17px) + 2 * Fx.hair-box : 25px;
     property <bool> hov: ta.has-hover && enabled;
     property <bool> down: ta.pressed && enabled;
     property <float> k: down ? 0.97 : 1;

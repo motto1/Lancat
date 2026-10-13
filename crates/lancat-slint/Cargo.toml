@@ -34,6 +34,8 @@ wayland-client = "0.31"
 # zwp_text_input_v3（输入法）在 unstable 里
 wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 # 表情面板静止格的系统彩色字形（Slint 已经依赖 swash，这里只多开 render）
+# 托盘：StatusNotifierItem（旧版 tauri 托盘在 Linux 上走 libappindicator → SNI）
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
 swash = { version = "0.2.10", default-features = false, features = ["std", "scale", "render"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]

@@ -127,7 +127,9 @@ impl SettingsCtl {
         w.set_dock_edge(s.dock_edge.clone().into());
         w.set_dock_monitor(s.dock_monitor as i32);
         w.set_theme(s.theme.clone().into());
-        w.set_recv_dir(self.node.receive_dir().display().to_string().into());
+        let dir = self.node.receive_dir().display().to_string();
+        w.set_recv_dir(dir.clone().into());
+        w.set_recv_dir_shown(rtl_shown(&dir).into());
         w.set_recv_custom(!s.receive_dir.is_empty());
         let mp: Vec<SharedString> = s.manual_peers.iter().map(|a| a.into()).collect();
         w.set_manual_peers(ModelRc::new(VecModel::from(mp)));
@@ -468,7 +470,8 @@ mod flow {
                 while j < cs.len() && cs[j] != ' ' && !cjk(cs[j]) {
                     t.push(cs[j]);
                     j += 1;
-                    if cs[j - 1] == '/' && j < cs.len() && cs[j].is_alphanumeric() {
+                    // Chromium（Windows）在「/」后可断；旧版 Linux（WebKitGTK）实测整段网址不断开
+                    if cfg!(not(target_os = "linux")) && cs[j - 1] == '/' && j < cs.len() && cs[j].is_alphanumeric() {
                         break;
                     }
                 }
@@ -517,7 +520,8 @@ mod flow {
             if f.width <= 1.0 || f.widths.iter().any(|w| *w < 0.0) {
                 return;
             }
-            let lh = 11.5 * 1.5;
+            // 与 FlowNote.fs 相同（Linux 12px，Windows 11.5px）
+            let lh = crate::metrics::line_height(if cfg!(target_os = "linux") { 12.0 } else { 11.5 }, 1.5);
             let maxw = f.width;
             let mut pos = vec![(0.0f32, 0.0f32); f.toks.len()];
             let (mut x, mut line) = (0.0f32, 0usize);
@@ -558,5 +562,14 @@ mod flow {
                 w.set_about_lines(line as i32 + 1);
             }
         });
+    }
+}
+
+/// 旧版 .path 是 `direction: rtl`（为了从开头省略）：整串是 LTR 文字、开头的「/」是中性字符，按段落方向 RTL 排到了
+/// 最右边 —— 旧版显示成 "home/motto/…/recv/"。Windows 路径以盘符开头，不受影响。
+fn rtl_shown(p: &str) -> String {
+    match p.strip_prefix('/') {
+        Some(rest) => format!("{rest}/"),
+        None => p.to_string(),
     }
 }

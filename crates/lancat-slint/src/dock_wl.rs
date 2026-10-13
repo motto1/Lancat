@@ -10,7 +10,9 @@
 //!
 //! - 拖放（wl.rs 的 wl_data_device）：文件拖到停靠条 → 打开面板并显示拖放选择器；拖拽进行中不自动收起。
 //!
-//! 尚未做：消息 toast、拖动停靠条换边、托盘（StatusNotifierItem）。
+//! - 托盘：StatusNotifierItem（ksni），菜单与旧版 tray.rs 相同；Linux 上旧版（libappindicator）左键也只弹菜单。
+//! - 消息 toast：src/toast_wl.rs（停靠条鼓成胶囊，与旧版 native_dock/linux_toast.rs 相同）。
+//! - 拖动停靠条换边：旧版在 Wayland 上拿不到全局光标，按下停靠条只是打开面板；这里相同。
 
 use std::cell::RefCell;
 use std::io::{Read, Write};
@@ -37,7 +39,6 @@ pub struct Hooks {
     pub on_drag_over: Box<dyn Fn(f32, f32)>,
     pub on_drop: Box<dyn Fn(Vec<String>, Option<(f32, f32)>)>,
     pub on_settings: Box<dyn Fn()>,
-    #[allow(dead_code)]
     pub on_pinned: Box<dyn Fn(bool)>,
 }
 
@@ -142,6 +143,7 @@ pub fn init(node: Arc<Node>, hooks: Hooks) {
     };
     DOCK.with(|x| *x.borrow_mut() = Some(d));
     ipc_listen();
+    sni::create();
     apply_layout();
     log::info!("dock ready (wayland): edge {}", with(|d| d.node.settings().dock_edge).unwrap_or_default());
 }
@@ -195,8 +197,132 @@ pub fn note_typed() {
 }
 
 pub fn set_pinned(p: bool) {
-    with(|d| d.pinned = p);
+    let changed = with(|d| std::mem::replace(&mut d.pinned, p) != p).unwrap_or(false);
+    if changed {
+        hook(|h| (h.on_pinned)(p));
+        sni::sync();
+    }
 }
+
+/// 系统托盘（StatusNotifierItem）：与旧版 src-tauri/src/tray.rs 同一份菜单。
+/// 旧版在 Linux 上是 libappindicator：左键也弹菜单、没有悬停提示；这里一样（MENU_ON_ACTIVATE）。
+mod sni {
+    use ksni::blocking::TrayMethods as _;
+    use std::sync::Mutex;
+
+    pub struct T {
+        pinned: bool,
+        autostart: bool,
+    }
+
+    static H: Mutex<Option<ksni::blocking::Handle<T>>> = Mutex::new(None);
+
+    const ICONS: &[(i32, &[u8])] = &[
+        (16, include_bytes!("../assets/tray-16.argb")),
+        (24, include_bytes!("../assets/tray-24.argb")),
+        (32, include_bytes!("../assets/tray-32.argb")),
+        (48, include_bytes!("../assets/tray-48.argb")),
+        (64, include_bytes!("../assets/tray-64.argb")),
+        (128, include_bytes!("../assets/tray-128.argb")),
+    ];
+
+    /// 菜单回调在 ksni 的线程上：回到 Slint 事件循环再动界面
+    fn ui(f: impl FnOnce() + Send + 'static) {
+        let _ = slint::invoke_from_event_loop(f);
+    }
+
+    impl ksni::Tray for T {
+        const MENU_ON_ACTIVATE: bool = true;
+        fn id(&self) -> String {
+            "lancat".into()
+        }
+        fn title(&self) -> String {
+            "Lancat".into()
+        }
+        fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+            ICONS.iter().map(|&(w, d)| ksni::Icon { width: w, height: w, data: d.to_vec() }).collect()
+        }
+        fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+            use ksni::menu::*;
+            let item = |label: &str, f: fn()| -> ksni::MenuItem<Self> {
+                StandardItem { label: label.into(), activate: Box::new(move |_: &mut Self| ui(f)), ..Default::default() }.into()
+            };
+            vec![
+                item("打开 Lancat", || super::open_panel("tray")),
+                CheckmarkItem {
+                    label: "钉住面板（不自动收起）".into(),
+                    checked: self.pinned,
+                    activate: Box::new(|_: &mut Self| {
+                        ui(|| {
+                            let v = !super::pinned();
+                            super::set_pinned(v);
+                            if v {
+                                super::open_panel("tray");
+                            }
+                        })
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+                MenuItem::Separator,
+                item("刷新设备", || {
+                    super::with(|d| d.node.refresh_peers());
+                }),
+                item("打开接收文件夹", || {
+                    let Some(dir) = super::with(|d| d.node.receive_dir()) else { return };
+                    let _ = std::fs::create_dir_all(&dir);
+                    // 打开的是目录，绝不是收到的文件：不会执行任何东西
+                    if let Err(e) = std::process::Command::new("xdg-open").arg(&dir).spawn() {
+                        log::warn!("tray: xdg-open {}: {e}", dir.display());
+                    }
+                }),
+                item("设置…", || super::hook(|h| (h.on_settings)())),
+                CheckmarkItem {
+                    label: "开机自动启动".into(),
+                    checked: self.autostart,
+                    activate: Box::new(|_: &mut Self| {
+                        ui(|| {
+                            super::tray::set_autostart(!super::tray::autostart_enabled());
+                            sync();
+                        })
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+                MenuItem::Separator,
+                item("退出 Lancat", || {
+                    // 节点在事件循环结束后由 main 关掉（与关面板退出同一条路）
+                    if let Some(h) = H.lock().unwrap().take() {
+                        let _ = h.shutdown();
+                    }
+                    let _ = slint::quit_event_loop();
+                }),
+            ]
+        }
+    }
+
+    pub fn create() {
+        let t = T { pinned: super::pinned(), autostart: super::tray::autostart_enabled() };
+        match t.spawn() {
+            Ok(h) => *H.lock().unwrap() = Some(h),
+            // 没有 StatusNotifierWatcher（面板不带托盘）：和旧版一样只是没有托盘
+            Err(e) => log::warn!("tray: {e}"),
+        }
+    }
+
+    /// 勾选状态跟上真实状态（钉住 / 开机自启从别处改过）
+    pub fn sync() {
+        let (pinned, autostart) = (super::pinned(), super::tray::autostart_enabled());
+        if let Some(h) = H.lock().unwrap().as_ref() {
+            h.update(move |t: &mut T| {
+                t.pinned = pinned;
+                t.autostart = autostart;
+            });
+        }
+    }
+}
+
+
 
 /// 设置页的「显示器」下拉（输出的逻辑尺寸）
 pub fn monitor_labels() -> Vec<String> {
@@ -236,10 +362,10 @@ pub mod tray {
         } else {
             let _ = std::fs::remove_file(&p);
         }
+        super::sni::sync();
     }
 }
 
-#[allow(dead_code)]
 pub fn pinned() -> bool {
     with(|d| d.pinned).unwrap_or(false)
 }
@@ -249,6 +375,7 @@ pub fn is_visible() -> bool {
 }
 
 pub fn open_panel(reason: &str) {
+    crate::toast_wl::dismiss();
     let focus = reason == "tray" || reason == "shortcut" || reason.starts_with("toast:");
     let first = with(|d| {
         d.hover_timer.stop();
@@ -303,15 +430,66 @@ pub fn toggle_panel() {
     }
 }
 
-/// 收到消息：Wayland 版的 toast 在阶段 4 做；现在只让停靠条的未读脉冲跟上。
+/// 收到消息：面板关着时弹 toast（停靠条鼓成胶囊，src/toast_wl.rs），条件和文案与旧版 dock.rs / Windows 版相同。
 pub fn on_incoming(m: &lancat_core::Message) {
-    if !m.outgoing {
-        log::debug!("message from {} ({}): toast not implemented on wayland yet", m.peer_id, m.kind);
+    if m.outgoing {
+        return;
+    }
+    let skip = |why: &str| log::debug!("message toast for {} ({}) not shown: {why}", m.peer_id, m.kind);
+    let Some(spec) = with(|d| -> Result<crate::toast_wl::ToastSpec, &'static str> {
+        if d.visible {
+            return Err("panel open");
+        }
+        let peer = d.node.peers().into_iter().find(|p| p.id == m.peer_id).ok_or("unknown peer")?;
+        if peer.blocked {
+            return Err("peer blocked");
+        }
+        let s = |k: &str| m.body.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let text = match m.kind.as_str() {
+            "text" => s("text").split_whitespace().collect::<Vec<_>>().join(" "),
+            "emoji" => {
+                let alt = s("alt");
+                if s("kind") == "sticker" {
+                    format!("[贴纸] {alt}")
+                } else if alt.is_empty() {
+                    "[表情]".into()
+                } else {
+                    alt
+                }
+            }
+            "file" => {
+                let size = m.body.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+                format!("📄 {} · {}", s("name"), crate::human(size))
+            }
+            _ => return Err("kind has no toast"),
+        };
+        let (strip, _) = compute(d).ok_or("no dock geometry yet")?;
+        let &(mw, mh, _) = wl::outputs().get(strip.output).ok_or("no output")?;
+        let (w, h, a) = (strip.w as f64, strip.h as f64, strip.along as f64);
+        let rect = match strip.edge.as_str() {
+            "left" => (0.0, a, w, h),
+            "top" => (a, 0.0, w, h),
+            "bottom" => (a, mh as f64 - h, w, h),
+            _ => (mw as f64 - w, a, w, h),
+        };
+        log::info!("message toast: {} from {} ({})", m.kind, peer.name, m.peer_id);
+        let dark = crate::theme_is_dark(&d.node.settings().theme);
+        let hold_ms = 4000 + (text.chars().count() as u32 * 60).min(3000);
+        Ok(crate::toast_wl::ToastSpec { peer_id: peer.id.clone(), name: peer.name.clone(), text, edge: strip.edge.clone(), strip: rect, output: strip.output, dark, hold_ms })
+    }) else {
+        return;
+    };
+    match spec {
+        Ok(spec) => crate::toast_wl::show(spec),
+        Err(why) => skip(why),
     }
 }
 
-/// 拖动停靠条换边：Wayland 下没有全局光标，阶段 4 再做（按停靠条 surface 的指针拖动）。
-pub fn begin_move(_from_strip: bool) {}
+/// 拖动停靠条换边：旧版在 Wayland 上拿不到全局光标（cursor_position 出错），按下停靠条只是打开面板、
+/// 按下顶栏什么也不做；这里相同，只把 toast 收起（旧版 begin_move 第一件事）。
+pub fn begin_move(_from_strip: bool) {
+    crate::toast_wl::dismiss();
+}
 
 // ------------------------------------------------------------------ events from wl.rs
 
@@ -332,6 +510,10 @@ pub fn wl_strip_pointer(inside: bool) {
         if d.visible {
             d.entered = true;
             d.leave_timer.stop();
+            return false;
+        }
+        // toast 盖在停靠条的位置上：停在上面不悬停打开面板，点 toast 才打开（旧版 dock.rs tick）
+        if crate::toast_wl::shown() {
             return false;
         }
         !d.hover_disarmed && !probe

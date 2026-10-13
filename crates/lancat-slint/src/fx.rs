@@ -772,9 +772,30 @@ macro_rules! install_fx {
         g.on_paint(|kind, w, h, col, dark, dpr| $crate::fx::paint(kind.as_str(), w, h, col, dark, dpr));
         g.on_ease(|name, x| $crate::fx::ease(name.as_str(), x));
         g.on_lb(|size, text, win| $crate::metrics::line_box(size, text.as_str(), win));
+        g.on_lh(|size, f| $crate::metrics::line_height(size, f));
         g.set_dpr($c.window().scale_factor());
         #[cfg(target_os = "linux")]
-        g.set_hair(1.0 / $c.window().scale_factor().max(1.0));
+        {
+            g.set_hair(1.0 / $c.window().scale_factor().max(1.0));
+            g.set_hair_box(1.0 / $c.window().scale_factor().max(1.0));
+            g.set_gtk(true);
+            if let Some(f) = $crate::metrics::ui_family() {
+                g.set_font(f.into());
+            }
+            // title 提示：GTK 原生 tooltip 的样式与规则（旧版 WebKitGTK）
+            let tip = $c.global::<$crate::Tip>();
+            tip.set_gtk(true);
+            let (fam, size) = $crate::metrics::gtk_font();
+            tip.set_gtk_font(fam.into());
+            tip.set_gtk_size(size);
+            tip.on_gtk_line(move |text| $crate::metrics::gtk_line(size, text.as_str()));
+            let w = $c.as_weak();
+            $crate::tip_on_leave($normal, Box::new(move || {
+                if let Some(c) = w.upgrade() {
+                    c.global::<$crate::Tip>().set_block_all(false);
+                }
+            }));
+        }
     }};
 }
 

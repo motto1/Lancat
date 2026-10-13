@@ -1,0 +1,150 @@
+// Linux（Wayland）消息 toast：与旧版 src-tauri/src/native_dock/linux_toast.rs 的 cairo 绘制逐项相同。
+// 停靠条（strip 尺寸、accent 色）随 t 鼓成两行胶囊（头像、名字、消息），t 由 src/toast_wl.rs 驱动（easeOutBack 280 ms / 收回 k²）。
+// 窗口 = layer surface（贴屏幕边，含 10px 阴影外沿），只有卡片接收指针（输入区域在 wl.rs 设）。
+
+export component ToastWindow inherits Window {
+    background: transparent;
+    no-frame: true;
+    in property <float> t;              // 0 = 停靠条，1 = 胶囊（可略超 1）
+    in property <string> edge: "right";
+    in property <length> strip-w: 6px;
+    in property <length> strip-h: 160px;
+    in property <string> name;
+    in property <string> text;
+    in property <string> initials;
+    in property <color> avatar;
+    in property <bool> dark;
+    // 旧版用 GTK 的界面字体（gtk-font-name），pango 绝对字号
+    in property <string> family: "Sans";
+    default-font-family: root.family;
+
+    // ---- 尺寸（与旧版常量相同）----
+    property <length> H: 48px;
+    property <length> PAD: 8px;
+    property <length> AVATAR: 32px;
+    property <length> GAP: 9px;
+    property <length> RADIUS: 17px;
+    property <length> INSET: 4px;
+    property <length> name-w: min(nm.preferred-width, 196px);
+    property <length> text-w: min(tx.preferred-width, 196px);
+    out property <length> pill-w: max(PAD + AVATAR + GAP + max(name-w, text-w) + PAD * 1.7, H * 2.4);
+    out property <length> pill-h: H;
+
+    property <float> tt: max(0, t);
+    property <bool> vertical: edge == "left" || edge == "right";
+    property <length> cw: strip-w + (pill-w - strip-w) * tt;
+    property <length> ch: strip-h + (pill-h - strip-h) * tt;
+    property <length> gap: INSET * tt;
+    property <length> x0: vertical ? (edge == "right" ? root.width - cw - gap : gap) : (root.width - cw) / 2;
+    property <length> y0: vertical ? (root.height - ch) / 2 : (edge == "bottom" ? root.height - ch - gap : gap);
+    property <length> radius: (1 - tt) * (min(cw, ch) / 2) + tt * min(RADIUS, ch / 2);
+    property <float> content: clamp((tt - 0.45) / 0.55, 0, 1);
+    // 柔和阴影：4 个逐渐变宽、变淡的圆角矩形
+    property <float> sh-a: 0.05 * max(content, 0.3 * tt);
+
+    for i in [1, 2, 3, 4]: Rectangle {
+        property <length> d: i * 2px * root.tt;
+        x: root.x0 - d;
+        y: root.y0 - d + 1px;
+        width: root.cw + 2 * d;
+        height: root.ch + 2 * d;
+        border-radius: root.radius + d;
+        background: rgba(0, 0, 0, root.sh-a * (5 - i) / 4);
+    }
+
+    // 卡身：还是停靠条时是 accent，鼓起后变成半透明玻璃色
+    property <float> k: min(tt * 2, 1);
+    property <float> br: dark ? 0.12 : 0.97;
+    property <float> bg: dark ? 0.12 : 0.97;
+    property <float> bb: dark ? 0.14 : 0.98;
+    property <float> ba: dark ? 0.86 : 0.88;
+    Rectangle {
+        x: root.x0;
+        y: root.y0;
+        width: root.cw;
+        height: root.ch;
+        border-radius: root.radius;
+        background: rgba((0.04 + (root.br - 0.04) * root.k) * 255, (0.52 + (root.bg - 0.52) * root.k) * 255, (1.0 + (root.bb - 1.0) * root.k) * 255, 0.8 + (root.ba - 0.8) * root.k);
+    }
+    // 顶部高光
+    Rectangle {
+        x: root.x0;
+        y: root.y0;
+        width: root.cw;
+        height: root.ch;
+        border-radius: root.radius;
+        background: @linear-gradient(180deg, rgba(255, 255, 255, (root.dark ? 0.16 : 0.42) * root.content) 0%, rgba(255, 255, 255, 0) 55%);
+    }
+    // 镜面描边（cairo stroke 0.8，压在路径中线上）
+    Rectangle {
+        // 软件渲染器按整像素画边：1px 宽、alpha × 0.8，覆盖率与 0.8 线宽的抗锯齿描边相同
+        x: root.x0 - 0.5px;
+        y: root.y0 - 0.5px;
+        width: root.cw + 1px;
+        height: root.ch + 1px;
+        border-radius: root.radius + 0.5px;
+        border-width: 1px;
+        border-color: rgba(255, 255, 255, (root.dark ? 0.24 : 0.7) * 0.8 * root.content);
+    }
+    // 深色卡片外再一圈细黑线，压住深色壁纸
+    if root.dark: Rectangle {
+        x: root.x0 - 0.8px;
+        y: root.y0 - 0.8px;
+        width: root.cw + 1.6px;
+        height: root.ch + 1.6px;
+        border-radius: root.radius + 0.8px;
+        border-width: 0.6px;
+        border-color: rgba(0, 0, 0, 0.35 * root.content);
+    }
+
+    // ---- 内容（content > 0 才画）----
+    property <length> cy: y0 + ch / 2;
+    Rectangle {
+        visible: root.content > 0;
+        x: root.x0 + root.PAD;
+        y: root.cy - root.AVATAR / 2;
+        width: root.AVATAR;
+        height: root.AVATAR;
+        border-radius: root.AVATAR / 2;
+        background: root.avatar.with-alpha(root.content);
+        Text {
+            text: root.initials;
+            font-size: 14px;
+            font-weight: 700;
+            color: rgba(255, 255, 255, root.content);
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+    // 文字裁在卡片里（鼓起途中）
+    Rectangle {
+        visible: root.content > 0;
+        x: root.x0;
+        y: root.y0;
+        width: root.cw;
+        height: root.ch;
+        clip: true;
+        property <length> top: root.cy - root.y0 - (nm.preferred-height + tx.preferred-height + 1px) / 2;
+        nm := Text {
+            x: root.PAD + root.AVATAR + root.GAP;
+            y: parent.top;
+            width: root.name-w;
+            text: root.name;
+            font-size: 12.5px;
+            font-weight: 600;
+            overflow: elide;
+            wrap: no-wrap;
+            color: root.dark ? rgba(255, 255, 255, root.content) : rgba(0.07 * 255, 0.07 * 255, 0.08 * 255, root.content);
+        }
+        tx := Text {
+            x: root.PAD + root.AVATAR + root.GAP;
+            y: parent.top + nm.preferred-height + 1px;
+            width: root.text-w;
+            text: root.text;
+            font-size: 12px;
+            overflow: elide;
+            wrap: no-wrap;
+            color: root.dark ? rgba(0.92 * 255, 0.92 * 255, 0.95 * 255, 0.82 * root.content) : rgba(0.2 * 255, 0.2 * 255, 0.24 * 255, 0.85 * root.content);
+        }
+    }
+}

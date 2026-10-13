@@ -58,10 +58,11 @@ component Section inherits Rectangle {
         visible: root.flash > 0.001;
     }
     VerticalLayout {
-        padding-left: 14px;
-        padding-right: 14px;
-        padding-top: 6px;
-        padding-bottom: 10px;
+        // Linux：0.5px 边框占 1 设备像素（WebKitGTK）
+        padding-left: 14px + Fx.hair-box;
+        padding-right: 14px + Fx.hair-box;
+        padding-top: 6px + Fx.hair-box;
+        padding-bottom: 10px + Fx.hair-box;
         // h2：margin 8 0 4，行框 15 —— 文字在行框（不是整个 27 高）里居中，实测与旧版同一基线
         if root.title != "": Rectangle {
             height: 8px + root.h2-lh + 4px;
@@ -122,7 +123,7 @@ component Field inherits Rectangle {
     ti := TextInput {
         x: 8px;
         y: root.multi ? 4px : 0px;
-        width: parent.width - 16px - (root.number && (nta.has-hover || ti.has-focus) ? 14px : 0px);
+        width: parent.width - 16px - (root.number && (Fx.gtk || nta.has-hover || ti.has-focus) ? (Fx.gtk ? 18px : 14px) : 0px);
         height: root.multi ? parent.height - 8px : parent.height;
         vertical-alignment: root.multi ? top : center;
         single-line: !root.multi;
@@ -150,7 +151,49 @@ component Field inherits Rectangle {
     nta := TouchArea {
         enabled: false;
     }
-    if root.number && (nta.has-hover || ti.has-focus): Rectangle {
+    // Linux（WebKitGTK RenderThemeAdwaita，实测）：上下微调一直在，16×19 r3 细边小盒，离右边框 7、上边框 2
+    if root.number && Fx.gtk: Rectangle {
+        x: parent.width - 1px - 7px - 16px;
+        y: 1px + 2px;
+        width: 16px;
+        height: 19px;
+        border-radius: 3px;
+        border-width: 1px;
+        border-color: Theme.dark ? rgb(65, 65, 68) : rgb(228, 228, 229);
+        background: Theme.dark ? rgb(45, 45, 45) : #ffffff;
+        Path {
+            x: 5px;
+            y: 4px;
+            width: 6px;
+            height: 3px;
+            viewbox-width: 6;
+            viewbox-height: 3;
+            commands: "M0 3 L3 0 L6 3 Z";
+            fill: Theme.dark ? rgb(238, 238, 236) : rgb(46, 52, 54);
+        }
+        Path {
+            x: 5px;
+            y: 12px;
+            width: 6px;
+            height: 3px;
+            viewbox-width: 6;
+            viewbox-height: 3;
+            commands: "M0 0 L3 3 L6 0 Z";
+            fill: Theme.dark ? rgb(238, 238, 236) : rgb(46, 52, 54);
+        }
+        TouchArea {
+            pointer-event(e) => {
+                if e.kind == PointerEventKind.down {
+                    let up = self.mouse-y < self.height / 2;
+                    let v = root.text.to-float();
+                    let n = max(0, round((v + (up ? 100 : -100)) / 100) * 100);
+                    root.text = n;
+                    root.edited(root.text);
+                }
+            }
+        }
+    }
+    if root.number && !Fx.gtk && (nta.has-hover || ti.has-focus): Rectangle {
         x: parent.width - 15px;
         y: 2px;
         width: 13px;
@@ -213,7 +256,10 @@ component Field inherits Rectangle {
     }
 }
 
-/// Chromium 原生 range + accent-color（宽 180）：轨道 4px r2（已填 accent，未填灰），拇指 16px accent 圆
+/// 原生 range + accent-color（宽 180）。
+/// Windows（Chromium）：轨道 4px r2（已填 accent，未填灰），拇指 16px accent 圆。
+/// Linux（WebKitGTK RenderThemeAdwaita，实测）：轨道 6px r3（未填：浅色黑 40/255、深色白 30/255；已填 accent 到拇指中心），
+/// 拇指外径 20（1px 黑 17% 边，里面浅色 #fff、深色 #d2d2d2）。
 component Slider inherits Rectangle {
     in property <float> minimum;
     in property <float> maximum: 1;
@@ -224,31 +270,41 @@ component Slider inherits Rectangle {
     width: 180px;
     height: 20px;
     property <float> frac: (value - minimum) / max(0.000001, maximum - minimum);
+    property <length> tk: Fx.gtk ? 20px : 16px;
+    property <length> th: Fx.gtk ? 6px : 4px;
     Rectangle {
         x: 0;
-        y: (parent.height - 4px) / 2;
+        y: (parent.height - root.th) / 2;
         width: parent.width;
-        height: 4px;
-        border-radius: 2px;
-        background: Theme.dark ? #4b4b4f : #d9d9de;
+        height: root.th;
+        border-radius: root.th / 2;
+        background: Fx.gtk ? (Theme.dark ? rgba(255, 255, 255, 30 / 255) : rgba(0, 0, 0, 40 / 255)) : (Theme.dark ? #4b4b4f : #d9d9de);
         Rectangle {
             x: 0;
-            width: 8px + (root.width - 16px) * root.frac;
-            border-radius: 2px;
-            background: ta.has-hover || ta.pressed ? Theme.mix(Theme.accent, Theme.dark ? #ffffff : #000000, 0.1) : Theme.accent;
+            width: root.tk / 2 + (root.width - root.tk) * root.frac;
+            border-radius: root.th / 2;
+            background: !Fx.gtk && (ta.has-hover || ta.pressed) ? Theme.mix(Theme.accent, Theme.dark ? #ffffff : #000000, 0.1) : Theme.accent;
         }
     }
     Rectangle {
-        x: (root.width - 16px) * root.frac;
-        y: (root.height - 16px) / 2;
-        width: 16px;
-        height: 16px;
-        border-radius: 8px;
-        background: ta.has-hover || ta.pressed ? Theme.mix(Theme.accent, Theme.dark ? #ffffff : #000000, 0.1) : Theme.accent;
+        x: (root.width - root.tk) * root.frac;
+        y: (root.height - root.tk) / 2;
+        width: root.tk;
+        height: root.tk;
+        border-radius: root.tk / 2;
+        background: Fx.gtk ? rgba(0, 0, 0, 0.17) : (ta.has-hover || ta.pressed ? Theme.mix(Theme.accent, Theme.dark ? #ffffff : #000000, 0.1) : Theme.accent);
+        if Fx.gtk: Rectangle {
+            x: 1px;
+            y: 1px;
+            width: parent.width - 2px;
+            height: parent.height - 2px;
+            border-radius: self.width / 2;
+            background: Theme.dark ? #d2d2d2 : #ffffff;
+        }
     }
     ta := TouchArea {
         function set(x: length) {
-            let f = clamp((x - 8px) / (root.width - 16px), 0, 1);
+            let f = clamp((x - root.tk / 2) / (root.width - root.tk), 0, 1);
             let raw = root.minimum + f * (root.maximum - root.minimum);
             let v = clamp(round(raw / root.step) * root.step, root.minimum, root.maximum);
             if v != root.value { root.value = v; root.changed(v); }
@@ -319,11 +375,19 @@ component Note inherits HorizontalLayout {
     in property <color> color: Theme.text-2;
     padding-top: 6px;
     padding-bottom: 2px;
+    // line-height 1.5：Linux（WebKitGTK）截断成整数 17；Windows 保持 Slint 自身行距（按 1.5x 截图量过）
+    // 自然行高的量尺：宽高 0、间距 0，不影响布局
+    nm := Text { visible: false; width: 0px; height: 0px; text: "x"; font-size: 11.5px; }
     Text {
         text: root.text;
         font-size: 11.5px;
         color: root.color;
         wrap: word-wrap;
+        line-height-factor: Fx.gtk ? Fx.lh(11.5px, 1.5) / max(1px, nm.preferred-height) : 1;
+        // 折行后的高度要进布局：Slint 的 preferred-height 按不折行算，滚动区的内容高因此会少几行
+        property <length> lhv: Fx.gtk ? Fx.lh(11.5px, 1.5) : nm.preferred-height;
+        property <int> lines: max(1, ceil(self.preferred-width / max(1px, self.width) - 0.02));
+        min-height: self.lines * self.lhv;
     }
 }
 
@@ -334,16 +398,20 @@ component FlowNote inherits Rectangle {
     in property <int> lines: 1;
     callback measured(int, length);
     callback width-changed(length);
-    height: 6px + root.lines * 11.5px * 1.5 + 2px;
+    // 关于里的这段是 `.about p`（12px、margin 4 0，比 .note 的 11.5 / 6 0 2 优先）。Windows 按 1.5x 截图保持 11.5 / 6 / 2
+    in property <length> fs: Fx.gtk ? 12px : 11.5px;
+    in property <length> pt: Fx.gtk ? 4px : 6px;
+    in property <length> pb: Fx.gtk ? 4px : 2px;
+    height: root.pt + root.lines * Fx.lh(root.fs, 1.5) + root.pb;
     changed width => { root.width-changed(self.width); }
     init => { root.width-changed(self.width); }
     for t[i] in root.toks: Text {
         x: t.x;
-        y: 6px + t.y;
-        height: 11.5px * 1.5;
+        y: root.pt + t.y;
+        height: Fx.lh(root.fs, 1.5);
         vertical-alignment: center;
         text: t.t;
-        font-size: 11.5px;
+        font-size: root.fs;
         font-weight: t.bold ? 700 : 400;
         color: Theme.text-2;
         init => { root.measured(i, self.preferred-width); }
@@ -389,11 +457,15 @@ component CheckRow inherits Rectangle {
     // 展开箭头旋转 90°（160 ms ease）
     property <float> rot: open ? 90 : 0;
     animate rot { duration: 160ms; easing: cubic-bezier(0.2, 0.8, 0.3, 1); }
+    // 自然行高的量尺（放在布局外面：隐藏的元素在布局里照样占位）
+    dmm := Text { visible: false; text: "x"; font-size: 11px; }
+    smm := Text { visible: false; text: "x"; font-size: 11.5px; }
     property <color> scol: c.status == "ok" ? Theme.online : (c.status == "warn" ? Theme.warn : (c.status == "error" ? Theme.danger : Theme.text-3));
     height: lay.preferred-height;
     lay := VerticalLayout {
         padding-top: 8px;
-        padding-bottom: 8px;
+        // Linux：.check 的 0.5px 底边占 1 设备像素
+        padding-bottom: 8px + (root.last ? 0px : Fx.hair-box);
         HorizontalLayout {
             spacing: 10px;
             VerticalLayout {
@@ -419,13 +491,13 @@ component CheckRow inherits Rectangle {
             }
             VerticalLayout {
                 horizontal-stretch: 1;
-                // margin-top 1；再加 1：说明行比旧版高 2 物理像素（1.5x 实测）
-                spacing: 2px;
+                // margin-top 1；Windows 再加 1：说明行比旧版高 2 物理像素（1.5x 实测）
+                spacing: Fx.gtk ? 1px : 2px;
                 HorizontalLayout {
                     spacing: 6px;
                     alignment: start;
                     // .title 行框：12.5px 中文 normal 行高 16.67（> 徽标 16），每项因此比按 16 排高 0.67
-                    min-height: 16.67px;
+                    min-height: Fx.lb(12.5px, root.c.title, 16.67px);
                     Text { text: root.c.title; font-size: 12.5px; font-weight: 500; color: Theme.text; vertical-alignment: center; }
                     VerticalLayout {
                         alignment: center;
@@ -446,12 +518,15 @@ component CheckRow inherits Rectangle {
                 // .summary：11.5px line-height 1.45（16.675/行）。Slint 行距取字体度量（11.5px ≈ 14.67/行，实测 1.5x 截图），
                 // 按行数换成 CSS 的总高度，文字在里面居中：首行逐像素对齐，之后每行差 ≤1px，不再逐行累积
                 sm := Text {
-                    property <int> lines: max(1, round(self.preferred-height / 14.67px));
+                    // Linux：行高 = WebKitGTK 截断后的 16，用 line-height-factor 逐行对齐
+                    property <length> lhv: Fx.lh(11.5px, 1.45);
+                    line-height-factor: Fx.gtk ? self.lhv / max(1px, smm.preferred-height) : 1;
+                    property <int> lines: Fx.gtk ? max(1, ceil(self.preferred-width / max(1px, self.width) - 0.02)) : max(1, round(self.preferred-height / 14.67px));
                     text: root.c.summary;
                     font-size: 11.5px;
                     color: Theme.text-2;
                     wrap: word-wrap;
-                    height: self.lines * 11.5px * 1.45;
+                    height: self.lines * self.lhv;
                     vertical-alignment: center;
                 }
             }
@@ -485,6 +560,7 @@ component CheckRow inherits Rectangle {
                         read-only: true;
                         text: root.c.detail;
                         font-size: 11px;
+                        line-height-factor: Fx.gtk ? Fx.lh(11px, 1.55) / max(1px, dmm.preferred-height) : 1;
                         color: Theme.text-2;
                         wrap: char-wrap;
                         single-line: false;
@@ -496,6 +572,7 @@ component CheckRow inherits Rectangle {
                             read-only: true;
                             text: root.c.help;
                             font-size: 11px;
+                            line-height-factor: Fx.gtk ? Fx.lh(11px, 1.55) / max(1px, dmm.preferred-height) : 1;
                             color: Theme.text;
                             wrap: word-wrap;
                             single-line: false;
@@ -659,7 +736,7 @@ export component SettingsWindow inherits Window {
     min-height: 480px + root.csd-h;
     background: Theme.glass-strong-solid;
     default-font-size: 13px;
-    default-font-family: "Segoe UI Variable Text";
+    default-font-family: Fx.font;
 
     in property <bool> saved-flash;
     in property <int> saved-gen;
@@ -681,6 +758,7 @@ export component SettingsWindow inherits Window {
     in property <int> dock-monitor;
     // 接收
     in property <string> recv-dir;
+    in property <string> recv-dir-shown;
     in property <bool> recv-custom;
     in-out property <string> max-file-mb;
     // 设备
@@ -742,7 +820,8 @@ export component SettingsWindow inherits Window {
         width: parent.width;
         height: parent.height;
         content-height: col.preferred-height;
-        content-width: self.width;
+        // Linux：WebKitGTK 的 8px 经典滚动条占布局宽，内容按剩下的宽居中（实测比不减时左移 4px）
+        content-width: self.width - (Fx.gtk && sb.shown ? 8px : 0px);
         HorizontalLayout {
             width: fl.width - (sb.shown ? 8px : 0px);
             alignment: center;
@@ -757,7 +836,7 @@ export component SettingsWindow inherits Window {
             HorizontalLayout {
                 spacing: 10px;
                 alignment: start;
-                Text { text: "Lancat 设置"; font-size: 17px; font-weight: 700; color: Theme.text; vertical-alignment: center; }
+                Text { text: "Lancat 设置"; font-size: 17px; font-weight: 700; color: Theme.text; vertical-alignment: center; height: Fx.lb(17px, self.text, self.preferred-height); }
                 // 已保存：1.2 s，70% 之前不透明，之后淡出
                 if root.saved-flash: Text {
                     property <float> t: 0;
@@ -899,7 +978,8 @@ export component SettingsWindow inherits Window {
                 }
                 Row {
                     label: "收起后释放面板";
-                    last: true;
+                    // 后面还有 .note：不是 :last-child，Linux 上照样有底线（Windows 按 1.5x 截图保持原样）
+                    last: !Fx.gtk;
                     VerticalLayout { alignment: center; s5 := Slider { minimum: 0; maximum: 7200; step: 60; value <=> root.keep-alive; changed => { root.save(); } } }
                     Em { text: root.keep-alive == 0 ? "常驻" : (root.keep-alive < 60 ? round(root.keep-alive) + "s" : round(root.keep-alive / 60) + " 分钟"); }
                 }
@@ -919,7 +999,7 @@ export component SettingsWindow inherits Window {
                             x: min(0px, parent.width - self.preferred-width);
                             width: self.preferred-width;
                             height: parent.height;
-                            text: root.recv-dir;
+                            text: root.recv-dir-shown;
                             font-size: 11px;
                             font-family: "Cascadia Mono";
                             color: Theme.text-2;
@@ -945,7 +1025,8 @@ export component SettingsWindow inherits Window {
                 }
                 Row {
                     label: "单文件大小上限";
-                    last: true;
+                    // 后面还有 .note：不是 :last-child，Linux 上照样有底线（Windows 按 1.5x 截图保持原样）
+                    last: !Fx.gtk;
                     VerticalLayout { alignment: center; f-mb := Field { width: 90px; height: 26px; number: true; text <=> root.max-file-mb; edited => { root.save(); } } }
                     Em { text: "MB（0 = 不限）"; }
                 }
@@ -958,12 +1039,14 @@ export component SettingsWindow inherits Window {
                     min-height: 34px;
                     HorizontalLayout {
                         spacing: 10px;
+                        padding-bottom: Fx.hair-box;
                         VerticalLayout { alignment: center; Rectangle { width: 8px; height: 8px; border-radius: 4px; background: d.online ? Theme.online : Theme.text-3; } }
                         VerticalLayout {
                             alignment: center;
                             horizontal-stretch: 1;
-                            Text { text: d.name; font-size: 12.5px; color: Theme.text; overflow: elide; }
-                            Text { text: d.sub; font-size: 10.5px; color: Theme.text-3; overflow: elide; }
+                            // 行框：Linux 按 WebKitGTK 的字体度量（名字含中文时更高），Windows 保持 Slint 自身
+                            Text { text: d.name; font-size: 12.5px; color: Theme.text; overflow: elide; height: Fx.gtk ? Fx.lb(12.5px, self.text, 0px) : self.preferred-height; vertical-alignment: center; }
+                            Text { text: d.sub; font-size: 10.5px; color: Theme.text-3; overflow: elide; height: Fx.gtk ? Fx.lb(10.5px, self.text, 0px) : self.preferred-height; vertical-alignment: center; }
                         }
                         VerticalLayout { alignment: center; Btn { text: d.blocked ? "取消拉黑" : "拉黑"; danger: !d.blocked; clicked => { root.toggle-block(d.id); } } }
                     }
@@ -974,7 +1057,7 @@ export component SettingsWindow inherits Window {
                     padding-bottom: 2px;
                     spacing: 5px;
                     Text { text: "按 IP 拉黑（每行一个）"; font-size: 13px; color: Theme.text; }
-                    f-ips := Field { height: 2 * 17px + 8px + 1px; multi: true; mono: true; text <=> root.blocked-ips; placeholder: "192.168.1.66"; edited => { root.save(); } }
+                    f-ips := Field { height: Fx.gtk ? 2 * 15px + 8px + 2 * Fx.hair-box : 2 * 17px + 8px + 1px; multi: true; mono: true; text <=> root.blocked-ips; placeholder: "192.168.1.66"; edited => { root.save(); } }
                 }
                 if root.manual-peers.length > 0: VerticalLayout {
                     padding-top: 8px;
@@ -1022,8 +1105,9 @@ export component SettingsWindow inherits Window {
                 title: "关于";
                 VerticalLayout {
                     padding-top: 4px;
-                    padding-bottom: 4px;
-                    Text { text: "Lancat " + root.me-ver + " · " + root.me-os + " · 局域网零配置快传"; font-size: 12px; color: Theme.text; wrap: word-wrap; }
+                    // Linux：两个 p 的 4px 外边距折叠成一个（下一段自己带 4）
+                    padding-bottom: Fx.gtk ? 0px : 4px;
+                    Text { height: Fx.gtk ? Fx.lb(12px, self.text, 0px) : self.preferred-height; vertical-alignment: center; text: "Lancat " + root.me-ver + " · " + root.me-os + " · 局域网零配置快传"; font-size: 12px; color: Theme.text; wrap: word-wrap; }
                 }
                 FlowNote {
                     toks: root.about-toks;

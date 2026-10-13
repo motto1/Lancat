@@ -15,6 +15,8 @@ mod diag;
 mod dock;
 #[cfg(target_os = "linux")]
 mod dock_wl;
+#[cfg(target_os = "linux")]
+mod toast_wl;
 // Linux 的停靠（Wayland layer-shell）与 Windows 版 dock 同一套对外接口
 #[cfg(target_os = "linux")]
 use dock_wl as dock;
@@ -1964,11 +1966,31 @@ thread_local! {
 
 /// 平台层：指针移动 / 离开（normal = 设置这类普通窗口）
 pub(crate) fn note_pointer(normal: bool, x: f32, y: f32, inside: bool) {
-    POINTER.with(|p| {
+    let was = POINTER.with(|p| {
         let mut v = p.get();
+        let was = v[normal as usize].2;
         v[normal as usize] = (x, y, inside);
         p.set(v);
+        was
     });
+    // GTK：按下过带提示的元素后，指针离开窗口才重新允许 tooltip
+    if was && !inside {
+        TIP_LEAVE.with(|t| {
+            if let Some(f) = t.borrow()[normal as usize].as_ref() {
+                f();
+            }
+        });
+    }
+}
+
+thread_local! {
+    static TIP_LEAVE: RefCell<[Option<Box<dyn Fn()>>; 2]> = const { RefCell::new([None, None]) };
+}
+
+/// 指针离开窗口时要做的事（Linux：解除 GTK tooltip 的按下屏蔽）；normal = 普通窗口（设置页），否则面板
+#[allow(dead_code)]
+pub(crate) fn tip_on_leave(normal: bool, f: Box<dyn Fn()>) {
+    TIP_LEAVE.with(|t| t.borrow_mut()[normal as usize] = Some(f));
 }
 
 /// 浏览器的 title 提示：指针停在元素上 ~600 ms 才出现；元素在悬停中被重建（侧栏点选后模型刷新）时

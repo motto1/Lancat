@@ -7,6 +7,7 @@ import { Theme, Fx, Shadow, Tip, TipArea, TipBubble, Icon, IconButton, Btn, Scro
 export { Theme, Fx, Tip } from "common.slint";
 export { Icons } from "icons.slint";
 export { SettingsWindow, DiagCheck, DevItem, FlowTok } from "settings.slint";
+export { ToastWindow } from "toast.slint";
 
 export struct PeerItem {
     id: string,
@@ -334,10 +335,10 @@ component FileCard inherits Rectangle {
     border-color: m.failed ? Theme.danger.with-alpha(0.5) : Theme.sep;
     opacity: m.cancelled ? 0.6 : 1;
     lay := HorizontalLayout {
-        padding-top: 9px * root.k;
-        padding-bottom: 9px * root.k;
-        padding-left: 10px * root.k;
-        padding-right: 8px * root.k;
+        padding-top: 9px * root.k + Fx.hair-box;
+        padding-bottom: 9px * root.k + Fx.hair-box;
+        padding-left: 10px * root.k + Fx.hair-box;
+        padding-right: 8px * root.k + Fx.hair-box;
         spacing: 9px * root.k;
         VerticalLayout {
             alignment: center;
@@ -369,11 +370,13 @@ component FileCard inherits Rectangle {
             }
             HorizontalLayout {
                 spacing: 0px;
-                Text { text: root.m.fmeta; font-size: 10.5px * root.k; color: Theme.text-2; height: Fx.lb(10.5px * root.k, self.text, self.preferred-height); vertical-alignment: center; }
+                // 一个行框：fmeta 和状态文字在同一行内，行高由含中文的整行决定
+                property <length> mh: Fx.lb(10.5px * root.k, root.m.fmeta + root.m.fst, fmt.preferred-height);
+                fmt := Text { text: root.m.fmeta; font-size: 10.5px * root.k; color: Theme.text-2; height: parent.mh; vertical-alignment: center; }
                 Rectangle {
                     horizontal-stretch: 1;
-                    height: fst.preferred-height;
-                    fst := Text { width: parent.width; text: root.m.fst; font-size: 10.5px * root.k; color: root.m.failed ? Theme.danger : Theme.text-2; overflow: elide; }
+                    height: parent.mh;
+                    fst := Text { width: parent.width; height: parent.height; vertical-alignment: center; text: root.m.fst; font-size: 10.5px * root.k; color: root.m.failed ? Theme.danger : Theme.text-2; overflow: elide; }
                     TipArea { tip: root.m.failed ? root.m.err : ""; }
                 }
             }
@@ -466,8 +469,11 @@ component MessageRow inherits Rectangle {
     // 按行数换算成 1.38 的总高度，文字在里面居中（单行与旧版逐像素一致，多行每行差 ≤1px）
     in property <length> l1: 18px;
     in property <length> l2: 35px;
-    property <int> lines: max(1, round((txt.preferred-height / root.k - root.l1) / max(1px, root.l2 - root.l1)) + 1);
-    property <length> text-h: root.lines * 13px * 1.38;
+    // 行高 = Fx.lh(13px, 1.38)（Windows 17.94，Linux WebKitGTK 截断成 17），用 line-height-factor 把 Slint 的自然行高换算过去
+    property <length> lhv: Fx.lh(13px, 1.38);
+    property <float> lhf: root.lhv / max(1px, root.l1);
+    property <int> lines: max(1, round(txt.preferred-height / root.k / root.lhv));
+    property <length> text-h: root.lines * root.lhv;
     property <length> nat-h: m.kind == "sticker" ? 160px : (m.kind == "file" ? fc.h : root.text-h + 12px);
     height: top + nat-h;
     // 缩放中心 = 行（不含时间分隔）中心
@@ -490,8 +496,8 @@ component MessageRow inherits Rectangle {
         }
     }
     if m.sep != "": Text {
-        // 行框 12.67 居中，再上提 2：与旧版同一基线（1.5x 实测）
-        y: 8px;
+        // 行框 12.67 居中，再上提 2：与旧版同一基线（1.5x 实测）；Linux（WebKitGTK 1x 实测）基线低 1.5
+        y: 8px + (Fx.hair-box > 0 ? 1.5px : 0px);
         width: parent.width;
         height: root.sep-lh;
         text: root.m.sep;
@@ -532,6 +538,7 @@ component MessageRow inherits Rectangle {
             font-size: 13px * root.k;
             color: root.m.outgoing ? Theme.accent-contrast : Theme.text;
             selection-foreground-color: root.m.outgoing ? Theme.accent-contrast : Theme.text;
+            line-height-factor: root.lhf;
         }
     }
     if m.kind == "sticker": Rectangle {
@@ -919,7 +926,7 @@ export component PanelWindow inherits Window {
     width: 360px + 2 * frame;
     height: 520px + 2 * frame;
     default-font-size: 13px;
-    default-font-family: "Segoe UI Variable Text";
+    default-font-family: Fx.font;
 
     in property <[PeerItem]> peers;
     in property <[MsgItem]> messages;
@@ -1009,7 +1016,8 @@ export component PanelWindow inherits Window {
     // ---------------- 合成层（src/compose.rs）：窗口逻辑坐标，按合成顺序 ----------------
     // Linux：外壳边框占布局（shell-bw），弹层按内容区（外壳的 padding box）定位
     property <length> ep-x: root.shell-bw + 66px + 6px;
-    property <length> ep-y: 520px - root.shell-bw - composer-h - 6px - 288px;
+    // bottom: calc(100% + 6px) 相对输入栏的 padding box（不含 0.5px 上边框；Linux 上它占 1 设备像素）
+    property <length> ep-y: 520px - root.shell-bw - composer-h + root.composer-bt - 6px - 288px;
     property <length> ep-w: 360px - 2 * root.shell-bw - 66px - 12px;
     property <length> am-x: root.shell-bw + 66px + 6px + 30px + 2px;
     // 菜单条目：padding 6 + 12.5px 中文行框（Windows 量得 16.67；Linux 按 Noto CJK 算）
@@ -1021,6 +1029,12 @@ export component PanelWindow inherits Window {
     property <length> mn-x: min(menu-x - (root.frame > 0 ? 0px : frame), 220px) + root.shell-bw;
     property <length> mn-y: min(menu-y - (root.frame > 0 ? 0px : frame), 420px) + root.shell-bw;
     property <length> mn-h: 5px * 2 + root.mi-h * 3;
+    // 指针在弹层（表情面板 / 附件菜单 / 右键菜单）上：弹层不是滚动区的后代，滚动区不算 :hover（旧版滚动条不亮）
+    pure function over-popover(ax: length, ay: length) -> bool {
+        (root.emoji-open && ax >= frame + ep-x && ax < frame + ep-x + ep-w && ay >= frame + ep-y && ay < frame + ep-y + 288px)
+        || (root.attach-open && ax >= frame + am-x && ax < frame + am-x + 120px && ay >= frame + am-y && ay < frame + am-y + am-h)
+        || (root.menu-peer != "" && ax >= frame + mn-x && ax < frame + mn-x + 150px && ay >= frame + mn-y && ay < frame + mn-y + mn-h)
+    }
     property <length> toast-w: min(toast-t.preferred-width + 24px, 360px * 0.8);
     property <length> toast-h: Fx.lb(12px, root.toast, toast-t.preferred-height) + 14px;
     // .glass 弹层（表情面板 / 附件菜单 / 右键菜单）：无原生材质时 backdrop-filter: blur(30px) saturate(180%)；
@@ -1102,8 +1116,9 @@ export component PanelWindow inherits Window {
                             alignment: center;
                             horizontal-stretch: 1;
                             // 实测旧版（1.5x）：标题高 1、状态行高 2 物理像素 → 行距 -0.67、整体上移 0.67
-                            spacing: -0.67px;
-                            padding-bottom: 2px;
+                            // Linux（WebKitGTK，1x）：不做这处校正，只让出底边框的 1 设备像素
+                            spacing: Fx.hair-box > 0 ? 0px : -0.67px;
+                            padding-bottom: Fx.hair-box > 0 ? 1px : 2px;
                             Text { text: root.header-title; font-size: 13px; font-weight: 600; letter-spacing: -0.13px; color: Theme.text; overflow: elide; height: Fx.lb(13px, self.text, self.preferred-height); vertical-alignment: center; }
                             Text { text: root.subtitle; font-size: 11px; color: root.subtitle-accent ? Theme.accent : Theme.text-2; overflow: elide; height: Fx.lb(11px, self.text, self.preferred-height); vertical-alignment: center; }
                         }
@@ -1420,7 +1435,7 @@ export component PanelWindow inherits Window {
                                     view-h: list.height;
                                     content-h: list.content-height;
                                     pos <=> list.content-y;
-                                    hovered: lha.has-hover || self.hov;
+                                    hovered: (lha.has-hover && !root.over-popover(lha.absolute-position.x + lha.mouse-x, lha.absolute-position.y + lha.mouse-y)) || self.hov;
                                 }
                             }
                             // ---- composer ----
@@ -1467,7 +1482,7 @@ export component PanelWindow inherits Window {
                                     fieldbox := Rectangle {
                                         horizontal-stretch: 1;
                                         // field-sizing: content，max-height 96 后内部滚动
-                                        height: min(96px, max(30px, input.preferred-height + 12px + 1px));
+                                        height: min(96px, max(30px, input.preferred-height + 12px + (Fx.hair-box > 0 ? 2 * Fx.hair-box : 1px)));
                                         border-radius: 15px;
                                         background: Theme.field;
                                         border-width: 1phx;
@@ -1498,8 +1513,11 @@ export component PanelWindow inherits Window {
                                                 content-width: self.width;
                                                 content-height: max(self.height, input.preferred-height + 12px);
                                                 input := TextInput {
-                                                    x: 11px;
-                                                    y: 6px;
+                                                    // 0.5px 边框在 Linux 上占 1 设备像素（WebKitGTK），文字跟着内移
+                                                    x: 11px + Fx.hair-box;
+                                                    y: 6px + Fx.hair-box;
+                                                    // line-height: 17px
+                                                    line-height-factor: 17px / max(1px, lh1.preferred-height);
                                                     width: ifl.width - 22px - (isb.shown ? 6px : 0px);
                                                     height: max(self.preferred-height, ifl.height - 12px);
                                                     single-line: false;
@@ -1533,8 +1551,10 @@ export component PanelWindow inherits Window {
                                             hovered: input.has-focus;
                                         }
                                         if root.draft == "": Text {
-                                            x: 11px;
-                                            y: 6px;
+                                            x: 11px + Fx.hair-box;
+                                            y: 6px + Fx.hair-box;
+                                            height: 17px;
+                                            vertical-alignment: center;
                                             text: root.placeholder;
                                             color: Theme.text-3;
                                             font-size: 13px;

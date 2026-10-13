@@ -111,6 +111,28 @@ pub enum Cmd {
     Top(usize, bool),
     /// 客户端自绘标题栏上的操作，作用在最近一次被按下的普通窗口上
     TopAct(TopAct),
+    /// 消息 toast 的 layer surface（src/toast_wl.rs）：Some = 显示 / 移动，None = 销毁
+    Toast(Option<ToastPlace>),
+}
+
+/// toast 的 layer surface：贴输出左上角、按 margin 定位（与旧版 linux_toast 的 set_layer_shell_margin 相同），
+/// 逻辑 px；`input` 是只接收指针的卡片矩形（surface 内坐标），阴影外沿不挡点击。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToastPlace {
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+    pub output: usize,
+    pub input: (i32, i32, i32, i32),
+}
+
+/// toast 上的指针事件（交给 src/toast_wl.rs）
+#[derive(Clone, Copy, Debug)]
+pub enum ToastPointer {
+    Enter,
+    Leave,
+    LeftRelease,
 }
 
 /// 自绘标题栏（compositor 要求客户端装饰时，旧版 GTK 窗口画的那条标题栏）的操作
@@ -129,6 +151,9 @@ thread_local! {
     static ACTIVE: Cell<bool> = const { Cell::new(false) };
     /// 第一个窗口（面板）已经创建：之后的都是普通窗口
     static PANEL_MADE: Cell<bool> = const { Cell::new(false) };
+    /// 下一个创建的 Slint 窗口是 toast（mark_next_toast）
+    static NEXT_TOAST: Cell<bool> = const { Cell::new(false) };
+    static TOAST_WIN: RefCell<Weak<WlWindow>> = const { RefCell::new(Weak::new()) };
     /// 事件循环运行中新建的普通窗口，下一轮并入 State.tops
     static NEW_TOPS: RefCell<Vec<Weak<WlWindow>>> = const { RefCell::new(Vec::new()) };
     /// 后台线程读完拖放数据（回到事件循环线程后放这里）：Count(n) / Drop(files)
@@ -138,6 +163,11 @@ thread_local! {
 enum DndDone {
     Count(u64, usize),
     Drop(Vec<String>),
+}
+
+/// 接下来创建的 Slint 窗口当作 toast（不是普通窗口，也不是面板）：在 `ToastWindow::new()` 之前调用。
+pub fn mark_next_toast() {
+    NEXT_TOAST.with(|t| t.set(true));
 }
 
 pub fn push(c: Cmd) {
@@ -319,6 +349,15 @@ struct TopSurf {
     buf: Vec<Bgra>,
 }
 
+struct ToastSurf {
+    layer: LayerSurface,
+    place: ToastPlace,
+    configured: bool,
+    width: u32,
+    height: u32,
+    buf: Vec<Bgra>,
+}
+
 struct TopWin {
     id: usize,
     win: Weak<WlWindow>,
@@ -365,6 +404,7 @@ struct State {
     dnd_gen: u64,
     /// 已松开、正在后台读数据的拖放
     dnd_drop: Option<(DragOffer, bool, (f32, f32))>,
+    toast: Option<ToastSurf>,
 }
 
 #[derive(Default)]
@@ -496,6 +536,7 @@ impl WlPlatform {
             pool,
             qh: qh.clone(),
             panel: None,
+            toast: None,
             strip: None,
             strip_look: StripLook { edge: "right".into(), unread: false, open: false, hovering: false, accent: (10.0 / 255.0, 132.0 / 255.0, 1.0), phase: 0.0 },
             pointer: None,
@@ -543,9 +584,10 @@ impl WlPlatform {
 
 impl slint::platform::Platform for WlPlatform {
     fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
-        // 第一个窗口 = 面板（layer surface）；之后的 = 普通窗口（xdg toplevel，设置页）
-        let top = PANEL_MADE.with(|p| p.replace(true));
-        let (w0, h0) = if top { (480, 620) } else { (W, H) };
+        // 第一个窗口 = 面板（layer surface）；之后的 = 普通窗口（xdg toplevel，设置页）；mark_next_toast 之后的 = toast
+        let toast = NEXT_TOAST.with(|t| t.replace(false));
+        let top = !toast && PANEL_MADE.with(|p| p.replace(true));
+        let (w0, h0) = if toast { (300, 80) } else if top { (480, 620) } else { (W, H) };
         let w = Rc::<WlWindow>::new_cyclic(|weak: &Weak<WlWindow>| WlWindow {
             window: slint::Window::new(weak.clone() as Weak<dyn WindowAdapter>),
             renderer: SoftwareRenderer::new_with_repaint_buffer_type(RepaintBufferType::NewBuffer),
@@ -563,7 +605,9 @@ impl slint::platform::Platform for WlPlatform {
         });
         w.id.set(Rc::as_ptr(&w) as *const u8 as usize);
         w.window.dispatch_event(WindowEvent::Resized { size: slint::LogicalSize::new(w0 as f32, h0 as f32) });
-        if top {
+        if toast {
+            TOAST_WIN.with(|t| *t.borrow_mut() = Rc::downgrade(&w));
+        } else if top {
             NEW_TOPS.with(|t| t.borrow_mut().push(Rc::downgrade(&w)));
         } else if let Some(s) = self.state.borrow_mut().as_mut() {
             s.win = Rc::downgrade(&w);
@@ -591,6 +635,7 @@ impl slint::platform::Platform for WlPlatform {
             for c in cmds {
                 state.apply(c);
             }
+            pump_wheel();
             slint::platform::update_timers_and_animations();
             state.sync_ime();
             let fading = state.panel.as_ref().is_some_and(|p| p.configured && p.anim.is_some()) || crate::compose::animating();
@@ -605,14 +650,17 @@ impl slint::platform::Platform for WlPlatform {
                 state.draw_strip();
             }
             state.draw_tops();
+            state.draw_toast();
             for d in DND_DONE.with(|q| std::mem::take(&mut *q.borrow_mut())) {
                 state.dnd_done(d);
             }
             queue.dispatch_pending(&mut state).map_err(|e| e.to_string())?;
             queue.flush().map_err(|e| e.to_string())?;
             let anim = fading
+                || wheel_busy()
                 || state.win.upgrade().is_some_and(|w| w.window.has_active_animations() && state.panel.is_some())
-                || state.tops.iter().any(|t| t.surf.as_ref().is_some_and(|s| s.configured) && t.win.upgrade().is_some_and(|w| w.window.has_active_animations()));
+                || state.tops.iter().any(|t| t.surf.as_ref().is_some_and(|s| s.configured) && t.win.upgrade().is_some_and(|w| w.window.has_active_animations()))
+                || state.toast.as_ref().is_some_and(|t| t.configured) && TOAST_WIN.with(|t| t.borrow().upgrade()).is_some_and(|w| w.window.has_active_animations());
             let pending_cmds = CMDS.with(|q| !q.borrow().is_empty());
             let timeout = slint::platform::duration_until_next_timer_update().map(|d| d.min(Duration::from_secs(1)));
             let ms: i32 = if pending_cmds {
@@ -671,6 +719,77 @@ fn pollfd(fd: i32) -> PollFd {
 }
 extern "C" {
     fn poll(fds: *mut PollFd, n: u64, timeout: i32) -> i32;
+}
+
+// ------------------------------------------------------------------ wheel (WebKitGTK 的滚动步长与平滑滚动)
+
+/// 面板消息列表的可视高（逻辑 px），滚轮步长按它算
+const PANEL_VIEW_H: f32 = 424.0;
+/// WebKit ScrollAnimationSmooth 的时长（按旧版录屏量的近似）
+const SMOOTH_MS: f32 = 150.0;
+
+struct Smooth {
+    win: Weak<WlWindow>,
+    pos: LogicalPosition,
+    total: (f32, f32),
+    sent: (f32, f32),
+    t0: Instant,
+}
+
+thread_local! {
+    static SMOOTH: RefCell<Vec<Smooth>> = const { RefCell::new(Vec::new()) };
+}
+
+/// 滚轮：旧版 WebKitGTK —— GDK 平滑滚动的 delta（libinput 一格 15 → 1.5）× Scrollbar::pixelsPerLineStep(可视高) =
+/// 可视高^(2/3)（GTK / WPE 分支），再由平滑滚动动画分几帧走完（实测设置页 971 高时一格 147 px）。
+fn wheel(w: &Rc<WlWindow>, position: LogicalPosition, ha: f64, hd: i32, va: f64, vd: i32, view_h: f32) {
+    let unit = |abs: f64, disc: i32| -> f32 { if abs != 0.0 { abs as f32 / 10.0 } else { disc as f32 * 1.5 } };
+    let step = view_h.max(1.0).powf(2.0 / 3.0);
+    let (dx, dy) = (-unit(ha, hd) * step, -unit(va, vd) * step);
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+    SMOOTH.with(|q| {
+        let mut q = q.borrow_mut();
+        // 同一窗口上一段还没走完：剩下的并进来，从现在重新计时（WebKit 也是把新增量叠加到目标上）
+        if let Some(s) = q.iter_mut().find(|s| s.win.ptr_eq(&Rc::downgrade(w))) {
+            s.total = (s.total.0 - s.sent.0 + dx, s.total.1 - s.sent.1 + dy);
+            s.sent = (0.0, 0.0);
+            s.t0 = Instant::now();
+            s.pos = position;
+        } else {
+            q.push(Smooth { win: Rc::downgrade(w), pos: position, total: (dx, dy), sent: (0.0, 0.0), t0: Instant::now() });
+        }
+    });
+    pump_wheel();
+}
+
+fn pump_wheel() {
+    let jobs: Vec<(Rc<WlWindow>, LogicalPosition, f32, f32)> = SMOOTH.with(|q| {
+        let mut q = q.borrow_mut();
+        let mut out = Vec::new();
+        q.retain_mut(|s| {
+            let Some(w) = s.win.upgrade() else { return false };
+            let k = (s.t0.elapsed().as_secs_f32() * 1000.0 / SMOOTH_MS).min(1.0);
+            // ease-out（三次）
+            let e = 1.0 - (1.0 - k).powi(3);
+            let want = (s.total.0 * e, s.total.1 * e);
+            let d = (want.0 - s.sent.0, want.1 - s.sent.1);
+            s.sent = want;
+            if d.0 != 0.0 || d.1 != 0.0 {
+                out.push((w, s.pos, d.0, d.1));
+            }
+            k < 1.0
+        });
+        out
+    });
+    for (w, position, dx, dy) in jobs {
+        w.window.dispatch_event(WindowEvent::PointerScrolled { position, delta_x: dx, delta_y: dy });
+    }
+}
+
+fn wheel_busy() -> bool {
+    SMOOTH.with(|q| !q.borrow().is_empty())
 }
 
 fn anchor_of(edge: &str) -> Anchor {
@@ -813,6 +932,44 @@ impl State {
             Cmd::Strip(None) => {
                 self.strip = None;
             }
+            Cmd::Toast(Some(p)) => {
+                let same_output = self.toast.as_ref().is_some_and(|t| t.place.output == p.output);
+                if same_output {
+                    let (changed, input_changed) = self.toast.as_ref().map(|t| (t.place != p, t.place.input != p.input)).unwrap_or((false, false));
+                    if changed {
+                        if let Some(t) = self.toast.as_ref() {
+                            t.layer.set_margin(p.y, 0, 0, p.x);
+                            t.layer.set_size(p.w, p.h);
+                        }
+                        if input_changed {
+                            self.toast_input(&p);
+                        }
+                        if let Some(t) = self.toast.as_mut() {
+                            t.layer.commit();
+                            t.place = p;
+                        }
+                    }
+                } else {
+                    let surface = self.compositor.create_surface(&self.qh);
+                    let out = self.output(p.output);
+                    let layer = self.layer_shell.create_layer_surface(&self.qh, surface, Layer::Overlay, Some("lancat-toast"), out.as_ref());
+                    layer.set_anchor(Anchor::LEFT | Anchor::TOP);
+                    layer.set_exclusive_zone(-1);
+                    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+                    layer.set_margin(p.y, 0, 0, p.x);
+                    layer.set_size(p.w, p.h);
+                    layer.wl_surface().set_buffer_scale(self.scale);
+                    let (w, h) = (p.w, p.h);
+                    self.toast = Some(ToastSurf { layer, place: p.clone(), configured: false, width: w, height: h, buf: Vec::new() });
+                    self.toast_input(&p);
+                    if let Some(t) = self.toast.as_ref() {
+                        t.layer.commit();
+                    }
+                }
+            }
+            Cmd::Toast(None) => {
+                self.toast = None;
+            }
             Cmd::StripLook(l) => {
                 if self.strip_look != l {
                     self.strip_look = l;
@@ -886,6 +1043,42 @@ impl State {
         s.damage_buffer(0, 0, width as i32, height as i32);
         if buffer.attach_to(s).is_ok() {
             ps.layer.commit();
+        }
+    }
+
+    /// 只有卡片接收指针（旧版 input_shape_combine_region）
+    fn toast_input(&self, p: &ToastPlace) {
+        let Some(t) = self.toast.as_ref() else { return };
+        if let Ok(r) = smithay_client_toolkit::compositor::Region::new(&self.compositor) {
+            let (x, y, w, h) = p.input;
+            r.add(x, y, w.max(1), h.max(1));
+            t.layer.wl_surface().set_input_region(Some(r.wl_region()));
+        }
+    }
+
+    fn draw_toast(&mut self) {
+        let Some(w) = TOAST_WIN.with(|t| t.borrow().upgrade()) else { return };
+        let Some(ts) = self.toast.as_mut().filter(|t| t.configured) else { return };
+        if !(w.needs_redraw.get() || w.window.has_active_animations()) {
+            return;
+        }
+        let sc = self.scale.max(1) as u32;
+        let (width, height) = (ts.width * sc, ts.height * sc);
+        let n = (width * height) as usize;
+        if ts.buf.len() != n {
+            ts.buf = vec![Bgra::default(); n];
+        }
+        w.needs_redraw.set(false);
+        ts.buf.iter_mut().for_each(|p| *p = Bgra::default());
+        w.renderer.render(&mut ts.buf[..], width as usize);
+        let Ok((buffer, canvas)) = self.pool.create_buffer(width as i32, height as i32, width as i32 * 4, wl_shm::Format::Argb8888) else { return };
+        // SAFETY: Bgra is repr(C) 4 bytes
+        let bytes = unsafe { std::slice::from_raw_parts(ts.buf.as_ptr() as *const u8, n * 4) };
+        canvas[..n * 4].copy_from_slice(bytes);
+        let s = ts.layer.wl_surface();
+        s.damage_buffer(0, 0, width as i32, height as i32);
+        if buffer.attach_to(s).is_ok() {
+            ts.layer.commit();
         }
     }
 
@@ -1285,8 +1478,28 @@ impl LayerShellHandler for State {
             self.strip = None;
             crate::dock::wl_outputs_changed();
         }
+        if self.toast.as_ref().is_some_and(|t| &t.layer == l) {
+            self.toast = None;
+        }
     }
     fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, l: &LayerSurface, c: LayerSurfaceConfigure, _: u32) {
+        if let Some(ts) = self.toast.as_mut().filter(|t| &t.layer == l) {
+            if c.new_size.0 > 0 && c.new_size.1 > 0 {
+                ts.width = c.new_size.0;
+                ts.height = c.new_size.1;
+            }
+            ts.configured = true;
+            let (tw, th) = (ts.width, ts.height);
+            if let Some(w) = TOAST_WIN.with(|t| t.borrow().upgrade()) {
+                let sc = self.scale.max(1) as u32;
+                w.size.set(PhysicalSize::new(tw * sc, th * sc));
+                w.window.dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor: sc as f32 });
+                w.window.dispatch_event(WindowEvent::Resized { size: slint::LogicalSize::new(tw as f32, th as f32) });
+                w.needs_redraw.set(true);
+            }
+            self.draw_toast();
+            return;
+        }
         if let Some(st) = self.strip.as_mut().filter(|s| &s.layer == l) {
             if c.new_size.0 > 0 && c.new_size.1 > 0 {
                 st.width = c.new_size.0;
@@ -1379,6 +1592,19 @@ impl SeatHandler for State {
 impl PointerHandler for State {
     fn pointer_frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_pointer::WlPointer, events: &[PointerEvent]) {
         for e in events {
+            if self.toast.as_ref().is_some_and(|t| t.layer.wl_surface() == &e.surface) {
+                let ev = match e.kind {
+                    PointerEventKind::Enter { .. } => Some(ToastPointer::Enter),
+                    PointerEventKind::Leave { .. } => Some(ToastPointer::Leave),
+                    PointerEventKind::Release { button: 0x110, .. } => Some(ToastPointer::LeftRelease),
+                    _ => None,
+                };
+                if let Some(ev) = ev {
+                    // 在事件分发里不动 surface：下一轮再交给 toast
+                    slint::Timer::single_shot(Duration::ZERO, move || crate::toast_wl::pointer(ev));
+                }
+                continue;
+            }
             if self.strip.as_ref().is_some_and(|s| s.layer.wl_surface() == &e.surface) {
                 match e.kind {
                     PointerEventKind::Enter { .. } => crate::dock::wl_strip_pointer(true),
@@ -1430,10 +1656,8 @@ impl PointerHandler for State {
                     w.window.dispatch_event(WindowEvent::PointerReleased { position, button: button(b) })
                 }
                 PointerEventKind::Axis { horizontal, vertical, .. } => {
-                    // 离散滚轮（value120）按一格 ≈ 40 px，与 winit 后端相近
-                    let dy = if vertical.absolute != 0.0 { vertical.absolute } else { vertical.discrete as f64 * 10.0 };
-                    let dx = if horizontal.absolute != 0.0 { horizontal.absolute } else { horizontal.discrete as f64 * 10.0 };
-                    w.window.dispatch_event(WindowEvent::PointerScrolled { position, delta_x: -dx as f32 * 4.0, delta_y: -dy as f32 * 4.0 })
+                    // 面板里的滚动区（消息列表）约 424 高
+                    wheel(&w, position, horizontal.absolute, horizontal.discrete, vertical.absolute, vertical.discrete, PANEL_VIEW_H);
                 }
             }
         }
@@ -1466,9 +1690,10 @@ impl State {
             }
             PointerEventKind::Release { button: b, .. } => w.window.dispatch_event(WindowEvent::PointerReleased { position, button: button(b) }),
             PointerEventKind::Axis { horizontal, vertical, .. } => {
-                let dy = if vertical.absolute != 0.0 { vertical.absolute } else { vertical.discrete as f64 * 10.0 };
-                let dx = if horizontal.absolute != 0.0 { horizontal.absolute } else { horizontal.discrete as f64 * 10.0 };
-                w.window.dispatch_event(WindowEvent::PointerScrolled { position, delta_x: -dx as f32 * 4.0, delta_y: -dy as f32 * 4.0 })
+                // 设置页：整页滚动，可视高 = 窗口高 − 自绘标题栏
+                let sc = w.window.scale_factor().max(1.0);
+                let view = (w.size.get().height as f32 / sc - 37.0).max(100.0);
+                wheel(&w, position, horizontal.absolute, horizontal.discrete, vertical.absolute, vertical.discrete, view);
             }
         }
     }
