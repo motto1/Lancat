@@ -10,7 +10,7 @@
 use crate::PanelWindow;
 use i_slint_core::input::{InternalKeyEvent, KeyEventType};
 use i_slint_core::window::{InputMethodRequest, WindowAdapterInternal};
-use slint::platform::software_renderer::{PremultipliedRgbaColor, RepaintBufferType, SoftwareRenderer, TargetPixel};
+use slint::platform::software_renderer::{RepaintBufferType, SoftwareRenderer};
 use slint::platform::{Key, PointerEventButton, WindowAdapter, WindowEvent};
 use slint::{LogicalPosition, PhysicalSize};
 use std::cell::{Cell, RefCell};
@@ -37,31 +37,7 @@ fn env(key: &str) -> Option<String> {
 
 // ---------- pixel ----------
 
-/// 与 32 位 DIB 同布局的预乘 BGRA 像素。
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct Bgra {
-    b: u8,
-    g: u8,
-    r: u8,
-    a: u8,
-}
-
-impl TargetPixel for Bgra {
-    fn blend(&mut self, c: PremultipliedRgbaColor) {
-        let ia = (255 - c.alpha) as u16;
-        self.r = (self.r as u16 * ia / 255) as u8 + c.red;
-        self.g = (self.g as u16 * ia / 255) as u8 + c.green;
-        self.b = (self.b as u16 * ia / 255) as u8 + c.blue;
-        self.a = (self.a as u16 + c.alpha as u16 - (self.a as u16 * c.alpha as u16) / 255) as u8;
-    }
-    fn from_rgb(r: u8, g: u8, b: u8) -> Self {
-        Bgra { b, g, r, a: 255 }
-    }
-    fn background() -> Self {
-        Bgra::default()
-    }
-}
+pub use crate::compose::Bgra;
 
 // ---------- event loop ----------
 
@@ -151,7 +127,7 @@ impl slint::platform::Platform for Win32Platform {
                 }
             }
             let wait = slint::platform::duration_until_next_timer_update();
-            let anim = wins.iter().any(|w| w.window.has_active_animations());
+            let anim = wins.iter().any(|w| w.window.has_active_animations() || w.settling()) || crate::compose::animating();
             let ms = if anim { 16 } else { wait.map(|d| d.as_millis().min(u32::MAX as u128 - 1) as u32).unwrap_or(INFINITE) };
             unsafe {
                 MsgWaitForMultipleObjectsEx(None, ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
@@ -205,6 +181,11 @@ pub struct Win32Window {
     shown_once: Cell<bool>,
     alpha: Cell<u8>,
     fade_gen: Cell<u64>,
+    /// 弹出时页面的 scale(.985→1) 160 ms ease（旧版 Panel.svelte 的 Windows 分支）
+    settle: Cell<Option<std::time::Instant>>,
+    /// 变换后的帧（settle 期间 WM_PAINT 从这里拷）
+    xbuf: RefCell<Vec<Bgra>>,
+    xformed: Cell<bool>,
 }
 
 const CLASS: PCWSTR = w!("LancatSlintPanel");
@@ -226,6 +207,9 @@ impl Win32Window {
             first_paint_logged: Cell::new(false),
             alpha: Cell::new(0),
             fade_gen: Cell::new(0),
+            settle: Cell::new(None),
+            xbuf: RefCell::new(Vec::new()),
+            xformed: Cell::new(false),
             normal: NEXT_NORMAL.with(|n| n.replace(false)),
             shown_once: Cell::new(false),
         });
@@ -291,19 +275,58 @@ impl Win32Window {
         }
         self.needs_redraw.set(false);
         let t = std::time::Instant::now();
-        let region = self.renderer.render(&mut buf, w);
+        let out = if self.normal {
+            let r = self.renderer.render(&mut buf, w);
+            let (o, sz) = (r.bounding_box_origin(), r.bounding_box_size());
+            if sz.width == 0 || sz.height == 0 {
+                crate::compose::Out::Partial(None)
+            } else {
+                crate::compose::Out::Partial(Some((o.x, o.y, sz.width, sz.height)))
+            }
+        } else {
+            let o = crate::compose::render(&self.renderer, &mut buf, w, hgt, self.scale.get(), true);
+            if matches!(o, crate::compose::Out::Full) {
+                // 合成时切换 Fx.pass 引起的重绘请求不算数
+                self.needs_redraw.set(false);
+            }
+            o
+        };
         if !self.first_paint_logged.replace(true) {
             log::info!("first frame {}x{} rendered in {} ms ({} ms after start)", w, hgt, t.elapsed().as_millis(), crate::t0().elapsed().as_millis());
+        }
+        // 弹出 settle：整帧以中心缩放（页面还在 .985 → 1）
+        let mut full = full || matches!(out, crate::compose::Out::Full);
+        let was = self.xformed.replace(false);
+        if let Some(t0) = self.settle.get() {
+            let k = (t0.elapsed().as_secs_f32() * 1000.0 / 160.0).min(1.0);
+            if k < 1.0 {
+                let e = crate::fx::bezier(0.2, 0.8, 0.3, 1.0, k);
+                let sc = 0.985 + 0.015 * e;
+                let mut xb = self.xbuf.borrow_mut();
+                if xb.len() != buf.len() {
+                    *xb = vec![Bgra::default(); buf.len()];
+                }
+                crate::compose::xform_frame(&buf, &mut xb, w, hgt, sc, 0.0, 0.0, 1.0);
+                self.xformed.set(true);
+                self.needs_redraw.set(true);
+                return Some(RECT { left: 0, top: 0, right: w as i32, bottom: hgt as i32 });
+            }
+            self.settle.set(None);
+        }
+        if was {
+            full = true;
         }
         if full {
             return Some(RECT { left: 0, top: 0, right: w as i32, bottom: hgt as i32 });
         }
-        let o = region.bounding_box_origin();
-        let sz = region.bounding_box_size();
-        if sz.width == 0 || sz.height == 0 {
-            return None;
+        match out {
+            crate::compose::Out::Partial(Some((x, y, rw, rh))) => Some(RECT { left: x.max(0), top: y.max(0), right: (x + rw as i32).min(w as i32), bottom: (y + rh as i32).min(hgt as i32) }),
+            _ => None,
         }
-        Some(RECT { left: o.x.max(0), top: o.y.max(0), right: (o.x + sz.width as i32).min(w as i32), bottom: (o.y + sz.height as i32).min(hgt as i32) })
+    }
+
+    fn settling(&self) -> bool {
+        self.settle.get().is_some()
     }
 
     fn paint(&self) {
@@ -313,7 +336,9 @@ impl Win32Window {
         let late = if self.needs_redraw.get() { self.render() } else { None };
         let size = self.size.get();
         let (w, hgt) = (size.width as usize, size.height as usize);
-        let buf = self.buf.borrow();
+        let buf0 = self.buf.borrow();
+        let xb = self.xbuf.borrow();
+        let buf: &Vec<Bgra> = if self.xformed.get() && xb.len() == buf0.len() { &xb } else { &buf0 };
         unsafe {
             let mut ps = PAINTSTRUCT::default();
             let dc = BeginPaint(h, &mut ps);
@@ -425,6 +450,7 @@ impl WindowAdapter for Win32Window {
                 let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
             }
             self.needs_redraw.set(true);
+            self.settle.set(Some(std::time::Instant::now()));
             fade_to(self, 255, fade_ms(true));
         } else {
             unsafe {
@@ -573,6 +599,7 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             let s = (wp.0 & 0xffff) as f32 / 96.0;
             w.scale.set(s);
             w.window.dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor: s });
+            crate::dpr_changed();
             let r = &*(lp.0 as *const RECT);
             let _ = SetWindowPos(h, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
             LRESULT(0)
@@ -589,11 +616,14 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 let mut t = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: h, dwHoverTime: 0 };
                 let _ = TrackMouseEvent(&mut t);
             }
-            w.window.dispatch_event(WindowEvent::PointerMoved { position: w.logical(lp) });
+            let pos = w.logical(lp);
+            crate::note_pointer(w.normal, pos.x, pos.y, true);
+            w.window.dispatch_event(WindowEvent::PointerMoved { position: pos });
             LRESULT(0)
         }
         WM_MOUSELEAVE_ => {
             w.tracking.set(false);
+            crate::note_pointer(w.normal, -1000.0, -1000.0, false);
             w.window.dispatch_event(WindowEvent::PointerExited);
             LRESULT(0)
         }
@@ -604,6 +634,11 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 _ => PointerEventButton::Middle,
             };
             SetCapture(h);
+            if !w.normal {
+                // 点在弹层外：先关弹层（旧版 window click），这次点击照常分发
+                let p = w.logical(lp);
+                crate::pointer_down(p.x, p.y);
+            }
             w.window.dispatch_event(WindowEvent::PointerPressed { position: w.logical(lp), button });
             LRESULT(0)
         }
@@ -621,7 +656,8 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             let mut p = POINT { x: (lp.0 & 0xffff) as i16 as i32, y: ((lp.0 >> 16) & 0xffff) as i16 as i32 };
             let _ = ScreenToClient(h, &mut p);
             let s = w.scale.get();
-            let delta = ((wp.0 >> 16) & 0xffff) as i16 as f32 / 120.0 * 48.0;
+            // Chromium（WebView2）滚轮一格 100px
+            let delta = ((wp.0 >> 16) & 0xffff) as i16 as f32 / 120.0 * 100.0;
             w.window.dispatch_event(WindowEvent::PointerScrolled { position: LogicalPosition::new(p.x as f32 / s, p.y as f32 / s), delta_x: 0.0, delta_y: delta });
             LRESULT(0)
         }
@@ -640,6 +676,13 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             if let Some(k) = modifier_key(vk) {
                 if !repeat {
                     w.key(k.into(), down, false);
+                }
+                return LRESULT(0);
+            }
+            if vk == VK_ESCAPE && !w.normal {
+                // 窗口级 Esc（旧版 Panel.svelte onKey + 表情面板的捕获）
+                if down && !repeat {
+                    crate::escape_key();
                 }
                 return LRESULT(0);
             }
@@ -893,6 +936,9 @@ pub fn panel_show(r: crate::dock::Rect) {
     let Some(w) = panel() else { return };
     panel_place(r);
     w.needs_redraw.set(true);
+    if w.alpha.get() == 0 {
+        w.settle.set(Some(std::time::Instant::now()));
+    }
     unsafe {
         let _ = ShowWindow(w.hwnd.get(), SW_SHOWNOACTIVATE);
     }

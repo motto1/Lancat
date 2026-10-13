@@ -143,6 +143,8 @@ fn run_checks(node: &Node, wanted_port: u16) -> Diagnostics {
     let port = node.port();
     #[cfg(windows)]
     checks.extend(windows_checks(port, wanted_port));
+    #[cfg(target_os = "linux")]
+    checks.extend(linux_checks(wanted_port));
     checks.push(port_check(port, wanted_port));
     checks.push(recv_dir_check(node));
     checks.push(runtime_check(node));
@@ -246,6 +248,13 @@ pub async fn run_fix(id: String, dry_run: bool) -> Result<FixResult, String> {
         let d = refresh().await?;
         return Ok(FixResult { ok: true, dry_run: false, cancelled: false, message: "已恢复为默认接收目录".into(), commands, script: None, diagnostics: Some(d) });
     }
+    #[cfg(not(windows))]
+    {
+        let _ = (wanted, dry);
+        Err(format!("这一项（{id}）需要手动处理，请按说明操作"))
+    }
+    #[cfg(windows)]
+    {
     let plan = tokio::task::spawn_blocking(move || windows_fix_plan(&id, wanted)).await.map_err(|e| e.to_string())??;
     if dry {
         return Ok(FixResult { ok: true, dry_run: true, cancelled: false, message: "预览：以下命令会在一次管理员授权（UAC）后执行，现在不会做任何修改".into(), commands: plan.commands, script: Some(plan.script), diagnostics: None });
@@ -269,6 +278,7 @@ pub async fn run_fix(id: String, dry_run: bool) -> Result<FixResult, String> {
     log::info!("diagnostics fix {}: ok={ok} cancelled={cancelled} {message}", plan.id);
     let d = refresh().await?;
     Ok(FixResult { ok, dry_run: false, cancelled, message, commands: plan.commands, script: None, diagnostics: Some(d) })
+    }
 }
 
 
@@ -588,6 +598,39 @@ fn windows_fix_plan(id: &str, wanted: u16) -> Result<FixPlan, String> {
         }
         _ => Err(format!("未知的修复项：{id}")),
     }
+}
+
+// ------------------------------------------------------------------ Linux（旧版 src-tauri/src/diag/mod.rs 原样移植）
+
+#[cfg(target_os = "linux")]
+fn linux_checks(port: u16) -> Vec<Check> {
+    let port = if port == 0 { lancat_core::protocol::DEFAULT_PORT } else { port };
+    let run = |cmd: &str, args: &[&str]| -> Option<(bool, String)> {
+        let o = std::process::Command::new(cmd).args(args).output().ok()?;
+        Some((o.status.success(), format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)).to_lowercase()))
+    };
+    let help = format!(
+        "ufw：sudo ufw allow {port}/tcp && sudo ufw allow {port},5353/udp\nfirewalld：sudo firewall-cmd --permanent --add-port={port}/tcp --add-port={port}/udp --add-port=5353/udp && sudo firewall-cmd --reload"
+    );
+    let mut c = match run("firewall-cmd", &["--state"]) {
+        Some((true, s)) if s.contains("running") && !s.contains("not running") => match run("firewall-cmd", &["--list-ports"]) {
+            Some((true, ports)) if ports.split_whitespace().any(|p| p == format!("{port}/tcp")) => Check::new("firewall", "防火墙", "ok", format!("firewalld 已放行 {port}/tcp")),
+            Some((true, _)) => Check::new("firewall", "防火墙", "warn", format!("firewalld 正在运行，当前区域没有放行 {port}/tcp")),
+            _ => Check::new("firewall", "防火墙", "unknown", "firewalld 正在运行，无法读取放行端口"),
+        },
+        _ => match run("ufw", &["status"]) {
+            Some((true, s)) if s.contains("inactive") => Check::new("firewall", "防火墙", "ok", "ufw 未启用"),
+            Some((true, s)) if s.contains(&format!("{port}/tcp")) || s.contains(&format!("{port} ")) => Check::new("firewall", "防火墙", "ok", format!("ufw 已放行 {port}")),
+            Some((true, _)) => Check::new("firewall", "防火墙", "warn", format!("ufw 已启用，没有放行 {port}/tcp")),
+            // ufw needs root to read its status; nftables / iptables too
+            _ => Check::new("firewall", "防火墙", "unknown", "无法读取防火墙状态（需要管理员权限）"),
+        },
+    };
+    c.help = Some(help);
+    c.inbound = true;
+    let mut n = Check::new("network", "网络类型", "unknown", "Linux 没有公用/专用网络之分");
+    n.help = Some("如果其他设备仍连不进来，检查路由器是否开启了 AP 隔离 / 访客网络".into());
+    vec![c, n]
 }
 
 // ------------------------------------------------------------------ macOS

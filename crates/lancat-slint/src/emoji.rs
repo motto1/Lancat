@@ -140,8 +140,20 @@ fn poster_key(e: &EmojiPayload, px: u32) -> String {
 
 struct Job {
     key: String,
-    json: String,
+    /// 解压 / 读文件放到后台线程做：主线程只给出取数据的办法
+    src: PosterSrc,
     px: u32,
+    /// 首帧的磁盘缓存（预乘 RGBA，px×px×4 字节）：第二次启动起表情面板一打开就是满的
+    cache: Option<PathBuf>,
+}
+
+enum PosterSrc {
+    Noto(String),
+    Json(String),
+}
+
+fn poster_cache_dir() -> PathBuf {
+    crate::data_dir().join("cache").join("posters")
 }
 
 fn spawn_worker() -> mpsc::Sender<Job> {
@@ -151,7 +163,21 @@ fn spawn_worker() -> mpsc::Sender<Job> {
         .spawn(move || {
             while let Ok(job) = rx.recv() {
                 let px = job.px;
-                let buf = Player::new(&job.json, px).map(|mut p| p.render_raw(0.0));
+                let want = (px * px * 4) as usize;
+                let mut buf = job.cache.as_ref().and_then(|p| std::fs::read(p).ok()).filter(|b| b.len() == want);
+                if buf.is_none() {
+                    let json = match job.src {
+                        PosterSrc::Noto(code) => noto_json(&code),
+                        PosterSrc::Json(j) => Some(j),
+                    };
+                    buf = json.and_then(|j| Player::new(&j, px)).map(|mut p| p.render_raw(0.0));
+                    if let (Some(b), Some(path)) = (buf.as_ref(), job.cache.as_ref()) {
+                        if let Some(dir) = path.parent() {
+                            let _ = std::fs::create_dir_all(dir);
+                        }
+                        let _ = std::fs::write(path, b);
+                    }
+                }
                 let key = job.key;
                 post(move |app| app.emoji.poster_done(key, px, buf));
             }
@@ -162,12 +188,34 @@ fn spawn_worker() -> mpsc::Sender<Job> {
 
 // ------------------------------------------------------------------ state
 
+/// 聊天贴纸（旧版 Sticker.svelte mode="chat"）：进入视口（rootMargin 40px）才播，播满 2 遍停在首帧；
+/// 悬停从头循环，离开后播完剩余到满 2 遍；离开视口暂停；同时最多 MAX_PLAYING 个（新的挤掉最早开始的）；
+/// 面板隐藏时全部暂停。状态跟着「组件」走：切会话时全部重建。
 struct ChatAnim {
     player: Player,
     frame: f32,
     loops: u32,
     hover: bool,
+    visible: bool,
+    /// 被并发上限挤掉（旧版 playing.shift().pause()）：下次 sync 才继续
+    bumped: bool,
 }
+
+impl ChatAnim {
+    fn wants(&self) -> bool {
+        self.visible && !self.bumped && (self.hover || self.loops < 2)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ChatEv {
+    Visible,
+    Hidden,
+    HoverIn,
+    HoverOut,
+}
+
+const MAX_PLAYING: usize = 6;
 
 pub struct EmojiState {
     node: Arc<Node>,
@@ -175,6 +223,9 @@ pub struct EmojiState {
     pending: HashSet<String>,
     worker: mpsc::Sender<Job>,
     chat: HashMap<String, ChatAnim>,
+    /// 正在播的聊天贴纸，按开始顺序
+    playing: Vec<String>,
+    paused: bool,
     hover: Option<(String, Player, f32)>,
     timer: slint::Timer,
     last_tick: Instant,
@@ -184,6 +235,9 @@ pub struct EmojiState {
     query: String,
     importing: bool,
     rebuild_queued: bool,
+    /// 表情网格的列数（Slint 按面板宽度算好报过来）
+    cols: usize,
+    prewarmed: bool,
 }
 
 const GRID_PX: f32 = 30.0;
@@ -196,6 +250,8 @@ impl EmojiState {
             pending: HashSet::new(),
             worker: spawn_worker(),
             chat: HashMap::new(),
+            playing: Vec::new(),
+            paused: false,
             hover: None,
             timer: slint::Timer::default(),
             last_tick: Instant::now(),
@@ -205,6 +261,8 @@ impl EmojiState {
             query: String::new(),
             importing: false,
             rebuild_queued: false,
+            cols: 7,
+            prewarmed: false,
         }
     }
 
@@ -224,9 +282,12 @@ impl EmojiState {
             return Some(i.clone());
         }
         if self.pending.insert(key.clone()) {
-            match lottie_data(&self.node, e) {
-                Some(json) => {
-                    let _ = self.worker.send(Job { key, json, px });
+            let safe = |s: &str| s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect::<String>();
+            let cache = Some(poster_cache_dir().join(format!("{}-{}-{px}.rgba", safe(&e.kind), safe(&e.code))));
+            let src = if e.kind == "noto" && e.data.is_none() { Some(PosterSrc::Noto(e.code.clone())) } else { lottie_data(&self.node, e).map(PosterSrc::Json) };
+            match src {
+                Some(src) => {
+                    let _ = self.worker.send(Job { key, src, px, cache });
                 }
                 None => {
                     self.pending.remove(&key);
@@ -234,6 +295,23 @@ impl EmojiState {
             }
         }
         None
+    }
+
+    /// 面板第一次弹出后在后台把表情面板的首帧都备好（旧版是彩色字形，打开即满；这里首帧要渲染）
+    pub fn prewarm(&mut self) {
+        if self.prewarmed {
+            return;
+        }
+        self.prewarmed = true;
+        let px = (GRID_PX * scale()) as u32;
+        let mut codes: Vec<String> = self.recent.iter().filter(|k| !k.starts_with("s:")).cloned().collect();
+        codes.extend(EMOJI.iter().map(|e| e.code.to_string()));
+        for code in codes {
+            if let Some(em) = by_code(&code) {
+                let e = EmojiPayload { kind: "noto".into(), code: em.code.into(), alt: em.ch.into(), data: None };
+                let _ = self.poster(&e, px);
+            }
+        }
     }
 
     fn poster_done(&mut self, key: String, px: u32, buf: Option<Vec<u8>>) {
@@ -264,17 +342,40 @@ impl EmojiState {
     }
 
     fn cell(&mut self, key: &str) -> Option<EmojiCell> {
-        let px = (GRID_PX * scale()) as u32;
         if let Some(id) = key.strip_prefix("s:") {
+            // 贴纸格：Sticker size 34，格高 44
+            let px = (34.0 * scale()) as u32;
             let name = self.stickers.iter().find(|s| s.id == id)?.name.clone();
             let e = EmojiPayload { kind: "sticker".into(), code: id.into(), alt: name.clone(), data: None };
             let img = self.poster(&e, px).unwrap_or_default();
-            return Some(EmojiCell { key: key.into(), img, title: format!("{name}（右键删除）").into() });
+            return Some(EmojiCell { key: key.into(), img, title: format!("{name}（右键删除）").into(), sticker: true, h: 44.0, ..Default::default() });
         }
+        let px = (GRID_PX * scale()) as u32;
         let em = by_code(key)?;
         let e = EmojiPayload { kind: "noto".into(), code: em.code.into(), alt: em.ch.into(), data: None };
         let img = self.poster(&e, px).unwrap_or_default();
-        Some(EmojiCell { key: key.into(), img, title: em.kw.split(' ').next().unwrap_or("").into() })
+        Some(EmojiCell { key: key.into(), img, title: em.kw.split(' ').next().unwrap_or("").into(), h: 38.0, ..Default::default() })
+    }
+
+    /// CSS grid auto-fill：按列数排行，行高 = 行内最高的格（贴纸 44 / 表情 38）
+    fn layout(cells: &mut [EmojiCell], cols: usize) -> f32 {
+        let cols = cols.max(1);
+        let mut y = 0.0f32;
+        for row in cells.chunks_mut(cols) {
+            let h = row.iter().map(|c| c.h).fold(0.0f32, f32::max);
+            for (j, c) in row.iter_mut().enumerate() {
+                c.col = j as i32;
+                c.top = y;
+                c.h = h;
+            }
+            y += h;
+        }
+        y
+    }
+
+    fn section(&self, id: &str, prev: &str, label: &str, mut cells: Vec<EmojiCell>, stickers: bool, note: &str) -> EmojiSection {
+        let gh = Self::layout(&mut cells, self.cols);
+        EmojiSection { id: id.into(), prev: prev.into(), label: label.into(), cells: ModelRc::new(VecModel::from(cells)), grid_h: gh, stickers, note: note.into() }
     }
 
     fn rebuild_sections(&mut self) {
@@ -285,27 +386,32 @@ impl EmojiState {
             let keys: Vec<&str> = EMOJI.iter().filter(|e| e.kw.to_lowercase().contains(&q) || e.ch == q).map(|e| e.code).collect();
             let cells: Vec<EmojiCell> = keys.iter().filter_map(|k| self.cell(k)).collect();
             let note = if cells.is_empty() { format!("没有找到「{}」", self.query.trim()) } else { String::new() };
-            secs.push(EmojiSection { id: "search".into(), label: "".into(), cells: ModelRc::new(VecModel::from(cells)), stickers: false, note: note.into() });
+            secs.push(self.section("search", "", "", cells, false, &note));
         } else {
+            let mut prev = String::new();
             for c in CATEGORIES {
                 match c.id {
                     "recent" => {
+                        // 最近使用：表情和贴纸混排（贴纸格高 44，所在行一起变高）
                         let keys: Vec<String> = self.recent.iter().take(21).cloned().collect();
                         let cells: Vec<EmojiCell> = keys.iter().filter_map(|k| self.cell(k)).collect();
                         if !cells.is_empty() {
-                            secs.push(EmojiSection { id: "recent".into(), label: "最近使用".into(), cells: ModelRc::new(VecModel::from(cells)), stickers: false, note: "".into() });
+                            secs.push(self.section("recent", &prev, "最近使用", cells, false, ""));
+                            prev = "recent".into();
                         }
                     }
                     "stickers" => {
                         let keys: Vec<String> = self.stickers.iter().map(|s| format!("s:{}", s.id)).collect();
                         let cells: Vec<EmojiCell> = keys.iter().filter_map(|k| self.cell(k)).collect();
                         let note = if cells.is_empty() { "导入 Telegram 的 .tgs 动态贴纸（或 Lottie .json），即可在这里发送。" } else { "" };
-                        secs.push(EmojiSection { id: "stickers".into(), label: "贴纸".into(), cells: ModelRc::new(VecModel::from(cells)), stickers: true, note: note.into() });
+                        secs.push(self.section("stickers", &prev, "贴纸", cells, true, note));
+                        prev = "stickers".into();
                     }
                     id => {
                         let keys: Vec<&str> = EMOJI.iter().filter(|e| e.cat == id).map(|e| e.code).collect();
                         let cells: Vec<EmojiCell> = keys.iter().filter_map(|k| self.cell(k)).collect();
-                        secs.push(EmojiSection { id: id.into(), label: c.label.into(), cells: ModelRc::new(VecModel::from(cells)), stickers: false, note: "".into() });
+                        secs.push(self.section(id, &prev, c.label, cells, false, ""));
+                        prev = id.into();
                     }
                 }
             }
@@ -327,6 +433,7 @@ impl EmojiState {
                 ui.set_emoji_query("".into());
                 ui.set_emoji_scroll(0.0);
                 ui.set_emoji_tab("recent".into());
+                self.cols = ui.get_emoji_cols().max(1) as usize;
             }
             self.rebuild_sections();
             if let Some(ui) = ui() {
@@ -334,6 +441,7 @@ impl EmojiState {
             }
         } else {
             self.hover = None;
+            crate::compose::stop(2);
             if let Some(ui) = ui() {
                 ui.set_emoji_hovered("".into());
             }
@@ -372,35 +480,66 @@ impl EmojiState {
         });
     }
 
-    pub fn play_chat(&mut self, msg_id: &str, e: &EmojiPayload, px: u32, hover: bool) {
-        if let Some(a) = self.chat.get_mut(msg_id) {
-            a.hover |= hover;
-            self.ensure_timer();
-            return;
-        }
-        let Some(json) = lottie_data(&self.node, e) else { return };
-        let Some(player) = Player::new(&json, px) else { return };
-        self.chat.insert(msg_id.to_string(), ChatAnim { player, frame: 0.0, loops: 0, hover });
-        self.ensure_timer();
-    }
-
-    pub fn unhover_chat(&mut self, msg_id: &str) {
-        if let Some(a) = self.chat.get_mut(msg_id) {
-            a.hover = false;
-            if a.loops >= 2 {
-                a.loops = 2;
+    /// 聊天贴纸事件（视口进出 / 悬停），`panel_visible` = 面板在屏上
+    pub fn chat_event(&mut self, msg_id: &str, e: &EmojiPayload, px: u32, ev: ChatEv, panel_visible: bool) {
+        if !self.chat.contains_key(msg_id) {
+            if ev == ChatEv::Hidden || ev == ChatEv::HoverOut {
+                return;
             }
+            let Some(json) = lottie_data(&self.node, e) else { return };
+            let Some(player) = Player::new(&json, px) else { return };
+            self.chat.insert(msg_id.to_string(), ChatAnim { player, frame: 0.0, loops: 0, hover: false, visible: false, bumped: false });
+        }
+        let a = self.chat.get_mut(msg_id).unwrap();
+        match ev {
+            ChatEv::Visible => a.visible = true,
+            ChatEv::Hidden => a.visible = false,
+            ChatEv::HoverIn => {
+                a.hover = true;
+                a.loops = 0;
+                // 悬停算一次「进入」：旧版 mouseenter 时 IntersectionObserver 早已报告可见
+                a.visible = true;
+            }
+            ChatEv::HoverOut => a.hover = false,
+        }
+        // sync()：要播就（重新）排进 playing，否则移出
+        a.bumped = false;
+        let wants = a.wants();
+        self.playing.retain(|x| x != msg_id);
+        if wants {
+            self.playing.push(msg_id.to_string());
+            while self.playing.len() > MAX_PLAYING {
+                let old = self.playing.remove(0);
+                if let Some(o) = self.chat.get_mut(&old) {
+                    o.bumped = true;
+                }
+            }
+            if panel_visible && !self.paused {
+                self.ensure_timer();
+            }
+        } else if ev == ChatEv::Hidden {
+            // 离开视口：pause（停在当前帧，不回首帧）
         }
     }
 
     pub fn stop_chat(&mut self) {
         self.chat.clear();
+        self.playing.clear();
     }
 
-    pub fn stop_all(&mut self) {
-        self.chat.clear();
+    /// 面板收起：全部暂停（状态保留，旧版 setLottieActive(false)）
+    pub fn pause_all(&mut self) {
+        self.paused = true;
         self.hover = None;
         self.timer.stop();
+    }
+
+    /// 面板弹出：继续 playing 里的
+    pub fn resume_all(&mut self) {
+        self.paused = false;
+        if !self.playing.is_empty() {
+            self.ensure_timer();
+        }
     }
 
     fn grid_hover(&mut self, key: &str, on: bool) {
@@ -432,23 +571,26 @@ impl crate::App {
         self.emoji.last_tick = now;
         let mut frames: Vec<(String, slint::Image)> = Vec::new();
         let mut done: Vec<String> = Vec::new();
-        for (id, a) in self.emoji.chat.iter_mut() {
+        let ids = self.emoji.playing.clone();
+        for id in ids {
+            let Some(a) = self.emoji.chat.get_mut(&id) else { continue };
+            if !a.wants() {
+                continue;
+            }
             a.frame += a.player.fps() * dt;
             if a.frame >= a.player.total {
                 a.frame = 0.0;
                 a.loops += 1;
                 if !a.hover && a.loops >= 2 {
+                    // 播满 2 遍：停在首帧（= 海报）
                     done.push(id.clone());
-                    // stop on the first frame (= the poster)
                     frames.push((id.clone(), a.player.render(0.0)));
                     continue;
                 }
             }
             frames.push((id.clone(), a.player.render(a.frame)));
         }
-        for id in done {
-            self.emoji.chat.remove(&id);
-        }
+        self.emoji.playing.retain(|x| !done.contains(x));
         for (id, img) in frames {
             self.set_sticker_frame(&id, img);
         }
@@ -462,7 +604,7 @@ impl crate::App {
                 ui.set_emoji_hover_img(img);
             }
         }
-        if self.emoji.chat.is_empty() && self.emoji.hover.is_none() {
+        if self.emoji.playing.is_empty() && self.emoji.hover.is_none() {
             self.emoji.timer.stop();
         }
     }
@@ -497,6 +639,10 @@ thread_local! {
     static UI: std::cell::RefCell<Option<slint::Weak<PanelWindow>>> = const { std::cell::RefCell::new(None) };
 }
 
+fn ui_weak_get() -> Option<PanelWindow> {
+    ui()
+}
+
 fn scale() -> f32 {
     ui().map(|u| u.window().scale_factor()).unwrap_or(1.0)
 }
@@ -510,7 +656,29 @@ fn with_app_later(f: impl FnOnce(&mut crate::App) + 'static) {
 pub fn wire(w: &PanelWindow) {
     UI.with(|u| *u.borrow_mut() = Some(w.as_weak()));
     w.on_emoji_toggled(|open| {
+        if open {
+            crate::compose::start(2);
+        }
         with_app(|app| app.emoji.opened(open));
+    });
+    w.on_emoji_cols_changed(|cols| {
+        with_app(|app| {
+            app.emoji.cols = cols.max(1) as usize;
+            if app.emoji.open {
+                app.emoji.rebuild_sections();
+            }
+        });
+    });
+    w.on_emoji_jump_to(|y| {
+        // scroller.scrollTo({ top: offsetTop - 4, behavior: "smooth" })
+        let Some(ui) = ui() else { return };
+        let from = ui.get_emoji_scroll();
+        let to = -y.max(0.0);
+        crate::smooth_scroll("emoji", from, to, move |v| {
+            if let Some(ui) = ui_weak_get() {
+                ui.set_emoji_scroll(v);
+            }
+        });
     });
     w.on_emoji_pick(|key: SharedString| {
         with_app(|app| {
@@ -546,32 +714,20 @@ pub fn wire(w: &PanelWindow) {
     });
     w.on_emoji_jump(|tab| {
         with_app(|app| {
+            let had_query = !app.emoji.query.is_empty();
             app.emoji.query.clear();
             let Some(ui) = ui() else { return };
             ui.set_emoji_query("".into());
             ui.set_emoji_tab(tab.clone());
-            app.emoji.rebuild_sections();
-            // section offsets: header 26 + rows × 38 (+ note 40)
-            let cols = ui.get_emoji_cols().max(1) as usize;
-            let mut y = 0.0f32;
-            let secs = ui.get_emoji_sections();
-            use slint::Model;
-            for i in 0..secs.row_count() {
-                let s = secs.row_data(i).unwrap();
-                if s.id == tab {
-                    break;
-                }
-                let n = s.cells.row_count();
-                y += 26.0 + (n.div_ceil(cols) as f32) * 38.0 + if s.note.is_empty() { 0.0 } else { 40.0 };
+            if had_query {
+                app.emoji.rebuild_sections();
             }
-            ui.set_emoji_scroll(-y);
         });
     });
     w.on_emoji_import(|| {
         with_app(|app| {
             app.emoji.importing = true;
             app.dialog_open_pub(true);
-            #[cfg(windows)]
             crate::filedlg::pick_filtered(&[("Lottie 贴纸 (*.tgs;*.json)", "*.tgs;*.json")], |paths| {
                 with_app(move |app| {
                     app.dialog_open_pub(false);

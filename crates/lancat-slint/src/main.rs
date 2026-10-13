@@ -9,16 +9,20 @@
 
 slint::include_modules!();
 
-#[cfg(windows)]
+mod compose;
 mod diag;
 #[cfg(windows)]
 mod dock;
 #[cfg(target_os = "linux")]
 mod dock_wl;
+// Linux 的停靠（Wayland layer-shell）与 Windows 版 dock 同一套对外接口
+#[cfg(target_os = "linux")]
+use dock_wl as dock;
 mod emoji;
 mod emoji_catalog;
-#[cfg(windows)]
 mod filedlg;
+#[macro_use]
+mod fx;
 mod icons;
 mod lottie;
 mod settings_ui;
@@ -62,6 +66,10 @@ pub(crate) struct App {
     peer_model: Rc<VecModel<PeerItem>>,
     msgs: Vec<Message>,
     has_more: bool,
+    /// 其他会话已加载的消息（含翻出来的更早历史）与 has_more：切回来不丢（旧版 app.messages 缓存）
+    cache: HashMap<String, (Vec<Message>, bool)>,
+    /// 实时到达、还没上屏的消息：上屏那一次播入场动画（旧版 takeArrival）
+    arrivals: std::collections::HashSet<String>,
     loading_older: bool,
     msg_model: Rc<VecModel<MsgItem>>,
     current: String,
@@ -285,6 +293,9 @@ fn file_item(m: &Message, it: &mut MsgItem, prog: Option<&Prog>) {
     it.fst = if speed.is_empty() { label.into() } else { speed.into() };
     it.failed = m.status == "failed";
     it.cancelled = m.status == "cancelled";
+    if it.failed {
+        it.err = err.clone().into();
+    }
     if let Some((_, hint, local)) = failure {
         it.why = hint.into();
         it.fixlink = local;
@@ -319,6 +330,9 @@ impl App {
 
     pub(crate) fn flash(&mut self, msg: impl Into<SharedString>) {
         let Some(ui) = self.ui() else { return };
+        if ui.get_toast().is_empty() {
+            compose::start(7);
+        }
         ui.set_toast(msg.into());
         let w = ui.as_weak();
         // one timer for all toasts: each flash restarts the 2.6 s
@@ -379,7 +393,6 @@ impl App {
             ui.set_online_count(self.online_peers().len() as i32);
         }
         self.update_header();
-        #[cfg(windows)]
         dock::refresh_visual();
     }
 
@@ -437,11 +450,22 @@ impl App {
     }
 
     pub(crate) fn open(&mut self, id: &str) {
+        if self.current != id {
+            self.stash_current();
+        }
         self.current = id.to_string();
         self.broadcast = false;
         self.update_header();
         self.load_messages();
         self.mark_read_if_visible();
+    }
+
+    /// 当前会话的消息放回缓存（切走时）
+    fn stash_current(&mut self) {
+        if !self.current.is_empty() {
+            let msgs = std::mem::take(&mut self.msgs);
+            self.cache.insert(self.current.clone(), (msgs, self.has_more));
+        }
     }
 
     fn mark_read_if_visible(&mut self) {
@@ -457,22 +481,37 @@ impl App {
         }
     }
 
+    /// 切到 / 重新载入当前会话：有缓存用缓存（已加载的更早历史还在），没有才读库；贴纸组件全部重建
     fn load_messages(&mut self) {
-        self.msgs = if self.current.is_empty() {
-            Vec::new()
+        if self.current.is_empty() {
+            self.msgs = Vec::new();
+            self.has_more = false;
+        } else if let Some((v, more)) = self.cache.remove(&self.current) {
+            self.msgs = v;
+            self.has_more = more;
         } else {
             let mut v = self.node.messages(&self.current, None, 80).unwrap_or_default();
             v.sort_by_key(|m| m.ts);
-            v
+            self.has_more = v.len() >= 80;
+            self.msgs = v;
+        }
+        self.emoji.stop_chat();
+        self.rebuild_messages(true);
+    }
+
+    /// 历史被清空：缓存和当前列表一起清
+    fn reload_current(&mut self) {
+        self.msgs = match self.current.is_empty() {
+            true => Vec::new(),
+            false => {
+                let mut v = self.node.messages(&self.current, None, 80).unwrap_or_default();
+                v.sort_by_key(|m| m.ts);
+                v
+            }
         };
         self.has_more = self.msgs.len() >= 80;
         self.emoji.stop_chat();
         self.rebuild_messages(true);
-        // newest stickers play twice (旧版：可见的贴纸播 2 遍)
-        let ids: Vec<String> = self.msgs.iter().rev().take(4).filter(|m| self.sticker_of(m).is_some()).map(|m| m.id.clone()).collect();
-        for id in ids {
-            self.play_sticker(&id, false);
-        }
     }
 
     pub(crate) fn sticker_of(&self, m: &Message) -> Option<EmojiPayload> {
@@ -495,6 +534,7 @@ impl App {
         let m = &self.msgs[i];
         let mut it = MsgItem { id: m.id.clone().into(), outgoing: m.outgoing, status: m.status.clone().into(), first, progress: -1.0, ..Default::default() };
         it.sep = sep.unwrap_or_default().into();
+        it.enter = self.arrivals.remove(&m.id);
         if m.kind == "file" {
             let p = self.progress.get(&m.id).copied();
             file_item(m, &mut it, p.as_ref());
@@ -573,16 +613,44 @@ impl App {
         }
     }
 
+    fn note_arrival(&mut self, id: &str) {
+        self.arrivals.insert(id.to_string());
+        if self.arrivals.len() > 200 {
+            if let Some(x) = self.arrivals.iter().next().cloned() {
+                self.arrivals.remove(&x);
+            }
+        }
+    }
+
     fn upsert_message(&mut self, m: Message, live: bool) {
         if m.peer_id != self.current {
+            // 其他会话：只有已经加载过的才并进去（没加载过的等打开时读库）
+            let new_live = live && self.cache.get(&m.peer_id).is_some_and(|(v, _)| !v.iter().any(|x| x.id == m.id));
+            if let Some((v, _)) = self.cache.get_mut(&m.peer_id) {
+                match v.iter().position(|x| x.id == m.id) {
+                    Some(i) => v[i] = m.clone(),
+                    None => {
+                        let mut j = v.len();
+                        while j > 0 && v[j - 1].ts > m.ts {
+                            j -= 1;
+                        }
+                        v.insert(j, m.clone());
+                    }
+                }
+            }
+            if new_live {
+                self.note_arrival(&m.id);
+            }
             return;
         }
         if let Some(i) = self.msgs.iter().position(|x| x.id == m.id) {
             self.msgs[i] = m;
             self.refresh_row(i);
         } else {
-            let id = m.id.clone();
             let outgoing = m.outgoing;
+            if live {
+                self.note_arrival(&m.id);
+            }
             let mut j = self.msgs.len();
             while j > 0 && self.msgs[j - 1].ts > m.ts {
                 j -= 1;
@@ -599,20 +667,17 @@ impl App {
             } else {
                 self.rebuild_messages(false);
             }
-            if live && self.sticker_of(&self.msgs[j]).is_some() {
-                self.play_sticker(&id, false);
-            }
             self.mark_read_if_visible();
         }
     }
 
-    pub(crate) fn play_sticker(&mut self, msg_id: &str, hover: bool) {
+    /// 聊天贴纸：进入/离开视口、悬停（规则见 emoji.rs）
+    pub(crate) fn sticker_event(&mut self, msg_id: &str, ev: emoji::ChatEv) {
         let Some(m) = self.msgs.iter().find(|m| m.id == msg_id) else { return };
         let Some(e) = self.sticker_of(m) else { return };
         let px = (160.0 * self.scale()) as u32;
-        if self.visible {
-            self.emoji.play_chat(msg_id, &e, px, hover);
-        }
+        let visible = self.visible;
+        self.emoji.chat_event(msg_id, &e, px, ev, visible);
     }
 
     /// 动画帧写回消息行
@@ -676,7 +741,9 @@ impl App {
             CoreEvent::PeerRemoved { peer_id } => {
                 self.peers.retain(|p| p.id != peer_id);
                 self.selected.retain(|x| *x != peer_id);
+                self.cache.remove(&peer_id);
                 if self.current == peer_id {
+                    self.msgs.clear();
                     self.current = self.peers.first().map(|p| p.id.clone()).unwrap_or_default();
                     self.load_messages();
                 }
@@ -686,14 +753,12 @@ impl App {
                 }
             }
             CoreEvent::Message { message } => {
-                #[cfg(windows)]
                 dock::on_incoming(&message);
                 if !message.outgoing {
                     self.typing.remove(&message.peer_id);
                     self.update_header();
                 }
                 self.upsert_message(message, true);
-                #[cfg(windows)]
                 dock::refresh_visual();
             }
             CoreEvent::MessageUpdate { message } => {
@@ -739,8 +804,13 @@ impl App {
                     }
                 }
                 self.rebuild_peers();
+                for (k, v) in self.cache.iter_mut() {
+                    if peer_id.as_ref().is_none_or(|id| id == k) {
+                        *v = (Vec::new(), false);
+                    }
+                }
                 if peer_id.as_ref().is_none_or(|id| *id == self.current) {
-                    self.load_messages();
+                    self.reload_current();
                 }
             }
             CoreEvent::Settings { settings } => {
@@ -749,14 +819,10 @@ impl App {
                 if let Some(sc) = self.settings.as_mut() {
                     sc.settings_changed(&settings);
                 }
-                #[cfg(windows)]
                 dock::apply_layout();
             }
             CoreEvent::Alert { kind, report, detail } => {
-                #[cfg(windows)]
                 diag::on_core_alert(&kind, report.as_ref(), &detail);
-                #[cfg(not(windows))]
-                let _ = (kind, report, detail);
             }
         }
     }
@@ -831,7 +897,6 @@ impl App {
     }
 
     fn on_typing(&mut self) {
-        #[cfg(windows)]
         dock::note_typed();
         let t = self.targets();
         if t.len() == 1 && self.last_typing_sent.is_none_or(|x| x.elapsed() > Duration::from_millis(2500)) {
@@ -912,7 +977,6 @@ impl App {
             return;
         }
         self.dialog_open = true;
-        #[cfg(windows)]
         filedlg::pick(directory, move |paths| {
             with_app(move |app| {
                 app.dialog_open = false;
@@ -925,11 +989,6 @@ impl App {
                 }
             });
         });
-        #[cfg(not(windows))]
-        {
-            let _ = (directory, targets);
-            self.dialog_open = false;
-        }
     }
 
     fn peer_menu_action(&mut self, act: &str) {
@@ -985,8 +1044,13 @@ impl App {
         }
         if v {
             self.mark_read_if_visible();
+            self.emoji.resume_all();
+            // 弹出动画之后再在后台备表情面板的首帧（只做一次；有磁盘缓存时几乎是零成本）
+            slint::Timer::single_shot(Duration::from_millis(600), || {
+                with_app(|app| app.emoji.prewarm());
+            });
         } else {
-            self.emoji.stop_all();
+            self.emoji.pause_all();
             self.stop_typing();
         }
     }
@@ -1011,6 +1075,9 @@ impl App {
                 }
                 ui.set_drop_slots(ModelRc::new(VecModel::from(slots)));
                 ui.set_drag_count(n as i32);
+                if !ui.get_dragging() {
+                    compose::start(5);
+                }
                 ui.set_dragging(true);
             }
             None => {
@@ -1021,24 +1088,34 @@ impl App {
         }
     }
 
+    /// 拖放选择器的命中测试：与 app.slint 的槽位排版同一套数（旧版 hitTest：只有槽位是 data-drop，
+    /// 选择器盖住整个外壳，槽位之外放下 = 不发送）。x、y 是窗口逻辑坐标。
     fn drop_hit(&self, x: f32, y: f32) -> String {
         let Some(ui) = self.ui() else { return String::new() };
-        let size = ui.window().size().to_logical(ui.window().scale_factor());
-        let (w, h) = (size.width, size.height);
+        let frame = ui.get_pick_x_frame();
+        let (x, y) = (x - frame, y - frame);
         let slots = ui.get_drop_slots();
         let n = slots.row_count();
-        if n > 0 {
-            let x0 = (w - n as f32 * 72.0 - (n as f32 - 1.0) * 8.0) / 2.0;
-            let y0 = h / 2.0 - 20.0;
-            if y >= y0 && y <= y0 + 100.0 && x >= x0 {
-                let i = ((x - x0) / 80.0) as usize;
-                if i < n && x - x0 - i as f32 * 80.0 <= 72.0 {
-                    return slots.row_data(i).map(|s| s.key.to_string()).unwrap_or_default();
-                }
-            }
+        if n == 0 {
+            return String::new();
         }
-        if x > 66.0 && !self.broadcast && !self.current.is_empty() {
-            return "conversation".into();
+        let cols = ui.get_pick_cols().max(1) as usize;
+        let y0 = ui.get_pick_y0();
+        let key = ui.get_drop_key();
+        let focus = (0..n).position(|i| slots.row_data(i).is_some_and(|s| s.key == key));
+        for i in 0..n {
+            let row = i / cols;
+            let j = i % cols;
+            let in_row = cols.min(n - row * cols);
+            let shift = match focus {
+                Some(f) if f != i => if i < f { -1.0 } else { 1.0 },
+                _ => 0.0,
+            };
+            let sx = (360.0 - (in_row as f32 * 84.0 + (in_row as f32 - 1.0) * 6.0)) / 2.0 + j as f32 * 90.0 + shift * 22.0;
+            let sy = y0 + row as f32 * 138.0;
+            if x >= sx && x < sx + 84.0 && y >= sy && y < sy + 132.0 {
+                return slots.row_data(i).map(|s| s.key.to_string()).unwrap_or_default();
+            }
         }
         String::new()
     }
@@ -1049,13 +1126,16 @@ impl App {
         if ui.get_drop_key() == key.as_str() {
             return;
         }
+        // 「松开发送给 <b>名</b>」：全部 → 「全部 N 台设备」
         let name = if let Some(id) = key.strip_prefix("peer:") {
             self.peer_name(id)
         } else if key == "all" {
-            "全部设备".into()
+            format!("全部 {} 台设备", self.online_peers().len())
         } else {
             String::new()
         };
+        let idx = ui.get_drop_slots().iter().position(|s| s.key == key.as_str()).map(|i| i as i32).unwrap_or(-1);
+        ui.set_drop_focus_idx(idx);
         ui.set_drop_focus_name(name.into());
         ui.set_drop_key(key.into());
     }
@@ -1089,7 +1169,6 @@ impl App {
 
 impl App {
     /// 诊断状态变化：齿轮红点 + 横幅 + 设置窗口的检查列表
-    #[cfg(windows)]
     pub(crate) fn diag_status(&mut self, st: diag::DiagStatus, last: Option<diag::Diagnostics>) {
         if let Some(ui) = self.ui() {
             ui.set_problems(st.problems as i32);
@@ -1146,8 +1225,71 @@ pub(crate) fn theme_is_dark(theme: &str) -> bool {
     }
     #[cfg(not(windows))]
     {
-        theme == "dark"
+        match theme {
+            "dark" => true,
+            "light" => false,
+            _ => match SYS_DARK.load(std::sync::atomic::Ordering::Relaxed) {
+                1 => false,
+                2 => true,
+                _ => {
+                    let d = system_dark();
+                    SYS_DARK.store(if d { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+                    d
+                }
+            },
+        }
     }
+}
+
+#[cfg(not(windows))]
+static SYS_DARK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Linux：系统外观（xdg-desktop-portal 的 org.freedesktop.appearance color-scheme，1 = 深色；
+/// 读不到再看 GNOME 的 gsettings）。WebKitGTK 的 prefers-color-scheme 跟的也是它。
+#[cfg(not(windows))]
+pub(crate) fn system_dark() -> bool {
+    use std::process::Command;
+    if let Ok(o) = Command::new("gdbus")
+        .args(["call", "--session", "--timeout", "1", "--dest", "org.freedesktop.portal.Desktop", "--object-path", "/org/freedesktop/portal/desktop", "--method", "org.freedesktop.portal.Settings.Read", "org.freedesktop.appearance", "color-scheme"])
+        .output()
+    {
+        let t = String::from_utf8_lossy(&o.stdout);
+        if o.status.success() {
+            return t.contains("uint32 1");
+        }
+    }
+    if let Ok(o) = Command::new("gsettings").args(["get", "org.gnome.desktop.interface", "color-scheme"]).output() {
+        return String::from_utf8_lossy(&o.stdout).contains("dark");
+    }
+    false
+}
+
+/// Linux：系统外观变了没有（主题为「跟随系统」时每 3 s 查一次）
+#[cfg(not(windows))]
+fn system_theme_watch() {
+    thread_local! {
+        static LAST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+        static T: slint::Timer = slint::Timer::default();
+    }
+    T.with(|t| {
+        t.start(slint::TimerMode::Repeated, Duration::from_secs(3), || {
+            let follows = with_app(|app| app.node.settings().theme == "system").unwrap_or(false);
+            if !follows {
+                return;
+            }
+            // 子进程查询放到后台线程，结果回 UI 线程
+            std::thread::spawn(|| {
+                let d = system_dark();
+                SYS_DARK.store(if d { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+                post(move |app| {
+                    if LAST.with(|l| l.replace(Some(d))) != Some(d) {
+                        let s = app.node.settings();
+                        app.apply_theme(&s);
+                    }
+                });
+            });
+        });
+    });
 }
 
 pub(crate) fn data_dir() -> std::path::PathBuf {
@@ -1212,25 +1354,27 @@ fn wire_ui(ui: &PanelWindow) {
         });
     });
     ui.on_toggle_pin(|| {
-        #[cfg(windows)]
-        {
-            let p = !dock::pinned();
-            dock::set_pinned(p);
-        }
+        let p = !dock::pinned();
+        dock::set_pinned(p);
+        with_app(move |app| {
+            if let Some(ui) = app.ui() {
+                ui.set_pinned(p);
+            }
+        });
     });
     ui.on_escape(|| {
         #[cfg(windows)]
         win::request_hide();
+        #[cfg(not(windows))]
+        dock::hide_panel();
     });
     ui.on_open_settings(|| open_settings(false));
     ui.on_open_diag(|| open_settings(true));
     ui.on_dismiss_banner(|| {
-        #[cfg(windows)]
         diag::dismiss_alert();
     });
     ui.on_header_pressed(|| {
-        // 按住标题栏拖动可以把停靠条移到别的边（旧版 dock_move_start）
-        #[cfg(windows)]
+        // 按住标题栏拖动可以把停靠条移到别的边（旧版 dock_move_start；Wayland 没有全局光标，旧版同样不动）
         dock::begin_move(false);
     });
     ui.on_peer_menu(|id, x, y| {
@@ -1241,6 +1385,7 @@ fn wire_ui(ui: &PanelWindow) {
                 ui.set_menu_y(y);
                 ui.set_menu_blocked(blocked);
                 ui.set_menu_peer(id);
+                compose::start(4);
             }
         });
     });
@@ -1292,13 +1437,17 @@ fn wire_ui(ui: &PanelWindow) {
         });
     });
     ui.on_sticker_hover(|id, h| {
-        with_app(|app| {
-            if h {
-                app.play_sticker(id.as_str(), true);
-            } else {
-                app.emoji.unhover_chat(id.as_str());
-            }
-        });
+        with_app(|app| app.sticker_event(id.as_str(), if h { emoji::ChatEv::HoverIn } else { emoji::ChatEv::HoverOut }));
+    });
+    ui.on_sticker_visible(|id, v| {
+        with_app(|app| app.sticker_event(id.as_str(), if v { emoji::ChatEv::Visible } else { emoji::ChatEv::Hidden }));
+    });
+    ui.on_attach_toggled(|open| {
+        if open {
+            compose::start(3);
+        } else {
+            compose::stop(3);
+        }
     });
     emoji::wire(ui);
 }
@@ -1318,6 +1467,9 @@ fn main() {
     // LANCAT_SLINT_WL=1 用自写的 SCTK layer-shell 后端（默认仍是 winit）
     #[cfg(target_os = "linux")]
     if env("LANCAT_SLINT_WL").as_deref() == Some("1") {
+        if dock::forward_to_running() {
+            return;
+        }
         match wl::WlPlatform::new() {
             Ok(p) => slint::platform::set_platform(Box::new(p)).expect("set platform"),
             Err(e) => log::warn!("wayland layer-shell backend unavailable ({e}); using winit"),
@@ -1340,6 +1492,16 @@ fn main() {
     log::info!("node started in {} ms", t0().elapsed().as_millis());
 
     let ui = PanelWindow::new().expect("create panel");
+    install_fx!(ui, false);
+    compose::set_panel(ui.as_weak());
+    // Linux（Wayland layer-shell）没有原生材质：外框 8px + 圆角 14 的外壳、阴影、不透明度更高的 tint
+    #[cfg(target_os = "linux")]
+    if wl::active() {
+        ui.set_frame(wl::FRAME as f32);
+        ui.global::<Theme>().set_native_glass(false);
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    ui.global::<Theme>().set_native_glass(false);
     let settings = node.settings();
     let peer_model = Rc::new(VecModel::<PeerItem>::default());
     let msg_model = Rc::new(VecModel::<MsgItem>::default());
@@ -1355,6 +1517,8 @@ fn main() {
         peer_model,
         msgs: Vec::new(),
         has_more: false,
+        cache: HashMap::new(),
+        arrivals: Default::default(),
         loading_older: false,
         msg_model,
         current: String::new(),
@@ -1367,7 +1531,7 @@ fn main() {
         typing_peer: None,
         refreshing_until: None,
         dialog_open: false,
-        visible: !cfg!(windows) || !win_dock_mode(),
+        visible: !dock_mode(),
         toast_timer: Default::default(),
         emoji: emoji::EmojiState::new(node.clone(), &settings),
         settings: None,
@@ -1388,6 +1552,13 @@ fn main() {
         }
     });
     wire_ui(&ui);
+    if !dock_mode() {
+        slint::Timer::single_shot(Duration::from_millis(1500), || {
+            with_app(|app| app.emoji.prewarm());
+        });
+    }
+    #[cfg(not(windows))]
+    system_theme_watch();
 
     // core events → UI thread
     let mut rx = node.subscribe();
@@ -1422,12 +1593,8 @@ fn main() {
 
     ui.show().expect("show");
     log::info!("panel shown {} ms after start", t0().elapsed().as_millis());
-    #[cfg(windows)]
     diag::init(node.clone(), rt.handle().clone(), wanted_port);
-    #[cfg(not(windows))]
-    let _ = wanted_port;
-    #[cfg(windows)]
-    if win::dock_mode() {
+    if dock_mode() {
         let w1 = ui.as_weak();
         dock::init(
             node.clone(),
@@ -1474,6 +1641,13 @@ fn main() {
     node.shutdown();
 }
 
+/// 测试：一步脚本（"cmd|peer|arg"），来自命令行 --script
+pub(crate) fn script_step(step: &str) {
+    let mut parts: Vec<String> = vec!["0".into()];
+    parts.extend(step.splitn(3, '|').map(String::from));
+    run_script(&parts);
+}
+
 /// 测试脚本一步：cmd = text|emoji|file（发给名为 peer 的设备）、open、emoji-panel、settings、diag、diagfix、
 /// menu（peer 的右键菜单）、attach-menu、theme（arg = light|dark|system）、hide
 fn run_script(parts: &[String]) {
@@ -1485,12 +1659,10 @@ fn run_script(parts: &[String]) {
         "settings" => return open_settings(false),
         "diag" => return open_settings(true),
         "open" => {
-            #[cfg(windows)]
             dock::open_panel("probe");
             return;
         }
         "hide" => {
-            #[cfg(windows)]
             dock::hide_panel();
             return;
         }
@@ -1535,7 +1707,44 @@ fn run_script(parts: &[String]) {
                 if let Some(ui) = app.ui() {
                     ui.set_emoji_open(true);
                 }
+                compose::start(2);
                 app.emoji_opened_pub(true);
+            }
+            "drag" => {
+                // 测试：拖放选择器（arg = 文件数）；peer 非空时把焦点放到那台设备上
+                let n: usize = arg.parse().unwrap_or(1);
+                app.drag_hint(Some(n));
+                if let Some(id) = id {
+                    let key = format!("peer:{id}");
+                    if let Some(ui) = app.ui() {
+                        let name = app.peer_name(&id);
+                        let idx = ui.get_drop_slots().iter().position(|s| s.key == key.as_str()).map(|i| i as i32).unwrap_or(-1);
+                        ui.set_drop_focus_idx(idx);
+                        ui.set_drop_focus_name(name.into());
+                        ui.set_drop_key(key.into());
+                    }
+                } else if peer == "all" {
+                    if let Some(ui) = app.ui() {
+                        let n = app.online_peers().len();
+                        ui.set_drop_focus_idx(-1);
+                        ui.set_drop_focus_name(format!("全部 {n} 台设备").into());
+                        ui.set_drop_key("all".into());
+                    }
+                }
+            }
+            "drag-end" => app.drag_hint(None),
+            "toast" => app.flash(arg),
+            "banner" => {
+                if let Some(ui) = app.ui() {
+                    ui.set_banner_title("其他设备可能连不进本机".into());
+                    ui.set_banner_detail(arg.into());
+                    ui.set_problems(1);
+                }
+            }
+            "draft" => {
+                if let Some(ui) = app.ui() {
+                    ui.set_draft(arg.replace("\\n", "\n").into());
+                }
             }
             "emoji-search" => {
                 if let Some(ui) = app.ui() {
@@ -1548,6 +1757,12 @@ fn run_script(parts: &[String]) {
                     ui.invoke_emoji_jump(arg.into());
                 }
             }
+            "attach-menu-anim" => {
+                if let Some(ui) = app.ui() {
+                    ui.set_attach_open(true);
+                }
+                compose::start(3);
+            }
             "menu" => {
                 // 脚本在 with_app 里跑：不能 invoke_peer_menu（回调里再 with_app 会借用失败，菜单不出），直接设属性
                 if let (Some(id), Some(ui)) = (id, app.ui()) {
@@ -1557,6 +1772,7 @@ fn run_script(parts: &[String]) {
                     ui.set_menu_blocked(blocked);
                     ui.set_menu_peer(id.into());
                 }
+                compose::start(4);
             }
             "attach-menu" => {
                 if let Some(ui) = app.ui() {
@@ -1578,7 +1794,6 @@ fn run_script(parts: &[String]) {
             }
             "diagfix" => {
                 // 只走 dry-run：LANCAT_FIX_DRY_RUN=1 时 run_fix 一律只返回预览命令
-                #[cfg(windows)]
                 if let Some(sc) = app.settings.as_ref() {
                     let _ = sc;
                     let fixes: Vec<String> = diag::last().map(|d| d.checks.iter().filter_map(|c| c.fix.as_ref().map(|f| f.id.clone())).collect()).unwrap_or_default();
@@ -1593,13 +1808,98 @@ fn run_script(parts: &[String]) {
     });
 }
 
-fn win_dock_mode() -> bool {
+/// 停靠模式：Windows 自写 Platform 的 dock，或 Linux Wayland layer-shell 的 dock_wl
+fn dock_mode() -> bool {
     #[cfg(windows)]
     {
         win::dock_mode()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        dock::enabled()
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         false
     }
+}
+
+thread_local! {
+    static TWEENS: RefCell<HashMap<&'static str, slint::Timer>> = RefCell::new(HashMap::new());
+}
+
+/// 每帧回调 f(t)，t 从 0 到 1（线性，按时间），持续 dur_ms；同一个 key 的新动画替换旧的
+pub(crate) fn tween(key: &'static str, dur_ms: f32, f: impl Fn(f32) + 'static) {
+    let t0 = std::time::Instant::now();
+    f(0.0);
+    let timer = slint::Timer::default();
+    timer.start(slint::TimerMode::Repeated, Duration::from_millis(15), move || {
+        let t = (t0.elapsed().as_secs_f32() * 1000.0 / dur_ms).min(1.0);
+        f(t);
+        if t >= 1.0 {
+            TWEENS.with(|m| {
+                if let Ok(m) = m.try_borrow_mut() {
+                    if let Some(t) = m.get(key) {
+                        t.stop();
+                    }
+                }
+            });
+        }
+    });
+    TWEENS.with(|m| {
+        m.borrow_mut().insert(key, timer);
+    });
+}
+
+/// 平滑滚动（Chromium 程序化 smooth scroll：ease-in-out，时长随距离增长，200–700 ms）
+pub(crate) fn smooth_scroll(key: &'static str, from: f32, to: f32, set: impl Fn(f32) + 'static) {
+    let d = (to - from).abs();
+    if d < 0.5 {
+        set(to);
+        return;
+    }
+    let dur = (150.0 + d.sqrt() * 12.0).clamp(200.0, 700.0);
+    tween(key, dur, move |t| set(from + (to - from) * fx::ease("ease-in-out", t)));
+}
+
+/// 平台层：面板上的鼠标按下（分发之前）—— 点在弹层外就关弹层，点击照常生效（旧版 window click）
+pub(crate) fn pointer_down(x: f32, y: f32) {
+    let Some(ui) = with_app(|app| app.ui()).flatten() else { return };
+    ui.invoke_pointer_down(x, y);
+}
+
+thread_local! {
+    /// 各窗口最后的指针位置（逻辑 px）与是否在窗口内：[面板, 普通窗口（设置）]
+    static POINTER: std::cell::Cell<[(f32, f32, bool); 2]> = const { std::cell::Cell::new([(0.0, 0.0, false); 2]) };
+}
+
+/// 平台层：指针移动 / 离开（normal = 设置这类普通窗口）
+pub(crate) fn note_pointer(normal: bool, x: f32, y: f32, inside: bool) {
+    POINTER.with(|p| {
+        let mut v = p.get();
+        v[normal as usize] = (x, y, inside);
+        p.set(v);
+    });
+}
+
+/// 浏览器的 title 提示：指针停在元素上 ~600 ms 才出现；元素在悬停中被重建（侧栏点选后模型刷新）时
+/// Slint 收不到它的离开事件，登记的提示就会在指针早已离开后弹出 —— 到点时核对指针还在主人元素的矩形里
+pub(crate) fn tip_valid(normal: bool, x: f32, y: f32, w: f32, h: f32) -> bool {
+    POINTER.with(|p| {
+        let (px, py, inside) = p.get()[normal as usize];
+        inside && px >= x && px < x + w && py >= y && py < y + h
+    })
+}
+
+/// 平台层：面板上的 Esc
+pub(crate) fn escape_key() {
+    let Some(ui) = with_app(|app| app.ui()).flatten() else { return };
+    ui.invoke_escape_key();
+}
+
+/// 平台层：面板换了 DPI —— 阴影/绘制图按新的缩放重画
+#[allow(dead_code)]
+pub(crate) fn dpr_changed() {
+    let Some(ui) = with_app(|app| app.ui()).flatten() else { return };
+    ui.global::<Fx>().set_dpr(ui.window().scale_factor());
 }

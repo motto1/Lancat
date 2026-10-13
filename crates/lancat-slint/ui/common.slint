@@ -1,7 +1,9 @@
-// 共用：主题 token（src/styles/global.css）、线条图标、图标按钮、设置页按钮。
+// 共用：主题 token（src/styles/global.css）、软件渲染补丁（Fx：阴影图 / 旋转路径 / 虚线 / 合成层）、
+// 线条图标、图标按钮、提示气泡、设置页按钮。
 
 export global Theme {
     in-out property <bool> dark: false;
+    // Windows（Acrylic）/ macOS 有原生材质：CSS tint 更淡；Linux 没有（main.rs 设 false）
     in-out property <bool> native-glass: true;
     in-out property <color> accent: #0a84ff;
     out property <color> accent-contrast: #ffffff;
@@ -9,9 +11,10 @@ export global Theme {
         ? (dark ? rgba(30, 30, 34, 0.38) : rgba(246, 246, 248, 0.42))
         : (dark ? rgba(36, 36, 40, 0.82) : rgba(246, 246, 248, 0.86));
     out property <color> glass-strong: dark ? rgba(44, 44, 48, 0.94) : rgba(252, 252, 253, 0.94);
-    // 弹出层/描边用的不透明版本（软件渲染下半透明叠半透明会发灰）
+    // 不透明版本：只用在「描边里套描边」这类 CSS 也是不透明观感的小地方
     out property <color> glass-strong-solid: dark ? #2c2c30 : #fcfcfd;
     out property <color> glass-border: dark ? rgba(255, 255, 255, 0.12) : rgba(0, 0, 0, 0.1);
+    out property <color> glass-highlight: dark ? rgba(255, 255, 255, 0.14) : rgba(255, 255, 255, 0.75);
     out property <color> sidebar: dark ? rgba(255, 255, 255, 0.04) : rgba(0, 0, 0, 0.035);
     out property <color> text: dark ? #f5f5f7 : #1d1d1f;
     out property <color> text-2: dark ? rgba(235, 235, 245, 0.68) : rgba(60, 60, 67, 0.72);
@@ -20,6 +23,7 @@ export global Theme {
     out property <color> bubble-in: dark ? rgba(255, 255, 255, 0.1) : rgba(0, 0, 0, 0.06);
     out property <color> hover: dark ? rgba(255, 255, 255, 0.07) : rgba(0, 0, 0, 0.05);
     out property <color> field: dark ? rgba(255, 255, 255, 0.07) : rgba(255, 255, 255, 0.7);
+    out property <color> seg-on: dark ? rgba(255, 255, 255, 0.17) : glass-strong;
     out property <color> rim-top: dark ? rgba(255, 255, 255, 0.22) : rgba(255, 255, 255, 0.85);
     out property <color> online: #30d158;
     out property <color> danger: #ff3b30;
@@ -27,6 +31,168 @@ export global Theme {
     out property <duration> dur-fast: 120ms;
     out property <duration> dur: 160ms;
     out property <duration> dur-slow: 220ms;
+    // color-mix(in srgb, a, b p%)
+    public pure function mix(a: color, b: color, p: float) -> color {
+        return a.mix(b, 1 - p);
+    }
+}
+
+/// 软件渲染器做不到的效果，由 Rust（src/fx.rs）补上。
+export global Fx {
+    in-out property <float> dpr: 1;
+    // 合成：0 = 普通单遍渲染；1 = 只画基底（活动层隐藏）；n ≥ 2 = 只画第 n 层（src/compose.rs）
+    in-out property <int> pass: 0;
+    in-out property <bool> a2;
+    in-out property <bool> a3;
+    in-out property <bool> a4;
+    in-out property <bool> a5;
+    in-out property <bool> a6;
+    in-out property <bool> a7;
+    in-out property <bool> a8;
+    in-out property <bool> a9;
+    /// box-shadow 图（只画在元素外部的外阴影 + 元素内部的 inset 阴影）；kind 见 fx.rs
+    pure callback shadow(string, length, length, length, color, bool, float) -> image;
+    pure callback shadow-margin(string) -> length;
+    /// 24×24 图标路径绕 (12,12) 旋转 deg 度（软件渲染器不支持 rotate）
+    pure callback rotate-path(string, float) -> string;
+    /// 圆角矩形虚线（CSS dashed）的路径，坐标单位 = 逻辑 px
+    pure callback dash-rect(length, length, length, float) -> string;
+    /// 自定义填充图（径向渐变高光、Windows 玻璃的 sheen/rim……）
+    pure callback paint(string, length, length, color, bool, float) -> image;
+    /// 命名缓动曲线 y(x)（cubic-bezier 精确求解）
+    pure callback ease(string, float) -> float;
+
+    public pure function base() -> bool {
+        return pass <= 1;
+    }
+    public pure function layer(id: int) -> bool {
+        return pass == 0 || pass == id || (pass == 1 && !act(id));
+    }
+    public pure function act(id: int) -> bool {
+        return (id == 2 && a2) || (id == 3 && a3) || (id == 4 && a4) || (id == 5 && a5) || (id == 6 && a6) || (id == 7 && a7) || (id == 8 && a8) || (id == 9 && a9);
+    }
+}
+
+/// 元素的 box-shadow：放进元素里当第一个子元素（外阴影在元素外、inset 在元素内，互不遮挡）
+export component Shadow inherits Image {
+    in property <string> kind;
+    in property <length> ew;
+    in property <length> eh;
+    in property <length> r;
+    in property <color> c: transparent;
+    property <length> m: Fx.shadow-margin(kind);
+    x: -m;
+    y: -m;
+    width: ew + 2 * m;
+    height: eh + 2 * m;
+    image-fit: fill;
+    source: (ew > 0 && eh > 0) ? Fx.shadow(kind, ew, eh, r, c, Theme.dark, Fx.dpr) : @image-url("");
+}
+
+/// 浏览器 title 提示（软件渲染下没有原生 tooltip）：悬停 600 ms 后出现在指针下方
+export global Tip {
+    in-out property <string> text;
+    in-out property <length> x;
+    in-out property <length> y;
+    in-out property <bool> pending;
+    in-out property <bool> shown;
+    in-out property <int> owner;
+    in-out property <int> seq;
+    /// 按下过的提示：浏览器点一下就收起 title 提示，直到指针离开那个元素才会再出现。
+    /// 点击常常让元素重建（侧栏选中 → 模型刷新），新元素的 has-hover 会再触发一次，所以按文字记。
+    in-out property <string> blocked;
+    /// 主人元素的矩形（窗口坐标）
+    in-out property <length> rx;
+    in-out property <length> ry;
+    in-out property <length> rw;
+    in-out property <length> rh;
+    /// Rust（main.rs tip_valid）：指针（平台层记录的真实位置）还在这个矩形里吗
+    callback valid(length, length, length, length) -> bool;
+}
+
+export component TipArea inherits TouchArea {
+    in property <string> tip;
+    property <int> me: 0;
+    changed has-hover => {
+        if self.has-hover && root.tip != "" {
+            Tip.seq += 1;
+            root.me = Tip.seq;
+            Tip.owner = root.me;
+            Tip.text = root.tip;
+            Tip.x = self.absolute-position.x + self.mouse-x;
+            Tip.y = self.absolute-position.y + self.mouse-y;
+            Tip.rx = self.absolute-position.x;
+            Tip.ry = self.absolute-position.y;
+            Tip.rw = self.width;
+            Tip.rh = self.height;
+            Tip.shown = false;
+            if root.tip != Tip.blocked {
+                Tip.blocked = "";
+                Tip.pending = true;
+            } else {
+                Tip.pending = false;
+            }
+        } else if Tip.owner == root.me {
+            // 真正离开（不是被重建掉）：解除按下后的屏蔽
+            Tip.pending = false;
+            Tip.shown = false;
+            Tip.blocked = "";
+        }
+    }
+    changed pressed => {
+        if self.pressed && root.tip != "" {
+            Tip.blocked = root.tip;
+        }
+        if Tip.owner == root.me {
+            Tip.pending = false;
+            Tip.shown = false;
+        }
+    }
+    // 提示出现在指针最后停下的地方（moved 只在按着时触发，悬停移动要看 mouse-x/y）
+    changed mouse-x => {
+        if Tip.owner == root.me && !Tip.shown && self.has-hover {
+            Tip.x = self.absolute-position.x + self.mouse-x;
+        }
+    }
+    changed mouse-y => {
+        if Tip.owner == root.me && !Tip.shown && self.has-hover {
+            Tip.y = self.absolute-position.y + self.mouse-y;
+        }
+    }
+}
+
+/// 提示气泡本体：放在窗口最上层
+export component TipBubble inherits Rectangle {
+    in property <length> win-w;
+    in property <length> win-h;
+    visible: Tip.shown && Tip.text != "";
+    property <length> bw: min(tt.preferred-width + 16px, win-w - 8px);
+    property <length> bh: tt.preferred-height + 8px;
+    x: max(4px, min(Tip.x, win-w - bw - 4px));
+    y: Tip.y + 20px + bh > win-h - 4px ? max(4px, Tip.y - bh - 6px) : Tip.y + 20px;
+    width: bw;
+    height: bh;
+    border-radius: 4px;
+    background: Theme.dark ? #2b2b2b : #f9f9f9;
+    border-width: 1px;
+    border-color: Theme.dark ? rgba(255, 255, 255, 0.12) : rgba(0, 0, 0, 0.12);
+    tt := Text {
+        x: 8px;
+        width: parent.width - 16px;
+        text: Tip.text;
+        font-size: 12px;
+        wrap: word-wrap;
+        color: Theme.dark ? #ffffff : #1a1a1a;
+        vertical-alignment: center;
+    }
+    Timer {
+        interval: 600ms;
+        running: Tip.pending;
+        triggered => {
+            Tip.pending = false;
+            Tip.shown = Tip.valid(Tip.rx, Tip.ry, Tip.rw, Tip.rh);
+        }
+    }
 }
 
 /// 24×24 线条图标（与旧版 Icon.svelte 相同：stroke-linecap/linejoin round，stroke 1.7）
@@ -49,32 +215,45 @@ export component Icon inherits Path {
     stroke-line-join: round;
 }
 
-/// .icon-btn：26×26 圆角 7，悬停 --hover 底 + 文字色，.on = accent
+/// .icon-btn：26×26 圆角 7；悬停 --hover 底 + 图标 text 色；:active scale(.92)；三者 120 ms ease；.on = accent
 export component IconButton inherits Rectangle {
     in property <string> d;
     in property <length> icon-size: 15px;
+    in property <float> sw: 1.7;
     in property <bool> on;
     in property <bool> enabled: true;
+    in property <string> tip;
+    in property <length> radius: 7px;
     callback clicked();
     width: 26px;
     height: 26px;
-    border-radius: 7px;
-    background: (ta.has-hover && enabled) ? Theme.hover : transparent;
     opacity: enabled ? 1 : 0.45;
-    animate background { duration: Theme.dur-fast; }
+    property <bool> hov: ta.has-hover && enabled;
+    property <float> k: (ta.pressed && enabled) ? 0.92 : 1;
+    animate k { duration: 120ms; easing: cubic-bezier(0.2, 0.8, 0.3, 1); }
+    Rectangle {
+        width: root.width * root.k;
+        height: root.height * root.k;
+        border-radius: root.radius * root.k;
+        background: root.hov ? Theme.hover : Theme.hover.transparentize(1);
+        animate background { duration: 120ms; easing: cubic-bezier(0.2, 0.8, 0.3, 1); }
+    }
     Icon {
         d: root.d;
-        size: root.icon-size;
-        color: root.on ? Theme.accent : ((ta.has-hover && root.enabled) ? Theme.text : Theme.text-2);
-        animate color { duration: Theme.dur-fast; }
+        size: root.icon-size * root.k;
+        sw: root.sw;
+        color: root.on ? Theme.accent : (root.hov ? Theme.text : Theme.text-2);
+        animate color { duration: 120ms; easing: cubic-bezier(0.2, 0.8, 0.3, 1); }
     }
-    ta := TouchArea {
+    ta := TipArea {
+        tip: root.tip;
         enabled: root.enabled;
         clicked => { root.clicked(); }
     }
 }
 
-/// 设置页 .btn（primary / danger 变体）
+/// 设置页 .btn：padding 4 11、r6、glass-strong 底 + .5px 边 + 0 .5px 1px 阴影；hover 混 7% text、active 11% + scale .97；
+/// danger：文字 danger、hover 混 10% danger；primary（诊断）：accent 底，hover 混 8% 黑；disabled .55
 export component Btn inherits Rectangle {
     in property <string> text;
     in property <bool> primary;
@@ -82,22 +261,35 @@ export component Btn inherits Rectangle {
     in property <bool> enabled: true;
     in property <string> icon;
     callback clicked();
-    height: 24px;
     width: lay.preferred-width;
-    border-radius: 6px;
-    background: primary ? (ta.pressed ? Theme.accent.darker(0.1) : (ta.has-hover ? Theme.accent.brighter(0.08) : Theme.accent))
-        : (ta.pressed ? Theme.sep : (ta.has-hover ? Theme.hover : Theme.glass-strong-solid));
-    border-width: primary ? 0px : 0.5px;
-    border-color: Theme.glass-border;
-    opacity: enabled ? 1 : 0.5;
+    height: 25px;
+    property <bool> hov: ta.has-hover && enabled;
+    property <bool> down: ta.pressed && enabled;
+    property <float> k: down ? 0.97 : 1;
+    animate k { duration: 120ms; easing: cubic-bezier(0.2, 0.8, 0.3, 1); }
+    opacity: enabled ? 1 : 0.55;
+    face := Rectangle {
+        width: root.width * root.k;
+        height: root.height * root.k;
+        border-radius: 6px;
+        background: root.primary
+            ? (root.hov ? Theme.mix(Theme.accent, #000000, 0.08) : Theme.accent)
+            : (root.down ? Theme.mix(Theme.glass-strong-solid, root.danger ? Theme.danger : Theme.text, root.danger ? 0.1 : 0.11)
+                : (root.hov ? Theme.mix(Theme.glass-strong-solid, root.danger ? Theme.danger : Theme.text, root.danger ? 0.1 : 0.07) : Theme.glass-strong));
+        animate background { duration: 120ms; easing: cubic-bezier(0.2, 0.8, 0.3, 1); }
+        border-width: root.primary ? 0px : 1phx;
+        border-color: Theme.glass-border;
+        if !root.primary: Shadow { kind: "btn"; ew: parent.width; eh: parent.height; r: 6px; }
+    }
     lay := HorizontalLayout {
-        padding-left: 10px;
-        padding-right: 10px;
-        spacing: 4px;
-        if root.icon != "": Icon { y: (parent.height - 12px) / 2; d: root.icon; size: 12px; sw: 2; color: root.primary ? Theme.accent-contrast : Theme.text; }
+        padding-left: 11px;
+        padding-right: 11px;
+        spacing: 5px;
+        alignment: center;
+        if root.icon != "": Icon { y: (parent.height - 12px) / 2; d: root.icon; size: 12px * root.k; sw: 2; color: root.primary ? Theme.accent-contrast : Theme.text; }
         Text {
             text: root.text;
-            font-size: 12px;
+            font-size: 12px * root.k;
             vertical-alignment: center;
             color: root.primary ? Theme.accent-contrast : (root.danger ? Theme.danger : Theme.text);
         }
@@ -105,5 +297,51 @@ export component Btn inherits Rectangle {
     ta := TouchArea {
         enabled: root.enabled;
         clicked => { root.clicked(); }
+    }
+}
+
+/// 经典 8px 滚动条（::-webkit-scrollbar）：拇指 4px（2px 透明边 + content-box）圆角，只在 hovered 时显示 text-3；可拖动
+export component ScrollBar inherits Rectangle {
+    in property <length> view-h;
+    in property <length> content-h;
+    in-out property <length> pos;       // Flickable 的 content-y（≤ 0）
+    in property <bool> hovered;
+    width: 8px;
+    out property <bool> hov: ta.has-hover;
+    // 溢出才有滚动条（且占 8px 宽）；布局用 shown（赋值、非绑定），避免「滚动条宽 → 内容高 → 滚动条」的绑定环
+    property <bool> raw: content-h > view-h + 0.5px;
+    out property <bool> shown;
+    changed raw => { root.shown = root.raw; }
+    init => { root.shown = root.raw; }
+    visible: shown;
+    property <length> track: root.height;
+    property <length> th: max(18px, track * view-h / max(1px, content-h));
+    property <length> range: max(0px, content-h - view-h);
+    property <length> ty: range > 0 ? (track - th) * (-pos / range) : 0px;
+    Rectangle {
+        x: 2px;
+        y: root.ty + 2px;
+        width: 4px;
+        height: root.th - 4px;
+        border-radius: 2px;
+        background: (root.hovered || ta.pressed) ? Theme.text-3 : transparent;
+    }
+    ta := TouchArea {
+        property <length> grab;
+        pointer-event(e) => {
+            if e.kind == PointerEventKind.down {
+                if self.mouse-y < root.ty || self.mouse-y > root.ty + root.th {
+                    // 点轨道：翻一页
+                    root.pos = clamp(root.pos + (self.mouse-y < root.ty ? root.view-h : -root.view-h), -root.range, 0px);
+                }
+                self.grab = self.mouse-y - root.ty;
+            }
+        }
+        moved => {
+            if self.pressed && root.track > root.th {
+                let t = clamp((self.mouse-y - self.grab) / (root.track - root.th), 0, 1);
+                root.pos = -t * root.range;
+            }
+        }
     }
 }

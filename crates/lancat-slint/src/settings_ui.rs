@@ -21,9 +21,10 @@ pub struct SettingsCtl {
     checking: bool,
 }
 
-fn fmt_hm(ts: i64) -> String {
+/// toLocaleTimeString([], { hour, minute, second: "2-digit" })
+fn fmt_hms(ts: i64) -> String {
     use chrono::{Local, TimeZone};
-    Local.timestamp_millis_opt(ts).single().map(|d| d.format("%H:%M").to_string()).unwrap_or_default()
+    Local.timestamp_millis_opt(ts).single().map(|d| d.format("%H:%M:%S").to_string()).unwrap_or_default()
 }
 
 impl SettingsCtl {
@@ -32,6 +33,7 @@ impl SettingsCtl {
         let win = crate::win::with_normal_window(SettingsWindow::new).ok()?;
         #[cfg(not(windows))]
         let win = SettingsWindow::new().ok()?;
+        install_fx!(win, true);
         let me = node.me();
         win.set_me_name(me.name.clone().into());
         win.set_me_id(me.id.clone().into());
@@ -39,7 +41,17 @@ impl SettingsCtl {
         win.set_me_ver(me.ver.clone().into());
         win.set_me_os(os_glyph(&me.os).into());
         win.set_emoji_count(crate::emoji_catalog::EMOJI.len() as i32);
-        #[cfg(windows)]
+        let n = crate::emoji_catalog::EMOJI.len();
+        flow::install(
+            &win,
+            &[
+                (&format!("内置 {n} 个动态表情来自 Google "), false),
+                ("Noto Animated Emoji", true),
+                ("，以 ", false),
+                ("CC BY 4.0", true),
+                (" 许可使用（https://creativecommons.org/licenses/by/4.0/）。", false),
+            ],
+        );
         win.set_dry_run_forced(crate::diag::dry_run_forced());
         wire(&win);
         let ctl = SettingsCtl { win, node, rt, save_timer: Default::default(), saved_timer: Default::default(), clear_timer: Default::default(), results: HashMap::new(), checking: false };
@@ -56,27 +68,31 @@ impl SettingsCtl {
         let s = self.node.settings();
         self.load(&s, true);
         self.peers_changed(peers);
-        #[cfg(windows)]
-        {
-            self.win.set_autostart(crate::dock::tray::autostart_enabled());
-            self.win.set_autostart_enabled(!crate::dock::tray::test_instance());
-            let mons: Vec<SharedString> = crate::dock::monitor_labels().into_iter().map(Into::into).collect();
-            self.win.set_monitors(ModelRc::new(VecModel::from(mons)));
-            if let Some(d) = crate::diag::last() {
-                self.diag_changed(&d);
-            }
+        self.win.set_autostart(crate::dock::tray::autostart_enabled());
+        self.win.set_autostart_enabled(!crate::dock::tray::test_instance());
+        let mons: Vec<SharedString> = crate::dock::monitor_labels().into_iter().map(Into::into).collect();
+        self.win.set_monitors(ModelRc::new(VecModel::from(mons)));
+        if let Some(d) = crate::diag::last() {
+            self.diag_changed(&d);
         }
         let _ = self.win.show();
+        self.win.global::<crate::Fx>().set_dpr(self.win.window().scale_factor());
+        // 旧版：打开设置页就检查一次（DiagSection onMount）；从「去修复」打开时滚过去再查
         self.recheck();
         if goto_diag {
             let w = self.win.as_weak();
-            slint::Timer::single_shot(Duration::from_millis(50), move || {
+            slint::Timer::single_shot(Duration::from_millis(60), move || {
                 if let Some(win) = w.upgrade() {
-                    let y = win.get_diag_y();
-                    win.set_scroll_y(-(y - 4.0));
+                    goto_diag_section(&win);
                 }
             });
         }
+    }
+
+    /// 已经开着时再次被要求跳到诊断（lancat://goto-diag）：滚过去 + 闪烁 + 重新检查
+    pub fn goto_diag(&mut self) {
+        goto_diag_section(&self.win);
+        self.recheck();
     }
 
     fn load(&self, s: &Settings, text_too: bool) {
@@ -86,12 +102,16 @@ impl SettingsCtl {
             w.set_max_file_mb(s.max_file_mb.to_string().into());
             w.set_blocked_ips(s.blocked_ips.join("\n").into());
         }
+        // 正在拖滑块 / 防抖保存还没落盘：不拿保存回来的（可能更旧的）值覆盖界面 —— 否则滑块会跳回去
+        let editing = w.get_editing() || self.save_timer.running();
+        if text_too || !editing {
+            w.set_dock_offset(s.dock_offset as f32);
+            w.set_dock_length(s.dock_length as f32);
+            w.set_hover_delay(s.hover_delay_ms as f32);
+            w.set_collapse_delay(s.collapse_delay_ms as f32);
+            w.set_keep_alive(s.panel_keep_alive_s as f32);
+        }
         w.set_dock_edge(s.dock_edge.clone().into());
-        w.set_dock_offset(s.dock_offset as f32);
-        w.set_dock_length(s.dock_length as f32);
-        w.set_hover_delay(s.hover_delay_ms as f32);
-        w.set_collapse_delay(s.collapse_delay_ms as f32);
-        w.set_keep_alive(s.panel_keep_alive_s as f32);
         w.set_dock_monitor(s.dock_monitor as i32);
         w.set_theme(s.theme.clone().into());
         w.set_recv_dir(self.node.receive_dir().display().to_string().into());
@@ -130,14 +150,18 @@ impl SettingsCtl {
         s.collapse_delay_ms = w.get_collapse_delay().round() as u64;
         s.panel_keep_alive_s = w.get_keep_alive().round() as u64;
         s.max_file_mb = w.get_max_file_mb().trim().parse().unwrap_or(0);
-        s.blocked_ips = w.get_blocked_ips().lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+        s.blocked_ips = w.get_blocked_ips().split(|c: char| c.is_whitespace() || c == ',').map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
         match self.node.set_settings(s) {
             Ok(_) => self.flash_saved(),
             Err(e) => log::warn!("save settings: {e}"),
         }
     }
 
+    /// 「已保存」1.2 s：旧版每次保存都 setTimeout(saved = false, 1200) 且不清前一个 —— 第一次的到点就收起
     fn flash_saved(&mut self) {
+        if self.saved_timer.running() {
+            return;
+        }
         self.win.set_saved_flash(true);
         let w = self.win.as_weak();
         self.saved_timer.start(slint::TimerMode::SingleShot, Duration::from_millis(1200), move || {
@@ -162,50 +186,40 @@ impl SettingsCtl {
     // ---------------- diagnostics ----------------
 
     fn recheck(&mut self) {
-        #[cfg(windows)]
-        {
-            if self.checking {
-                return;
-            }
-            self.checking = true;
-            self.win.set_checking(true);
-            self.win.set_diag_error("".into());
-            crate::diag::runtime().spawn(async move {
-                let r = crate::diag::refresh().await;
-                post(move |app| {
-                    if let Some(sc) = app.settings.as_mut() {
-                        sc.checking = false;
-                        sc.win.set_checking(false);
-                        match r {
-                            Ok(d) => sc.diag_changed(&d),
-                            Err(e) => sc.win.set_diag_error(e.into()),
-                        }
-                    }
-                });
-            });
+        if self.checking {
+            return;
         }
+        self.checking = true;
+        self.win.set_checking(true);
+        self.win.set_diag_error("".into());
+        crate::diag::runtime().spawn(async move {
+            let r = crate::diag::refresh().await;
+            post(move |app| {
+                if let Some(sc) = app.settings.as_mut() {
+                    sc.checking = false;
+                    sc.win.set_checking(false);
+                    match r {
+                        Ok(d) => sc.diag_changed(&d),
+                        Err(e) => sc.win.set_diag_error(e.into()),
+                    }
+                }
+            });
+        });
     }
 
-    #[cfg(windows)]
     pub fn diag_changed(&mut self, d: &crate::diag::Diagnostics) {
         let rows: Vec<DiagCheck> = d
             .checks
             .iter()
             .map(|c| {
-                let mut detail = c.detail.join("\n");
-                if let Some(h) = &c.help {
-                    if !detail.is_empty() {
-                        detail.push_str("\n\n");
-                    }
-                    detail.push_str(h);
-                }
                 let (result, cmds, ok, fail) = self.results.get(&c.id).cloned().unwrap_or_default();
                 DiagCheck {
                     id: c.id.clone().into(),
                     title: c.title.clone().into(),
                     status: c.status.clone().into(),
                     summary: c.summary.clone().into(),
-                    detail: detail.into(),
+                    detail: c.detail.join("\n").into(),
+                    help: c.help.clone().unwrap_or_default().into(),
                     fix_id: c.fix.as_ref().map(|f| f.id.clone()).unwrap_or_default().into(),
                     fix_label: c.fix.as_ref().map(|f| f.label.clone()).unwrap_or_default().into(),
                     fix_admin: c.fix.as_ref().is_some_and(|f| f.admin),
@@ -219,20 +233,20 @@ impl SettingsCtl {
             .collect();
         self.win.set_checks(ModelRc::new(VecModel::from(rows)));
         self.win.set_problems(d.problems as i32);
-        self.win.set_diag_time(fmt_hm(d.ts).into());
+        self.win.set_diag_time(fmt_hms(d.ts).into());
         self.win.set_dry_run_forced(d.dry_run_forced);
     }
 
-    #[cfg(windows)]
     fn run_fix(&mut self, fix_id: String, dry: bool) {
         // which check carries this fix (the result shows under it)
         let check_id = crate::diag::last().and_then(|d| d.checks.iter().find(|c| c.fix.as_ref().is_some_and(|f| f.id == fix_id)).map(|c| c.id.clone())).unwrap_or_default();
-        self.win.set_fix_busy(true);
+        self.win.set_fix_busy(format!("{fix_id}:{dry}").into());
+        self.results.remove(&check_id);
         crate::diag::runtime().spawn(async move {
             let r = crate::diag::run_fix(fix_id, dry).await;
             post(move |app| {
                 let Some(sc) = app.settings.as_mut() else { return };
-                sc.win.set_fix_busy(false);
+                sc.win.set_fix_busy("".into());
                 let entry = match &r {
                     Ok(fr) => (fr.message.clone(), if fr.dry_run { fr.commands.join("\n") } else { String::new() }, fr.ok && !fr.dry_run, !fr.ok),
                     Err(e) => (e.clone(), String::new(), false, true),
@@ -247,6 +261,28 @@ impl SettingsCtl {
     }
 }
 
+/// scrollIntoView({ behavior: "smooth", block: "start" })（scroll-margin-top 12）+ 区块闪烁 1.4 s
+fn goto_diag_section(win: &SettingsWindow) {
+    let y = win.get_diag_y();
+    let max = (win.get_content_h() - win.get_view_h()).max(0.0);
+    let to = -(y - 12.0).clamp(0.0, max);
+    let from = win.get_scroll_y();
+    let w = win.as_weak();
+    crate::smooth_scroll("settings", from, to, move |v| {
+        if let Some(win) = w.upgrade() {
+            win.set_scroll_y(v);
+        }
+    });
+    // sec-flash 1.4 s var(--ease)：0–40% 不变，之后淡出
+    let w = win.as_weak();
+    crate::tween("diag-flash", 1400.0, move |t| {
+        if let Some(win) = w.upgrade() {
+            let a = if t <= 0.4 { 1.0 } else { 1.0 - crate::fx::bezier(0.2, 0.8, 0.3, 1.0, (t - 0.4) / 0.6) };
+            win.set_diag_flash(a);
+        }
+    });
+}
+
 fn ctl(f: impl FnOnce(&mut SettingsCtl)) {
     with_app(|app| {
         if let Some(sc) = app.settings.as_mut() {
@@ -258,8 +294,8 @@ fn ctl(f: impl FnOnce(&mut SettingsCtl)) {
 fn wire(w: &SettingsWindow) {
     w.on_save(|| {
         ctl(|sc| {
-            // 防抖 300 ms（滑块拖动、打字）
-            sc.save_timer.start(slint::TimerMode::SingleShot, Duration::from_millis(300), || ctl(|sc| sc.save_now()));
+            // 防抖 250 ms（旧版 save()）
+            sc.save_timer.start(slint::TimerMode::SingleShot, Duration::from_millis(250), || ctl(|sc| sc.save_now()));
         });
     });
     w.on_save_now(|| ctl(|sc| sc.save_now()));
@@ -268,7 +304,6 @@ fn wire(w: &SettingsWindow) {
     w.on_set_theme(|t| ctl(|sc| sc.update(|s| s.theme = t.to_string())));
     w.on_reset_dir(|| ctl(|sc| sc.update(|s| s.receive_dir.clear())));
     w.on_pick_dir(|| {
-        #[cfg(windows)]
         crate::filedlg::pick_folder(|p| {
             if let Some(p) = p {
                 ctl(move |sc| sc.update(|s| s.receive_dir = p));
@@ -285,7 +320,6 @@ fn wire(w: &SettingsWindow) {
     });
     w.on_remove_manual(|a| ctl(|sc| sc.update(|s| s.manual_peers.retain(|x| x != a.as_str()))));
     w.on_toggle_autostart(|| {
-        #[cfg(windows)]
         ctl(|sc| {
             let on = !crate::dock::tray::autostart_enabled();
             crate::dock::tray::set_autostart(on);
@@ -295,9 +329,10 @@ fn wire(w: &SettingsWindow) {
     w.on_clear_all(|| {
         ctl(|sc| {
             if !sc.win.get_confirm_clear() {
+                // 旧版：4 s 内再点一次才清空
                 sc.win.set_confirm_clear(true);
                 let w = sc.win.as_weak();
-                sc.clear_timer.start(slint::TimerMode::SingleShot, Duration::from_secs(3), move || {
+                sc.clear_timer.start(slint::TimerMode::SingleShot, Duration::from_secs(4), move || {
                     if let Some(win) = w.upgrade() {
                         win.set_confirm_clear(false);
                     }
@@ -305,22 +340,180 @@ fn wire(w: &SettingsWindow) {
                 return;
             }
             sc.win.set_confirm_clear(false);
+            sc.clear_timer.stop();
             if let Err(e) = sc.node.clear_history(None) {
                 log::warn!("clear history: {e}");
             }
+            sc.flash_saved();
         });
     });
     w.on_recheck(|| ctl(|sc| sc.recheck()));
     w.on_run_fix(|id, dry| {
-        #[cfg(windows)]
         ctl(move |sc| sc.run_fix(id.to_string(), dry));
-        #[cfg(not(windows))]
-        let _ = (id, dry);
     });
 }
 
 /// 测试：在设置窗口里点这个修复（调用方保证 LANCAT_FIX_DRY_RUN=1，只出预览）
-#[cfg(windows)]
 pub fn test_fix(fix_id: String) {
     slint::Timer::single_shot(Duration::from_millis(0), move || ctl(move |sc| sc.run_fix(fix_id, false)));
+}
+
+/// 关于页的加粗段落：行内混排 + 断行（近似 UAX#14：汉字之间可断；空格后可断；URL 在「/」后接字母数字处可断；
+/// 闭合标点不放行首、开括号不放行尾）。每段的宽度由 Slint 量好报回来，宽度变化时重排。
+mod flow {
+    use crate::{FlowTok, SettingsWindow};
+    use slint::{ComponentHandle, Model, ModelRc, VecModel};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct Tok {
+        t: String,
+        bold: bool,
+        /// 这段之前可以断行
+        brk: bool,
+        space: bool,
+    }
+
+    #[derive(Default)]
+    struct Flow {
+        toks: Vec<Tok>,
+        widths: Vec<f32>,
+        width: f32,
+        model: Option<Rc<VecModel<FlowTok>>>,
+        win: Option<slint::Weak<SettingsWindow>>,
+        queued: bool,
+    }
+
+    thread_local! {
+        static FLOW: RefCell<Flow> = RefCell::new(Flow::default());
+    }
+
+    fn cjk(c: char) -> bool {
+        matches!(c as u32, 0x2E80..=0x9FFF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF)
+    }
+    fn closing(c: char) -> bool {
+        "，。、）」』：；！？】》,.;:!?)".contains(c)
+    }
+    fn opening(c: char) -> bool {
+        "（「『【《(".contains(c)
+    }
+
+    fn tokenize(segs: &[(&str, bool)]) -> Vec<Tok> {
+        let mut out: Vec<Tok> = Vec::new();
+        for (s, b) in segs {
+            let cs: Vec<char> = s.chars().collect();
+            let mut i = 0;
+            while i < cs.len() {
+                let c = cs[i];
+                if c == ' ' {
+                    out.push(Tok { t: " ".into(), bold: *b, brk: false, space: true });
+                    i += 1;
+                    continue;
+                }
+                let prev_open = out.last().and_then(|t| t.t.chars().last()).is_some_and(opening);
+                let prev_space = out.last().is_some_and(|t| t.space);
+                let prev_cjk = out.last().and_then(|t| t.t.chars().last()).is_some_and(cjk);
+                if cjk(c) {
+                    let brk = !out.is_empty() && !closing(c) && !prev_open;
+                    out.push(Tok { t: c.to_string(), bold: *b, brk, space: false });
+                    i += 1;
+                    continue;
+                }
+                // 西文：到空格 / 汉字为止；「/」后面接字母数字处切开（可断）
+                let mut j = i;
+                let mut t = String::new();
+                while j < cs.len() && cs[j] != ' ' && !cjk(cs[j]) {
+                    t.push(cs[j]);
+                    j += 1;
+                    if cs[j - 1] == '/' && j < cs.len() && cs[j].is_alphanumeric() {
+                        break;
+                    }
+                }
+                let continues = out.last().is_some_and(|p| !p.space && !p.t.chars().last().is_some_and(cjk) && !p.t.ends_with('/'));
+                let brk = !out.is_empty() && !closing(c) && !prev_open && (prev_space || prev_cjk || !continues);
+                out.push(Tok { t, bold: *b, brk, space: false });
+                i = j;
+            }
+        }
+        out
+    }
+
+    pub fn install(win: &SettingsWindow, segs: &[(&str, bool)]) {
+        let toks = tokenize(segs);
+        let model = Rc::new(VecModel::from(toks.iter().map(|t| FlowTok { t: t.t.clone().into(), bold: t.bold, x: -10000.0, y: 0.0 }).collect::<Vec<_>>()));
+        win.set_about_toks(ModelRc::from(model.clone()));
+        let n = toks.len();
+        FLOW.with(|f| {
+            *f.borrow_mut() = Flow { toks, widths: vec![-1.0; n], width: 0.0, model: Some(model), win: Some(win.as_weak()), queued: false };
+        });
+        win.on_about_measured(|i, w| {
+            FLOW.with(|f| {
+                if let Some(x) = f.borrow_mut().widths.get_mut(i as usize) {
+                    *x = w;
+                }
+            });
+            queue();
+        });
+        win.on_about_width(|w| {
+            FLOW.with(|f| f.borrow_mut().width = w);
+            queue();
+        });
+    }
+
+    fn queue() {
+        let go = FLOW.with(|f| !std::mem::replace(&mut f.borrow_mut().queued, true));
+        if go {
+            slint::Timer::single_shot(std::time::Duration::ZERO, layout);
+        }
+    }
+
+    fn layout() {
+        FLOW.with(|f| {
+            let mut f = f.borrow_mut();
+            f.queued = false;
+            if f.width <= 1.0 || f.widths.iter().any(|w| *w < 0.0) {
+                return;
+            }
+            let lh = 11.5 * 1.5;
+            let maxw = f.width;
+            let mut pos = vec![(0.0f32, 0.0f32); f.toks.len()];
+            let (mut x, mut line) = (0.0f32, 0usize);
+            let mut i = 0;
+            while i < f.toks.len() {
+                // 一个不可断的「词」：i..j（不含尾随空格），尾随空格 j..k
+                let mut j = i + 1;
+                while j < f.toks.len() && !f.toks[j].brk && !f.toks[j].space {
+                    j += 1;
+                }
+                let mut k = j;
+                while k < f.toks.len() && f.toks[k].space {
+                    k += 1;
+                }
+                let w: f32 = f.widths[i..j].iter().sum();
+                if x > 0.0 && x + w > maxw + 0.5 {
+                    line += 1;
+                    x = 0.0;
+                }
+                for (m, p) in pos.iter_mut().enumerate().take(k).skip(i) {
+                    *p = (x, line as f32 * lh);
+                    x += f.widths[m];
+                }
+                i = k;
+            }
+            if let Some(model) = f.model.as_ref() {
+                for (m, (px, py)) in pos.iter().enumerate() {
+                    if let Some(mut r) = model.row_data(m) {
+                        if r.x != *px || r.y != *py {
+                            r.x = *px;
+                            r.y = *py;
+                            model.set_row_data(m, r);
+                        }
+                    }
+                }
+            }
+            if let Some(w) = f.win.as_ref().and_then(|w| w.upgrade()) {
+                w.set_about_lines(line as i32 + 1);
+            }
+        });
+    }
 }

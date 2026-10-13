@@ -13,6 +13,12 @@
 //! dock（src/dock_wl.rs）不直接碰 Wayland 对象：它调用 `push(Cmd)`，事件循环每轮执行；
 //! Wayland 事件反过来调用 dock 的 `wl_*` 函数（只改 dock 自己的状态、再 push 命令，不会重入）。
 //!
+//! 普通窗口（设置页）：第一个 Slint 窗口是面板（layer surface），之后创建的都是独立的 xdg toplevel
+//! （服务端装饰；关闭按钮 → CloseRequested → Slint 隐藏 → 销毁 toplevel），不顶掉面板。
+//!
+//! 拖放：wl_data_device。文件拖到停靠条 → 打开面板（旧版 open_panel("drag")）；进入面板时预读一次
+//! text/uri-list 得到项数（「拖到头像上发送 N 项」），松开时再读、解析 file:// URI 交给 dock_wl。
+//!
 //! 位置：layer-shell 没有全局坐标，一律是「贴哪条边 + 沿边偏移 + 离边距离」（逻辑 px），由 dock 按
 //! 输出的逻辑尺寸算好。缩放：只支持整数缩放（wl_surface.set_buffer_scale）；分数缩放待做。
 
@@ -25,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use i_slint_core::input::{InternalKeyEvent, KeyEventType};
 use i_slint_core::window::{InputMethodRequest, WindowAdapterInternal};
-use slint::platform::software_renderer::{PremultipliedRgbaColor, RepaintBufferType, SoftwareRenderer, TargetPixel};
+use slint::platform::software_renderer::{RepaintBufferType, SoftwareRenderer};
 use slint::platform::{Key, PointerEventButton, WindowAdapter, WindowEvent};
 use slint::{LogicalPosition, PhysicalSize, SharedString};
 use smithay_client_toolkit::{
@@ -40,15 +46,24 @@ use smithay_client_toolkit::{
         pointer::{PointerEvent, PointerEventKind, PointerHandler},
         Capability, SeatHandler, SeatState,
     },
+    data_device_manager::{
+        data_device::{DataDevice, DataDeviceData, DataDeviceHandler},
+        data_offer::{DataOfferHandler, DragOffer},
+        DataDeviceManagerState,
+    },
     shell::{
         wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure},
+        xdg::{
+            window::{Window as XdgWindow, WindowConfigure, WindowDecorations, WindowHandler},
+            XdgShell,
+        },
         WaylandSurface,
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
 use wayland_client::{
     globals::{registry_queue_init, GlobalList},
-    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    protocol::{wl_data_device::WlDataDevice, wl_data_device_manager::DndAction, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
     Connection, EventQueue, QueueHandle,
 };
 use wayland_protocols::wp::text_input::zv3::client::{
@@ -58,30 +73,7 @@ use wayland_protocols::wp::text_input::zv3::client::{
 
 // ------------------------------------------------------------------ pixels
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct Bgra {
-    b: u8,
-    g: u8,
-    r: u8,
-    a: u8,
-}
-
-impl TargetPixel for Bgra {
-    fn blend(&mut self, c: PremultipliedRgbaColor) {
-        let ia = (255 - c.alpha) as u16;
-        self.r = (self.r as u16 * ia / 255) as u8 + c.red;
-        self.g = (self.g as u16 * ia / 255) as u8 + c.green;
-        self.b = (self.b as u16 * ia / 255) as u8 + c.blue;
-        self.a = (self.a as u16 + c.alpha as u16 - (self.a as u16 * c.alpha as u16) / 255) as u8;
-    }
-    fn from_rgb(r: u8, g: u8, b: u8) -> Self {
-        Bgra { b, g, r, a: 255 }
-    }
-    fn background() -> Self {
-        Bgra::default()
-    }
-}
+pub use crate::compose::Bgra;
 
 // ------------------------------------------------------------------ commands from the dock
 
@@ -115,6 +107,8 @@ pub enum Cmd {
     StripLook(StripLook),
     /// 面板主动要键盘（托盘 / toast 点击打开）：Exclusive 一下，拿到后回到 OnDemand
     PanelFocus,
+    /// 普通窗口（按 WlWindow.id）显示 / 隐藏
+    Top(usize, bool),
 }
 
 thread_local! {
@@ -122,6 +116,17 @@ thread_local! {
     /// 输出的逻辑尺寸（按 SCTK 的输出顺序），dock 算位置用
     static OUTPUTS: RefCell<Vec<(i32, i32, i32)>> = const { RefCell::new(Vec::new()) };
     static ACTIVE: Cell<bool> = const { Cell::new(false) };
+    /// 第一个窗口（面板）已经创建：之后的都是普通窗口
+    static PANEL_MADE: Cell<bool> = const { Cell::new(false) };
+    /// 事件循环运行中新建的普通窗口，下一轮并入 State.tops
+    static NEW_TOPS: RefCell<Vec<Weak<WlWindow>>> = const { RefCell::new(Vec::new()) };
+    /// 后台线程读完拖放数据（回到事件循环线程后放这里）：Count(n) / Drop(files)
+    static DND_DONE: RefCell<Vec<DndDone>> = const { RefCell::new(Vec::new()) };
+}
+
+enum DndDone {
+    Count(u64, usize),
+    Drop(Vec<String>),
 }
 
 pub fn push(c: Cmd) {
@@ -171,6 +176,13 @@ pub struct WlWindow {
     /// Slint 要输入法：Some(光标矩形，逻辑 px) / None
     ime: RefCell<Option<(InputMethodRequestKind, i32, i32, i32, i32, String, usize, usize)>>,
     ime_dirty: Cell<bool>,
+    /// 普通窗口（xdg toplevel）；false = 面板
+    top: bool,
+    id: Cell<usize>,
+    title: RefCell<String>,
+    pref: Cell<(u32, u32)>,
+    min: Cell<(u32, u32)>,
+    props_dirty: Cell<bool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -191,6 +203,26 @@ impl WindowAdapter for WlWindow {
     }
     fn request_redraw(&self) {
         self.needs_redraw.set(true);
+    }
+    fn set_visible(&self, visible: bool) -> Result<(), slint::PlatformError> {
+        if self.top {
+            push(Cmd::Top(self.id.get(), visible));
+        }
+        Ok(())
+    }
+    fn update_window_properties(&self, p: slint::platform::WindowProperties<'_>) {
+        if !self.top {
+            return;
+        }
+        *self.title.borrow_mut() = p.title().to_string();
+        let c = p.layout_constraints();
+        let pref = (c.preferred.width.round().max(1.0) as u32, c.preferred.height.round().max(1.0) as u32);
+        let min = c.min.map(|m| (m.width.round() as u32, m.height.round() as u32)).unwrap_or((0, 0));
+        if self.pref.get() != pref || self.min.get() != min {
+            self.pref.set(pref);
+            self.min.set(min);
+        }
+        self.props_dirty.set(true);
     }
     fn internal(&self, _: i_slint_core::InternalToken) -> Option<&dyn WindowAdapterInternal> {
         Some(self)
@@ -248,8 +280,8 @@ struct PanelSurf {
     configured: bool,
     width: u32,
     height: u32,
-    /// 淡入淡出：alpha 从 a0 到 a1，起点 t0
-    fade: (f32, f32, Instant, u64),
+    /// 弹出（弹簧）/ 收起（exitTo）动画；None = 静止
+    anim: Option<PanelAnim>,
     closing: bool,
     focus_req: bool,
 }
@@ -261,6 +293,20 @@ struct StripSurf {
     width: u32,
     height: u32,
     dirty: bool,
+}
+
+struct TopSurf {
+    xdg: XdgWindow,
+    configured: bool,
+    width: u32,
+    height: u32,
+    buf: Vec<Bgra>,
+}
+
+struct TopWin {
+    id: usize,
+    win: Weak<WlWindow>,
+    surf: Option<TopSurf>,
 }
 
 struct State {
@@ -286,7 +332,20 @@ struct State {
     ti_pending: TiPending,
     win: Weak<WlWindow>,
     buf: Vec<Bgra>,
+    xbuf: Vec<Bgra>,
     scale: i32,
+    xdg: Option<XdgShell>,
+    tops: Vec<TopWin>,
+    /// 键盘 / 输入法焦点所在的普通窗口
+    kb_top: Option<usize>,
+    ti_top: Option<usize>,
+    ddm: Option<DataDeviceManagerState>,
+    data_device: Option<DataDevice>,
+    /// 拖放进行中：Some(在面板上)（false = 在停靠条上）
+    dnd_on: Option<bool>,
+    dnd_gen: u64,
+    /// 已松开、正在后台读数据的拖放
+    dnd_drop: Option<(DragOffer, bool, (f32, f32))>,
 }
 
 #[derive(Default)]
@@ -296,8 +355,86 @@ struct TiPending {
     delete: Option<(u32, u32)>,
 }
 
-const FADE_IN_MS: u64 = 120;
-const FADE_OUT_MS: u64 = 140;
+/// 旧版 spring.ts：弹出 = springTo(从边外 36px、scale .94、opacity 0 → 原位；stiffness 300 damping 24；opacity 140 ms 线性)；
+/// 收起 = exitTo(220 ms cubic-bezier(.5,-.35,.75,.6) → 边外 28px、scale .96、opacity 0)
+#[derive(Clone, Copy)]
+struct PanelAnim {
+    opening: bool,
+    start: Instant,
+    /// 收起的起点姿态（tx, ty, s, op）
+    from: (f32, f32, f32, f32),
+}
+
+const EXIT_MS: f32 = 220.0;
+
+/// springCurve：半隐式欧拉 dt = 1/240，每 1/60 s 取样，直到 |p-1| < .0008 且 |v| < .01（与旧版完全同一算法）
+fn spring_curve() -> &'static [(f32, f32)] {
+    static C: std::sync::OnceLock<Vec<(f32, f32)>> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        let (k, d, m) = (300.0f64, 24.0f64, 1.0f64);
+        let dt = 1.0 / 240.0;
+        let (mut p, mut v, mut t, mut last) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let mut out = vec![(0.0f32, 0.0f32)];
+        while t < 2.5 {
+            let a = (-k * (p - 1.0) - d * v) / m;
+            v += a * dt;
+            p += v * dt;
+            t += dt;
+            if t - last >= 1.0 / 60.0 {
+                out.push(((t * 1000.0) as f32, p as f32));
+                last = t;
+            }
+            if (p - 1.0).abs() < 0.0008 && v.abs() < 0.01 {
+                break;
+            }
+        }
+        out.push(((t * 1000.0) as f32, 1.0));
+        out
+    })
+}
+
+fn spring_at(ms: f32) -> Option<f32> {
+    let c = spring_curve();
+    let end = c.last()?.0;
+    if ms >= end {
+        return None;
+    }
+    // WAAPI 关键帧之间线性插值
+    let i = c.partition_point(|x| x.0 <= ms).clamp(1, c.len() - 1);
+    let (a, b) = (c[i - 1], c[i]);
+    let t = if b.0 > a.0 { (ms - a.0) / (b.0 - a.0) } else { 1.0 };
+    Some(a.1 + (b.1 - a.1) * t)
+}
+
+fn edge_offset(edge: &str, dist: f32) -> (f32, f32) {
+    match edge {
+        "left" => (-dist, 0.0),
+        "top" => (0.0, -dist),
+        "bottom" => (0.0, dist),
+        _ => (dist, 0.0),
+    }
+}
+
+impl PanelAnim {
+    /// 当前姿态 (tx, ty, scale, opacity)；None = 动画已结束
+    fn pose(&self, edge: &str) -> Option<(f32, f32, f32, f32)> {
+        let ms = self.start.elapsed().as_secs_f32() * 1000.0;
+        if self.opening {
+            let p = spring_at(ms)?;
+            let (ex, ey) = edge_offset(edge, 36.0);
+            let op = (ms / 140.0).min(1.0);
+            Some((ex * (1.0 - p), ey * (1.0 - p), 0.94 + 0.06 * p, op))
+        } else {
+            if ms >= EXIT_MS {
+                return None;
+            }
+            let e = crate::fx::bezier(0.5, -0.35, 0.75, 0.6, ms / EXIT_MS);
+            let (ex, ey) = edge_offset(edge, 28.0);
+            let f = self.from;
+            Some((f.0 + (ex - f.0) * e, f.1 + (ey - f.1) * e, f.2 + (0.96 - f.2) * e, f.3 + (0.0 - f.3) * e))
+        }
+    }
+}
 
 pub struct WlPlatform {
     conn: Connection,
@@ -309,8 +446,10 @@ pub struct WlPlatform {
     wake_tx: Arc<std::os::unix::net::UnixStream>,
 }
 
-pub const W: u32 = 360;
-pub const H: u32 = 520;
+/// 无原生材质：外框 8px 留给圆角 14 的外壳与阴影（旧版 dock.rs MARGIN）
+pub const FRAME: u32 = 8;
+pub const W: u32 = 360 + 2 * FRAME;
+pub const H: u32 = 520 + 2 * FRAME;
 
 fn bind_ti(globals: &GlobalList, qh: &QueueHandle<State>) -> Option<ZwpTextInputManagerV3> {
     globals.bind::<ZwpTextInputManagerV3, _, _>(qh, 1..=1, TiData).map_err(|e| log::info!("text-input-v3 unavailable: {e}")).ok()
@@ -326,6 +465,8 @@ impl WlPlatform {
         let shm = Shm::bind(&globals, &qh).map_err(|e| format!("wl_shm: {e}"))?;
         let pool = SlotPool::new((W * H * 4) as usize, &shm).map_err(|e| e.to_string())?;
         let ti_manager = bind_ti(&globals, &qh);
+        let xdg = XdgShell::bind(&globals, &qh).map_err(|e| log::warn!("xdg-shell unavailable ({e}): settings window disabled")).ok();
+        let ddm = DataDeviceManagerState::bind(&globals, &qh).map_err(|e| log::warn!("wl_data_device_manager unavailable ({e}): no drag & drop")).ok();
         let mut state = State {
             registry_state: RegistryState::new(&globals),
             seat_state: SeatState::new(&globals, &qh),
@@ -349,7 +490,17 @@ impl WlPlatform {
             ti_pending: TiPending::default(),
             win: Weak::new(),
             buf: Vec::new(),
+            xbuf: Vec::new(),
             scale: 1,
+            xdg,
+            tops: Vec::new(),
+            kb_top: None,
+            ti_top: None,
+            ddm,
+            data_device: None,
+            dnd_on: None,
+            dnd_gen: 0,
+            dnd_drop: None,
         };
         // 一次往返：拿到输出信息（dock 算位置要用）和 seat 能力
         queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
@@ -371,16 +522,28 @@ impl WlPlatform {
 
 impl slint::platform::Platform for WlPlatform {
     fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, slint::PlatformError> {
+        // 第一个窗口 = 面板（layer surface）；之后的 = 普通窗口（xdg toplevel，设置页）
+        let top = PANEL_MADE.with(|p| p.replace(true));
+        let (w0, h0) = if top { (480, 620) } else { (W, H) };
         let w = Rc::<WlWindow>::new_cyclic(|weak: &Weak<WlWindow>| WlWindow {
             window: slint::Window::new(weak.clone() as Weak<dyn WindowAdapter>),
             renderer: SoftwareRenderer::new_with_repaint_buffer_type(RepaintBufferType::NewBuffer),
-            size: Cell::new(PhysicalSize::new(W, H)),
+            size: Cell::new(PhysicalSize::new(w0, h0)),
             needs_redraw: Cell::new(true),
             ime: RefCell::new(None),
             ime_dirty: Cell::new(false),
+            top,
+            id: Cell::new(0),
+            title: RefCell::new(String::new()),
+            pref: Cell::new((w0, h0)),
+            min: Cell::new((0, 0)),
+            props_dirty: Cell::new(false),
         });
-        w.window.dispatch_event(WindowEvent::Resized { size: slint::LogicalSize::new(W as f32, H as f32) });
-        if let Some(s) = self.state.borrow_mut().as_mut() {
+        w.id.set(Rc::as_ptr(&w) as *const u8 as usize);
+        w.window.dispatch_event(WindowEvent::Resized { size: slint::LogicalSize::new(w0 as f32, h0 as f32) });
+        if top {
+            NEW_TOPS.with(|t| t.borrow_mut().push(Rc::downgrade(&w)));
+        } else if let Some(s) = self.state.borrow_mut().as_mut() {
             s.win = Rc::downgrade(&w);
         }
         Ok(w)
@@ -391,9 +554,16 @@ impl slint::platform::Platform for WlPlatform {
         let mut state = self.state.borrow_mut().take().ok_or("no state")?;
         // 没有 dock（LANCAT_SLINT_NODOCK=1 或 dock 还没接上）：面板直接贴右缘显示
         if std::env::var("LANCAT_SLINT_NODOCK").as_deref() == Ok("1") {
-            push(Cmd::Panel(Some(Place { edge: "right".into(), along: 200, inset: 8, w: W, h: H, output: 0 })));
+            push(Cmd::Panel(Some(Place { edge: "right".into(), along: 200, inset: 0, w: W, h: H, output: 0 })));
         }
         loop {
+            // 新建的普通窗口
+            for w in NEW_TOPS.with(|t| std::mem::take(&mut *t.borrow_mut())) {
+                if let Some(rc) = w.upgrade() {
+                    state.tops.push(TopWin { id: rc.id.get(), win: w, surf: None });
+                }
+            }
+            state.tops.retain(|t| t.win.strong_count() > 0);
             // dock 的命令
             let cmds = CMDS.with(|q| std::mem::take(&mut *q.borrow_mut()));
             for c in cmds {
@@ -401,7 +571,7 @@ impl slint::platform::Platform for WlPlatform {
             }
             slint::platform::update_timers_and_animations();
             state.sync_ime();
-            let fading = state.panel.as_ref().is_some_and(|p| p.configured && p.fade.2.elapsed().as_millis() < p.fade.3 as u128 + 16);
+            let fading = state.panel.as_ref().is_some_and(|p| p.configured && p.anim.is_some()) || crate::compose::animating();
             if let Some(w) = state.win.upgrade() {
                 let ready = state.panel.as_ref().is_some_and(|p| p.configured);
                 if ready && (w.needs_redraw.get() || w.window.has_active_animations() || fading) {
@@ -412,9 +582,15 @@ impl slint::platform::Platform for WlPlatform {
             if state.strip.as_ref().is_some_and(|s| s.configured && s.dirty) {
                 state.draw_strip();
             }
+            state.draw_tops();
+            for d in DND_DONE.with(|q| std::mem::take(&mut *q.borrow_mut())) {
+                state.dnd_done(d);
+            }
             queue.dispatch_pending(&mut state).map_err(|e| e.to_string())?;
             queue.flush().map_err(|e| e.to_string())?;
-            let anim = fading || state.win.upgrade().is_some_and(|w| w.window.has_active_animations() && state.panel.is_some());
+            let anim = fading
+                || state.win.upgrade().is_some_and(|w| w.window.has_active_animations() && state.panel.is_some())
+                || state.tops.iter().any(|t| t.surf.as_ref().is_some_and(|s| s.configured) && t.win.upgrade().is_some_and(|w| w.window.has_active_animations()));
             let pending_cmds = CMDS.with(|q| !q.borrow().is_empty());
             let timeout = slint::platform::duration_until_next_timer_update().map(|d| d.min(Duration::from_secs(1)));
             let ms: i32 = if pending_cmds {
@@ -445,6 +621,9 @@ impl slint::platform::Platform for WlPlatform {
                     Some(j) => j(),
                     None => break,
                 }
+            }
+            for d in DND_DONE.with(|q| std::mem::take(&mut *q.borrow_mut())) {
+                state.dnd_done(d);
             }
             if self.quit.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 break;
@@ -543,23 +722,25 @@ impl State {
                         }
                     }
                     Some(ps) => {
-                        // 正在淡出又被打开：从当前 alpha 淡回来，不重建 surface
-                        let a = fade_alpha(ps.fade);
+                        // 正在收起又被打开：旧版 anim.cancel() 后重新 springTo（从固定起点），surface 不重建
                         ps.closing = false;
-                        ps.fade = (a, 1.0, Instant::now(), FADE_IN_MS);
+                        ps.anim = Some(PanelAnim { opening: true, start: Instant::now(), from: (0.0, 0.0, 1.0, 1.0) });
+                        ps.layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+                        ps.layer.commit();
                     }
                     None => {
                         let layer = self.new_layer("lancat-panel", &p, KeyboardInteractivity::OnDemand);
-                        self.panel = Some(PanelSurf { layer, place: p, configured: false, width: W, height: H, fade: (0.0, 1.0, Instant::now(), FADE_IN_MS), closing: false, focus_req: false });
+                        self.panel = Some(PanelSurf { layer, place: p, configured: false, width: W, height: H, anim: Some(PanelAnim { opening: true, start: Instant::now(), from: (0.0, 0.0, 1.0, 1.0) }), closing: false, focus_req: false });
                     }
                 }
             }
             Cmd::Panel(None) => {
                 if let Some(ps) = self.panel.as_mut() {
                     if !ps.closing {
-                        let a = if ps.configured { fade_alpha(ps.fade) } else { 0.0 };
+                        let edge = ps.place.edge.clone();
+                        let from = if !ps.configured { (0.0, 0.0, 1.0, 0.0) } else { ps.anim.and_then(|a| a.pose(&edge)).unwrap_or((0.0, 0.0, 1.0, 1.0)) };
                         ps.closing = true;
-                        ps.fade = (a, 0.0, Instant::now(), FADE_OUT_MS);
+                        ps.anim = Some(PanelAnim { opening: false, start: Instant::now(), from });
                         ps.layer.set_keyboard_interactivity(KeyboardInteractivity::None);
                         ps.layer.commit();
                     }
@@ -570,6 +751,19 @@ impl State {
                     ps.focus_req = true;
                     ps.layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
                     ps.layer.commit();
+                }
+            }
+            Cmd::Top(id, true) => self.show_top(id),
+            Cmd::Top(id, false) => {
+                if let Some(t) = self.tops.iter_mut().find(|t| t.id == id) {
+                    t.surf = None;
+                }
+                if self.kb_top == Some(id) {
+                    self.kb_top = None;
+                    REPEAT.with(|r| *r.borrow_mut() = None);
+                }
+                if self.ti_top == Some(id) {
+                    self.ti_top = None;
                 }
             }
             Cmd::Strip(Some(p)) => match self.strip.as_mut() {
@@ -606,7 +800,7 @@ impl State {
 
     /// 淡出结束：销毁面板 surface，释放像素缓冲。
     fn finish_close(&mut self) {
-        let done = self.panel.as_ref().is_some_and(|p| p.closing && (!p.configured || p.fade.2.elapsed().as_millis() >= p.fade.3 as u128));
+        let done = self.panel.as_ref().is_some_and(|p| p.closing && (!p.configured || p.anim.is_none_or(|a| a.start.elapsed().as_secs_f32() * 1000.0 >= EXIT_MS)));
         if done {
             self.panel = None;
             self.kb_on_panel = false;
@@ -620,10 +814,9 @@ impl State {
 
     fn draw_panel(&mut self) {
         let Some(w) = self.win.upgrade() else { return };
-        let Some(ps) = self.panel.as_ref() else { return };
+        let Some(ps) = self.panel.as_mut() else { return };
         let sc = self.scale.max(1) as u32;
         let (width, height) = (ps.width * sc, ps.height * sc);
-        let alpha = fade_alpha(ps.fade);
         let n = (width * height) as usize;
         if self.buf.len() != n {
             self.buf = vec![Bgra::default(); n];
@@ -631,18 +824,38 @@ impl State {
         w.needs_redraw.set(false);
         // NewBuffer：每帧整幅重画（缓冲是我们自己的，渲染器不保留上一帧状态，surface 重建后也安全）
         self.buf.iter_mut().for_each(|p| *p = Bgra::default());
-        w.renderer.render(&mut self.buf, width as usize);
-        let Ok((buffer, canvas)) = self.pool.create_buffer(width as i32, height as i32, width as i32 * 4, wl_shm::Format::Argb8888) else { return };
-        // SAFETY: Bgra is repr(C) 4 bytes, canvas is width*height*4 bytes
-        let src = unsafe { std::slice::from_raw_parts(self.buf.as_ptr() as *const u8, n * 4) };
-        if alpha >= 0.999 {
-            canvas[..n * 4].copy_from_slice(src);
-        } else {
-            let k = (alpha.clamp(0.0, 1.0) * 256.0) as u32;
-            for (d, s) in canvas[..n * 4].iter_mut().zip(src) {
-                *d = ((*s as u32 * k) >> 8) as u8;
-            }
+        let out = crate::compose::render(&w.renderer, &mut self.buf, width as usize, height as usize, sc as f32, false);
+        if matches!(out, crate::compose::Out::Full) {
+            w.needs_redraw.set(false);
         }
+        // 面板整体的弹出/收起变换
+        let edge = ps.place.edge.clone();
+        let pose = ps.anim.and_then(|a| a.pose(&edge));
+        if pose.is_none() && !ps.closing {
+            ps.anim = None;
+        }
+        let Ok((buffer, canvas)) = self.pool.create_buffer(width as i32, height as i32, width as i32 * 4, wl_shm::Format::Argb8888) else { return };
+        let src: &[Bgra] = match pose {
+            Some((tx, ty, s, op)) => {
+                if self.xbuf.len() != n {
+                    self.xbuf = vec![Bgra::default(); n];
+                }
+                crate::compose::xform_frame(&self.buf, &mut self.xbuf, width as usize, height as usize, s, tx * sc as f32, ty * sc as f32, op);
+                &self.xbuf
+            }
+            None if ps.closing => {
+                // 收起动画结束、surface 还没销毁的那一帧：全透明
+                if self.xbuf.len() != n {
+                    self.xbuf = vec![Bgra::default(); n];
+                }
+                self.xbuf.iter_mut().for_each(|p| *p = Bgra::default());
+                &self.xbuf
+            }
+            None => &self.buf,
+        };
+        // SAFETY: Bgra is repr(C) 4 bytes, canvas is width*height*4 bytes
+        let bytes = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u8, n * 4) };
+        canvas[..n * 4].copy_from_slice(bytes);
         let s = ps.layer.wl_surface();
         s.damage_buffer(0, 0, width as i32, height as i32);
         if buffer.attach_to(s).is_ok() {
@@ -666,14 +879,30 @@ impl State {
 
     /// Slint 的输入法请求 → text-input-v3（只在键盘焦点在面板上时 enable）。
     fn sync_ime(&mut self) {
-        let Some(w) = self.win.upgrade() else { return };
-        if !w.ime_dirty.replace(false) {
+        // 输入法跟着 text-input 的焦点窗口（面板或某个普通窗口）；其余窗口的请求只清掉脏标记
+        let target = if self.ti_on_panel { self.win.upgrade() } else { self.ti_top.and_then(|id| self.top_window(id)) };
+        let mut others: Vec<Rc<WlWindow>> = self.tops.iter().filter_map(|t| t.win.upgrade()).collect();
+        others.extend(self.win.upgrade());
+        let target_dirty = target.as_ref().is_some_and(|w| w.ime_dirty.get());
+        for o in &others {
+            if !target.as_ref().is_some_and(|t| Rc::ptr_eq(t, o)) && o.ime_dirty.replace(false) && target.is_none() && self.ti_enabled {
+                // 焦点不在任何窗口：关掉
+                if let Some(ti) = self.text_input.as_ref() {
+                    ti.disable();
+                    ti.commit();
+                }
+                self.ti_enabled = false;
+            }
+        }
+        let Some(w) = target else { return };
+        if !target_dirty {
             return;
         }
+        w.ime_dirty.set(false);
         let Some(ti) = self.text_input.as_ref() else { return };
         let req = w.ime.borrow().clone();
         match req {
-            Some((_, x, y, cw, chh, text, cursor, anchor)) if self.ti_on_panel => {
+            Some((_, x, y, cw, chh, text, cursor, anchor)) => {
                 if !self.ti_enabled {
                     ti.enable();
                     ti.set_content_type(zwp_text_input_v3::ContentHint::None, zwp_text_input_v3::ContentPurpose::Normal);
@@ -697,11 +926,237 @@ impl State {
     }
 }
 
-fn fade_alpha(f: (f32, f32, Instant, u64)) -> f32 {
-    let k = (f.2.elapsed().as_secs_f32() * 1000.0 / f.3.max(1) as f32).min(1.0);
-    // ease-out cubic（与 Windows 的整窗淡入相同的观感）
-    let e = 1.0 - (1.0 - k).powi(3);
-    f.0 + (f.1 - f.0) * e
+// ------------------------------------------------------------------ normal windows (xdg toplevel)
+
+impl State {
+    fn top_window(&self, id: usize) -> Option<Rc<WlWindow>> {
+        self.tops.iter().find(|t| t.id == id).and_then(|t| t.win.upgrade())
+    }
+
+    fn top_of_surface(&self, s: &wl_surface::WlSurface) -> Option<usize> {
+        self.tops.iter().find(|t| t.surf.as_ref().is_some_and(|x| x.xdg.wl_surface() == s)).map(|t| t.id)
+    }
+
+    fn show_top(&mut self, id: usize) {
+        let Some(xdg) = self.xdg.as_ref() else { return };
+        let Some(t) = self.tops.iter_mut().find(|t| t.id == id) else { return };
+        let Some(w) = t.win.upgrade() else { return };
+        if let Some(ts) = t.surf.as_ref() {
+            // 已经开着：带到前面（xdg-activation 需要令牌，这里只能重设标题提示用户；niri 会在原位）
+            ts.xdg.set_title(w.title.borrow().clone());
+            return;
+        }
+        let surface = self.compositor.create_surface(&self.qh);
+        surface.set_buffer_scale(self.scale);
+        let xw = xdg.create_window(surface, WindowDecorations::RequestServer, &self.qh);
+        xw.set_title(w.title.borrow().clone());
+        xw.set_app_id("lancat");
+        let (mw, mh) = w.min.get();
+        if mw > 0 && mh > 0 {
+            xw.set_min_size(Some((mw, mh)));
+        }
+        xw.commit();
+        w.props_dirty.set(false);
+        let (pw, ph) = w.pref.get();
+        t.surf = Some(TopSurf { xdg: xw, configured: false, width: pw.max(1), height: ph.max(1), buf: Vec::new() });
+    }
+
+    fn draw_tops(&mut self) {
+        let sc = self.scale.max(1) as u32;
+        let ids: Vec<usize> = self.tops.iter().filter(|t| t.surf.as_ref().is_some_and(|s| s.configured)).map(|t| t.id).collect();
+        for id in ids {
+            let Some(w) = self.top_window(id) else { continue };
+            if w.props_dirty.replace(false) {
+                if let Some(ts) = self.tops.iter().find(|t| t.id == id).and_then(|t| t.surf.as_ref()) {
+                    ts.xdg.set_title(w.title.borrow().clone());
+                    let (mw, mh) = w.min.get();
+                    ts.xdg.set_min_size(if mw > 0 && mh > 0 { Some((mw, mh)) } else { None });
+                }
+            }
+            if !(w.needs_redraw.get() || w.window.has_active_animations()) {
+                continue;
+            }
+            self.draw_top(id, &w, sc);
+        }
+    }
+
+    fn draw_top(&mut self, id: usize, w: &Rc<WlWindow>, sc: u32) {
+        let Some(ts) = self.tops.iter_mut().find(|t| t.id == id).and_then(|t| t.surf.as_mut()) else { return };
+        let (width, height) = (ts.width * sc, ts.height * sc);
+        let n = (width * height) as usize;
+        if ts.buf.len() != n {
+            ts.buf = vec![Bgra::default(); n];
+        }
+        w.needs_redraw.set(false);
+        ts.buf.iter_mut().for_each(|p| *p = Bgra::default());
+        w.renderer.render(&mut ts.buf[..], width as usize);
+        let Ok((buffer, canvas)) = self.pool.create_buffer(width as i32, height as i32, width as i32 * 4, wl_shm::Format::Argb8888) else { return };
+        // SAFETY: Bgra is repr(C) 4 bytes
+        let bytes = unsafe { std::slice::from_raw_parts(ts.buf.as_ptr() as *const u8, n * 4) };
+        canvas[..n * 4].copy_from_slice(bytes);
+        let s = ts.xdg.wl_surface();
+        s.damage_buffer(0, 0, width as i32, height as i32);
+        if buffer.attach_to(s).is_ok() {
+            ts.xdg.commit();
+        }
+    }
+}
+
+impl WindowHandler for State {
+    fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, window: &XdgWindow) {
+        let Some(id) = self.tops.iter().find(|t| t.surf.as_ref().is_some_and(|s| &s.xdg == window)).map(|t| t.id) else { return };
+        if let Some(w) = self.top_window(id) {
+            // Slint 决定（默认隐藏 → set_visible(false) → Cmd::Top(id, false) 销毁 toplevel）
+            w.window.dispatch_event(WindowEvent::CloseRequested);
+        }
+    }
+    fn configure(&mut self, _: &Connection, _: &QueueHandle<Self>, window: &XdgWindow, c: WindowConfigure, _: u32) {
+        let sc = self.scale.max(1) as u32;
+        let Some(t) = self.tops.iter_mut().find(|t| t.surf.as_ref().is_some_and(|s| &s.xdg == window)) else { return };
+        let id = t.id;
+        let Some(w) = t.win.upgrade() else { return };
+        let ts = t.surf.as_mut().unwrap();
+        let (pw, ph) = w.pref.get();
+        let (mw, mh) = w.min.get();
+        ts.width = c.new_size.0.map(|v| v.get()).unwrap_or(if ts.configured { ts.width } else { pw }).max(mw).max(1);
+        ts.height = c.new_size.1.map(|v| v.get()).unwrap_or(if ts.configured { ts.height } else { ph }).max(mh).max(1);
+        ts.configured = true;
+        let (lw, lh) = (ts.width, ts.height);
+        w.size.set(PhysicalSize::new(lw * sc, lh * sc));
+        w.window.dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor: sc as f32 });
+        w.window.dispatch_event(WindowEvent::Resized { size: slint::LogicalSize::new(lw as f32, lh as f32) });
+        w.needs_redraw.set(true);
+        self.draw_top(id, &w, sc);
+    }
+}
+
+// ------------------------------------------------------------------ drag & drop (wl_data_device)
+
+const URI_LIST: &str = "text/uri-list";
+
+/// text/uri-list → 本地路径（file:// URI，%XX 解码；注释行和非 file 的跳过）
+fn parse_uri_list(s: &str) -> Vec<String> {
+    s.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let rest = l.strip_prefix("file://")?;
+            // file://host/path：只认本机（空主机或 localhost）
+            let path = if rest.starts_with('/') { rest } else { rest.strip_prefix("localhost")? };
+            let b = path.as_bytes();
+            let mut out = Vec::with_capacity(b.len());
+            let mut i = 0;
+            while i < b.len() {
+                if b[i] == b'%' && i + 2 < b.len() {
+                    if let Ok(v) = u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16) {
+                        out.push(v);
+                        i += 3;
+                        continue;
+                    }
+                }
+                out.push(b[i]);
+                i += 1;
+            }
+            String::from_utf8(out).ok()
+        })
+        .collect()
+}
+
+/// 后台线程读完管道，回到事件循环线程交给 State（DND_DONE）
+fn read_pipe_async(pipe: smithay_client_toolkit::data_device_manager::ReadPipe, done: impl FnOnce(Vec<String>) -> DndDone + Send + 'static) {
+    std::thread::spawn(move || {
+        let mut pipe = pipe;
+        let mut s = String::new();
+        let _ = std::io::Read::read_to_string(&mut pipe, &mut s);
+        let files = parse_uri_list(&s);
+        let d = done(files);
+        let _ = slint::invoke_from_event_loop(move || DND_DONE.with(|q| q.borrow_mut().push(d)));
+    });
+}
+
+impl State {
+    fn dnd_done(&mut self, d: DndDone) {
+        match d {
+            DndDone::Count(gen, n) => {
+                if gen == self.dnd_gen && self.dnd_on.is_some() {
+                    crate::dock::wl_drag_count(n);
+                }
+            }
+            DndDone::Drop(files) => {
+                let Some((offer, panel, pos)) = self.dnd_drop.take() else { return };
+                offer.finish();
+                offer.destroy();
+                log::info!("drop: {} item(s) on {}", files.len(), if panel { "panel" } else { "strip" });
+                crate::dock::wl_drop(panel, files, if panel { Some(pos) } else { None });
+            }
+        }
+    }
+}
+
+impl DataDeviceHandler for State {
+    fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, dd: &WlDataDevice, x: f64, y: f64, surface: &wl_surface::WlSurface) {
+        let panel = self.panel.as_ref().is_some_and(|p| p.layer.wl_surface() == surface && !p.closing);
+        let strip = self.strip.as_ref().is_some_and(|s| s.layer.wl_surface() == surface);
+        let Some(offer) = wayland_client::Proxy::data::<DataDeviceData>(dd).and_then(|d| d.drag_offer()) else { return };
+        let files = offer.with_mime_types(|m| m.iter().any(|t| t == URI_LIST));
+        if !(panel || strip) || !files {
+            offer.accept_mime_type(offer.serial, None);
+            offer.set_actions(DndAction::empty(), DndAction::empty());
+            return;
+        }
+        offer.accept_mime_type(offer.serial, Some(URI_LIST.into()));
+        offer.set_actions(DndAction::Copy, DndAction::Copy);
+        let fresh = self.dnd_on.is_none();
+        self.dnd_on = Some(panel);
+        if fresh {
+            // 新的一次拖拽：预读一次 uri-list 拿项数（同一次拖拽从停靠条移到面板不重读）
+            self.dnd_gen += 1;
+            let gen = self.dnd_gen;
+            if let Ok(pipe) = offer.receive(URI_LIST.into()) {
+                read_pipe_async(pipe, move |f| DndDone::Count(gen, f.len()));
+            }
+        }
+        crate::dock::wl_drag_enter(panel, x as f32, y as f32);
+    }
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {
+        if self.dnd_drop.is_some() {
+            return; // 松开后的 leave：等数据读完
+        }
+        if let Some(panel) = self.dnd_on.take() {
+            crate::dock::wl_drag_leave(panel);
+        }
+    }
+    fn motion(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice, x: f64, y: f64) {
+        if self.dnd_on == Some(true) {
+            crate::dock::wl_drag_motion(x as f32, y as f32);
+        }
+    }
+    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, dd: &WlDataDevice) {
+        let Some(panel) = self.dnd_on.take() else { return };
+        let Some(offer) = wayland_client::Proxy::data::<DataDeviceData>(dd).and_then(|d| d.drag_offer()) else { return };
+        let pos = (offer.x as f32, offer.y as f32);
+        match offer.receive(URI_LIST.into()) {
+            Ok(pipe) => {
+                self.dnd_drop = Some((offer, panel, pos));
+                read_pipe_async(pipe, DndDone::Drop);
+            }
+            Err(e) => {
+                log::warn!("drop: receive failed: {e}");
+                offer.destroy();
+                crate::dock::wl_drop(panel, Vec::new(), None);
+            }
+        }
+    }
+}
+
+impl DataOfferHandler for State {
+    fn source_actions(&mut self, _: &Connection, _: &QueueHandle<Self>, offer: &mut DragOffer, _: DndAction) {
+        if self.dnd_on.is_some() {
+            offer.set_actions(DndAction::Copy, DndAction::Copy);
+        }
+    }
+    fn selected_action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &mut DragOffer, _: DndAction) {}
 }
 
 /// 停靠条：与旧版 native_dock/linux.rs 的 cairo 画法相同（圆角条，未悬停时朝屏幕内缩到 87%，
@@ -817,8 +1272,10 @@ impl LayerShellHandler for State {
         let first = !ps.configured;
         ps.configured = true;
         if first {
-            // 淡入从第一帧真正上屏开始算
-            ps.fade.2 = Instant::now();
+            // 弹出动画从第一帧真正上屏开始算
+            if let Some(a) = ps.anim.as_mut() {
+                a.start = Instant::now();
+            }
         }
         let (pw, ph) = (ps.width, ps.height);
         if let Some(w) = self.win.upgrade() {
@@ -840,6 +1297,11 @@ impl SeatHandler for State {
         &mut self.seat_state
     }
     fn new_seat(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        if self.data_device.is_none() {
+            if let Some(m) = self.ddm.as_ref() {
+                self.data_device = Some(m.get_data_device(qh, &seat));
+            }
+        }
         if self.text_input.is_none() {
             if let Some(m) = self.ti_manager.as_ref() {
                 self.text_input = Some(m.get_text_input(&seat, qh, TiData));
@@ -847,6 +1309,11 @@ impl SeatHandler for State {
         }
     }
     fn new_capability(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat, cap: Capability) {
+        if self.data_device.is_none() {
+            if let Some(m) = self.ddm.as_ref() {
+                self.data_device = Some(m.get_data_device(qh, &seat));
+            }
+        }
         if cap == Capability::Pointer && self.pointer.is_none() {
             self.pointer = self.seat_state.get_pointer(qh, &seat).ok();
         }
@@ -886,6 +1353,10 @@ impl PointerHandler for State {
                 }
                 continue;
             }
+            if let Some(id) = self.top_of_surface(&e.surface) {
+                self.top_pointer(id, e);
+                continue;
+            }
             let on_panel = self.panel.as_ref().is_some_and(|p| p.layer.wl_surface() == &e.surface);
             if !on_panel {
                 continue;
@@ -901,15 +1372,22 @@ impl PointerHandler for State {
             match e.kind {
                 PointerEventKind::Enter { .. } => {
                     crate::dock::wl_panel_pointer(true);
+                    crate::note_pointer(false, position.x, position.y, true);
                     w.window.dispatch_event(WindowEvent::PointerMoved { position });
                 }
-                PointerEventKind::Motion { .. } => w.window.dispatch_event(WindowEvent::PointerMoved { position }),
+                PointerEventKind::Motion { .. } => {
+                    crate::note_pointer(false, position.x, position.y, true);
+                    w.window.dispatch_event(WindowEvent::PointerMoved { position })
+                }
                 PointerEventKind::Leave { .. } => {
                     crate::dock::wl_panel_pointer(false);
+                    crate::note_pointer(false, -1000.0, -1000.0, false);
                     w.window.dispatch_event(WindowEvent::PointerExited);
                 }
                 PointerEventKind::Press { button: b, .. } => {
                     crate::dock::wl_panel_press(true);
+                    // 点在弹层外：先关弹层（旧版 window click），这次点击照常分发
+                    crate::pointer_down(position.x, position.y);
                     w.window.dispatch_event(WindowEvent::PointerPressed { position, button: button(b) })
                 }
                 PointerEventKind::Release { button: b, .. } => {
@@ -923,6 +1401,46 @@ impl PointerHandler for State {
                     w.window.dispatch_event(WindowEvent::PointerScrolled { position, delta_x: -dx as f32 * 4.0, delta_y: -dy as f32 * 4.0 })
                 }
             }
+        }
+    }
+}
+
+impl State {
+    /// 普通窗口上的指针事件（不经过 dock，没有弹层外点击的处理）
+    fn top_pointer(&mut self, id: usize, e: &PointerEvent) {
+        let Some(w) = self.top_window(id) else { return };
+        let position = LogicalPosition::new(e.position.0 as f32, e.position.1 as f32);
+        let button = |b: u32| match b {
+            0x110 => PointerEventButton::Left,
+            0x111 => PointerEventButton::Right,
+            0x112 => PointerEventButton::Middle,
+            _ => PointerEventButton::Other,
+        };
+        match e.kind {
+            PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                crate::note_pointer(true, position.x, position.y, true);
+                w.window.dispatch_event(WindowEvent::PointerMoved { position });
+            }
+            PointerEventKind::Leave { .. } => {
+                crate::note_pointer(true, -1000.0, -1000.0, false);
+                w.window.dispatch_event(WindowEvent::PointerExited);
+            }
+            PointerEventKind::Press { button: b, .. } => w.window.dispatch_event(WindowEvent::PointerPressed { position, button: button(b) }),
+            PointerEventKind::Release { button: b, .. } => w.window.dispatch_event(WindowEvent::PointerReleased { position, button: button(b) }),
+            PointerEventKind::Axis { horizontal, vertical, .. } => {
+                let dy = if vertical.absolute != 0.0 { vertical.absolute } else { vertical.discrete as f64 * 10.0 };
+                let dx = if horizontal.absolute != 0.0 { horizontal.absolute } else { horizontal.discrete as f64 * 10.0 };
+                w.window.dispatch_event(WindowEvent::PointerScrolled { position, delta_x: -dx as f32 * 4.0, delta_y: -dy as f32 * 4.0 })
+            }
+        }
+    }
+
+    /// 键盘事件的目标窗口：面板或有焦点的普通窗口
+    fn kb_window(&self) -> Option<Rc<WlWindow>> {
+        if self.kb_on_panel {
+            self.win.upgrade()
+        } else {
+            self.kb_top.and_then(|id| self.top_window(id))
         }
     }
 }
@@ -986,6 +1504,13 @@ thread_local! {
 
 impl KeyboardHandler for State {
     fn enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, surface: &wl_surface::WlSurface, _: u32, _: &[u32], _: &[Keysym]) {
+        if let Some(id) = self.top_of_surface(surface) {
+            self.kb_top = Some(id);
+            if let Some(w) = self.top_window(id) {
+                w.window.dispatch_event(WindowEvent::WindowActiveChanged(true));
+            }
+            return;
+        }
         let Some(ps) = self.panel.as_mut().filter(|p| p.layer.wl_surface() == surface) else { return };
         self.kb_on_panel = true;
         if ps.focus_req {
@@ -1000,6 +1525,14 @@ impl KeyboardHandler for State {
         crate::dock::wl_panel_keyboard(true);
     }
     fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, surface: &wl_surface::WlSurface, _: u32) {
+        if let Some(id) = self.kb_top.filter(|id| self.top_of_surface(surface) == Some(*id) || !self.kb_on_panel) {
+            self.kb_top = None;
+            REPEAT.with(|r| *r.borrow_mut() = None);
+            if let Some(w) = self.top_window(id) {
+                w.window.dispatch_event(WindowEvent::WindowActiveChanged(false));
+            }
+            return;
+        }
         if !self.panel.as_ref().is_some_and(|p| p.layer.wl_surface() == surface) && !self.kb_on_panel {
             return;
         }
@@ -1011,13 +1544,17 @@ impl KeyboardHandler for State {
         crate::dock::wl_panel_keyboard(false);
     }
     fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, ev: KeyEvent) {
-        if !self.kb_on_panel {
+        let Some(w) = self.kb_window() else { return };
+        if self.kb_on_panel && ev.keysym == Keysym::Escape {
+            // 窗口级 Esc（旧版 Panel.svelte onKey + 表情面板的捕获）
+            crate::escape_key();
             return;
         }
-        let Some(w) = self.win.upgrade() else { return };
         let Some(text) = key_text(&ev, self.ctrl_down()) else { return };
         w.window.dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
-        crate::dock::note_typed();
+        if self.kb_on_panel {
+            crate::dock::note_typed();
+        }
         // 修饰键不重复；其余按 repeat_info 重复（niri 的 wl_keyboard 不发 repeated 事件）
         let modifier = matches!(ev.keysym, Keysym::Shift_L | Keysym::Shift_R | Keysym::Control_L | Keysym::Control_R | Keysym::Alt_L | Keysym::Alt_R | Keysym::Super_L | Keysym::Super_R);
         REPEAT_RUN.with(|r| *r.borrow_mut() = None);
@@ -1041,20 +1578,14 @@ impl KeyboardHandler for State {
         }
     }
     fn repeat_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, ev: KeyEvent) {
-        if !self.kb_on_panel {
-            return;
-        }
-        if let (Some(w), Some(text)) = (self.win.upgrade(), key_text(&ev, self.ctrl_down())) {
+        if let (Some(w), Some(text)) = (self.kb_window(), key_text(&ev, self.ctrl_down())) {
             w.window.dispatch_event(WindowEvent::KeyPressed { text });
         }
     }
     fn release_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, ev: KeyEvent) {
         REPEAT.with(|r| *r.borrow_mut() = None);
         REPEAT_RUN.with(|r| *r.borrow_mut() = None);
-        if !self.kb_on_panel {
-            return;
-        }
-        if let (Some(w), Some(text)) = (self.win.upgrade(), key_text(&ev, self.ctrl_down())) {
+        if let (Some(w), Some(text)) = (self.kb_window(), key_text(&ev, self.ctrl_down())) {
             w.window.dispatch_event(WindowEvent::KeyReleased { text });
         }
     }
@@ -1088,12 +1619,15 @@ impl Dispatch2<ZwpTextInputV3, State> for TiData {
         match ev {
             Event::Enter { surface } => {
                 s.ti_on_panel = s.panel.as_ref().is_some_and(|p| p.layer.wl_surface() == &surface);
-                if let Some(w) = s.win.upgrade() {
+                s.ti_top = s.top_of_surface(&surface);
+                if let Some(w) = if s.ti_on_panel { s.win.upgrade() } else { s.ti_top.and_then(|id| s.top_window(id)) } {
                     w.ime_dirty.set(true);
                 }
             }
             Event::Leave { .. } => {
+                let prev = if s.ti_on_panel { s.win.upgrade() } else { s.ti_top.and_then(|id| s.top_window(id)) };
                 s.ti_on_panel = false;
+                s.ti_top = None;
                 if s.ti_enabled {
                     if let Some(ti) = s.text_input.as_ref() {
                         ti.disable();
@@ -1101,7 +1635,7 @@ impl Dispatch2<ZwpTextInputV3, State> for TiData {
                     }
                     s.ti_enabled = false;
                 }
-                if let Some(w) = s.win.upgrade() {
+                if let Some(w) = prev {
                     w.ime_preedit(String::new(), None);
                 }
             }
@@ -1117,7 +1651,7 @@ impl Dispatch2<ZwpTextInputV3, State> for TiData {
             Event::Done { .. } => {
                 // 协议规定的应用顺序：删除 surrounding → 上屏 commit → 设置新的预编辑
                 let p = std::mem::take(&mut s.ti_pending);
-                let Some(w) = s.win.upgrade() else { return };
+                let Some(w) = (if s.ti_on_panel { s.win.upgrade() } else { s.ti_top.and_then(|id| s.top_window(id)) }) else { return };
                 if let Some((before, after)) = p.delete {
                     if before > 0 || after > 0 {
                         log::debug!("text-input: delete_surrounding {before}/{after} (not applied)");
@@ -1126,7 +1660,9 @@ impl Dispatch2<ZwpTextInputV3, State> for TiData {
                 if let Some(t) = p.commit {
                     if !t.is_empty() {
                         w.ime_commit(t);
-                        crate::dock::note_typed();
+                        if s.ti_on_panel {
+                            crate::dock::note_typed();
+                        }
                     }
                 }
                 match p.preedit {

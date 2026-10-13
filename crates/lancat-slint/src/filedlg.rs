@@ -1,11 +1,57 @@
-//! 原生文件/文件夹选择（IFileOpenDialog，多选）。在独立 STA 线程里跑模态对话框，
+//! 原生文件/文件夹选择（多选）。Windows：IFileOpenDialog，在独立 STA 线程里跑模态对话框；
+//! Linux：GTK 的文件选择框（zenity，没有再试 kdialog / yad；旧版 Tauri 的对话框也是 GTK 的）。
 //! 结果回到 UI 线程（避免对话框的嵌套消息循环重入 Slint 事件处理）。
 
+#[cfg(windows)]
 use windows::core::{HSTRING, PCWSTR};
+#[cfg(windows)]
 use windows::Win32::System::Com::*;
+#[cfg(windows)]
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+#[cfg(windows)]
 use windows::Win32::UI::Shell::*;
 
+#[cfg(not(windows))]
+fn run(directory: bool, title: &str, filters: &[(String, String)]) -> Vec<String> {
+    use std::process::Command;
+    let lines = |o: std::process::Output| -> Option<Vec<String>> {
+        // 取消 = 退出码 1，返回空列表；程序不存在 = Err（试下一个）
+        Some(String::from_utf8_lossy(&o.stdout).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+    };
+    let mut z = Command::new("zenity");
+    z.args(["--file-selection", "--multiple", "--separator=\n", &format!("--title={title}")]);
+    if directory {
+        z.arg("--directory");
+    }
+    for (name, pat) in filters {
+        z.arg(format!("--file-filter={name} | {}", pat.replace(';', " ")));
+    }
+    if let Ok(o) = z.output() {
+        return lines(o).unwrap_or_default();
+    }
+    let mut k = Command::new("kdialog");
+    k.arg("--title").arg(title);
+    if directory {
+        k.args(["--getexistingdirectory", "."]);
+    } else {
+        k.args(["--getopenfilename", ".", "--multiple", "--separate-output"]);
+    }
+    if let Ok(o) = k.output() {
+        return lines(o).unwrap_or_default();
+    }
+    let mut y = Command::new("yad");
+    y.args(["--file", "--multiple", "--separator=\n", &format!("--title={title}")]);
+    if directory {
+        y.arg("--directory");
+    }
+    if let Ok(o) = y.output() {
+        return lines(o).unwrap_or_default();
+    }
+    log::warn!("no file chooser available (install zenity)");
+    Vec::new()
+}
+
+#[cfg(windows)]
 fn run(directory: bool, title: &str, filters: &[(String, String)]) -> Vec<String> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);

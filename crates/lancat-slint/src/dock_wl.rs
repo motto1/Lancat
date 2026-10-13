@@ -8,7 +8,9 @@
 //!   exclusive zone -1，不被状态栏挤开）；
 //! - 单实例：$XDG_RUNTIME_DIR 下按数据目录哈希命名的 unix socket，第二个进程把命令行写过去后退出。
 //!
-//! 尚未做（阶段 4）：消息 toast、拖放文件、拖动停靠条换边、托盘（StatusNotifierItem）。
+//! - 拖放（wl.rs 的 wl_data_device）：文件拖到停靠条 → 打开面板并显示拖放选择器；拖拽进行中不自动收起。
+//!
+//! 尚未做：消息 toast、拖动停靠条换边、托盘（StatusNotifierItem）。
 
 use std::cell::RefCell;
 use std::io::{Read, Write};
@@ -31,11 +33,12 @@ pub struct Hooks {
     pub composer: Box<dyn Fn() -> (bool, bool)>,
     pub on_open: Box<dyn Fn(&str)>,
     pub on_close: Box<dyn Fn()>,
-    #[allow(dead_code)]
     pub on_drag_hint: Box<dyn Fn(Option<usize>)>,
-    #[allow(dead_code)]
+    pub on_drag_over: Box<dyn Fn(f32, f32)>,
     pub on_drop: Box<dyn Fn(Vec<String>, Option<(f32, f32)>)>,
     pub on_settings: Box<dyn Fn()>,
+    #[allow(dead_code)]
+    pub on_pinned: Box<dyn Fn(bool)>,
 }
 
 struct Dock {
@@ -56,6 +59,11 @@ struct Dock {
     look: Option<StripLook>,
     listener: Option<UnixListener>,
     ipc_timer: slint::Timer,
+    /// 文件拖拽进行中（在停靠条或面板上）：不收起
+    dragging: bool,
+    drag_count: usize,
+    /// 拖出停靠条后没进面板：一会儿后结束这次拖拽
+    drag_timer: slint::Timer,
 }
 
 thread_local! {
@@ -95,13 +103,15 @@ fn compute(d: &Dock) -> Option<(Place, Place)> {
     let along_f = s.dock_offset.clamp(0.0, 1.0);
     let len = s.dock_length.clamp(40.0, 2000.0).min(if horizontal { mw } else { mh }).round();
     let span = if horizontal { mw } else { mh };
-    let (pw, ph) = (PANEL_W, PANEL_H);
+    // 面板窗口 = 面板 + 四周 8px 外框（旧版 Linux：MARGIN 8，窗口离边 STRIP + 2 − 8 = 0）
+    let fr = wl::FRAME as f64;
+    let (pw, ph) = (PANEL_W + 2.0 * fr, PANEL_H + 2.0 * fr);
     let pspan = if horizontal { pw } else { ph };
     let start = ((span - len) * along_f).round();
     let pstart = (start + len / 2.0 - pspan / 2.0).clamp(0.0, (span - pspan).max(0.0)).round();
     let (sw, sh) = if horizontal { (len as u32, STRIP as u32) } else { (STRIP as u32, len as u32) };
     let strip = Place { edge: edge.clone(), along: start as i32, inset: 0, w: sw, h: sh, output: idx };
-    let panel = Place { edge, along: pstart as i32, inset: (STRIP + 2.0) as i32, w: pw as u32, h: ph as u32, output: idx };
+    let panel = Place { edge, along: pstart as i32, inset: (STRIP + 2.0 - fr).max(0.0) as i32, w: pw as u32, h: ph as u32, output: idx };
     Some((strip, panel))
 }
 
@@ -126,6 +136,9 @@ pub fn init(node: Arc<Node>, hooks: Hooks) {
         look: None,
         listener: None,
         ipc_timer: Default::default(),
+        dragging: false,
+        drag_count: 0,
+        drag_timer: Default::default(),
     };
     DOCK.with(|x| *x.borrow_mut() = Some(d));
     ipc_listen();
@@ -183,6 +196,47 @@ pub fn note_typed() {
 
 pub fn set_pinned(p: bool) {
     with(|d| d.pinned = p);
+}
+
+/// 设置页的「显示器」下拉（输出的逻辑尺寸）
+pub fn monitor_labels() -> Vec<String> {
+    wl::outputs().iter().enumerate().map(|(i, &(w, h, _))| format!("显示器 {}（{w}×{h}）{}", i + 1, if i == 0 { " · 主" } else { "" })).collect()
+}
+
+/// 开机自启（XDG autostart 的 .desktop，与旧版 tauri-plugin-autostart 的 Linux 实现相同）
+pub mod tray {
+    fn path() -> Option<std::path::PathBuf> {
+        let base = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from).or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+        Some(base.join("autostart").join("Lancat.desktop"))
+    }
+
+    /// 隔离的测试实例（LANCAT_DATA_DIR）不碰开机自启
+    pub fn test_instance() -> bool {
+        std::env::var_os("LANCAT_DATA_DIR").is_some()
+    }
+
+    pub fn autostart_enabled() -> bool {
+        path().is_some_and(|p| p.exists())
+    }
+
+    pub fn set_autostart(on: bool) {
+        if test_instance() {
+            return;
+        }
+        let Some(p) = path() else { return };
+        if on {
+            let exe = std::env::current_exe().map(|e| e.display().to_string()).unwrap_or_else(|_| "lancat".into());
+            let body = format!("[Desktop Entry]\nType=Application\nVersion=1.0\nName=Lancat\nComment=Lancat startup script\nExec={exe} --autostart\nStartupNotify=false\nTerminal=false\n");
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Err(e) = std::fs::write(&p, body) {
+                log::warn!("autostart: {e}");
+            }
+        } else {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -317,6 +371,77 @@ pub fn wl_panel_press(down: bool) {
 
 pub fn wl_panel_keyboard(_focused: bool) {}
 
+// ---- 拖放（与 Windows 版 dock::on_drag 同一套语义）
+
+pub fn wl_drag_enter(panel: bool, x: f32, y: f32) {
+    let n = with(|d| {
+        d.dragging = true;
+        d.drag_timer.stop();
+        d.drag_count
+    })
+    .unwrap_or(0);
+    if !panel {
+        // 文件碰到停靠条：立刻打开（旧版 open_panel("drag")）
+        open_panel("drag");
+    }
+    hook(|h| (h.on_drag_hint)(Some(n)));
+    if panel {
+        hook(|h| (h.on_drag_over)(x, y));
+    }
+}
+
+/// 预读到的项数（「拖到头像上发送 N 项」）
+pub fn wl_drag_count(n: usize) {
+    let on = with(|d| {
+        d.drag_count = n;
+        d.dragging
+    })
+    .unwrap_or(false);
+    if on {
+        hook(|h| (h.on_drag_hint)(Some(n)));
+    }
+}
+
+pub fn wl_drag_motion(x: f32, y: f32) {
+    hook(|h| (h.on_drag_over)(x, y));
+}
+
+fn end_drag() {
+    with(|d| {
+        d.dragging = false;
+        d.drag_count = 0;
+        d.drag_timer.stop();
+    });
+    hook(|h| (h.on_drag_hint)(None));
+    schedule_leave();
+}
+
+pub fn wl_drag_leave(panel: bool) {
+    if panel {
+        end_drag();
+    } else {
+        // 从停靠条拖向正在弹出的面板：给 1.2 s 进入面板，否则算拖走了
+        with(|d| d.drag_timer.start(slint::TimerMode::SingleShot, Duration::from_millis(1200), end_drag));
+    }
+}
+
+pub fn wl_drop(panel: bool, files: Vec<String>, pos: Option<(f32, f32)>) {
+    with(|d| {
+        d.dragging = false;
+        d.drag_count = 0;
+        d.drag_timer.stop();
+    });
+    hook(|h| (h.on_drag_hint)(None));
+    if files.is_empty() {
+        schedule_leave();
+        return;
+    }
+    if !panel {
+        open_panel("drag");
+    }
+    hook(move |h| (h.on_drop)(files, pos));
+}
+
 fn schedule_leave() {
     let delay = with(|d| {
         if !d.visible || d.panel_in || d.strip_in || !d.entered {
@@ -337,7 +462,7 @@ fn leave_check() {
         }
         let (focused, draft) = (d.hooks.composer)();
         let typed = d.last_typed.is_some_and(|t| t.elapsed() < TYPED_HOLD);
-        Some(d.pinned || (focused && (draft || typed)) || d.pressed)
+        Some(d.pinned || (focused && (draft || typed)) || d.pressed || d.dragging)
     })
     .flatten();
     match hold {
@@ -400,6 +525,13 @@ fn ipc_poll() {
 
 pub fn handle_args(args: &[String], second: bool) {
     let has = |f: &str| args.iter().any(|a| a == f);
+    // 测试：--script "cmd|peer|arg"（转给正在运行的实例，同 LANCAT_SLINT_SCRIPT 的一步）
+    if let Some(i) = args.iter().position(|a| a == "--script") {
+        if let Some(step) = args.get(i + 1) {
+            crate::script_step(step);
+        }
+        return;
+    }
     if has("--settings") {
         hook(|h| (h.on_settings)());
     } else if has("--hide-panel") {

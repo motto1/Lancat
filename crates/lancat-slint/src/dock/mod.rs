@@ -812,6 +812,13 @@ fn ipc_window() {
 /// `--open-panel`：打开（不抢焦点）；`--hide-panel`：收起；`--settings`：设置；第二次无参数启动：打开并拿焦点。
 pub fn handle_args(args: &[String], second: bool) {
     let has = |f: &str| args.iter().any(|a| a == f);
+    // 测试：--script "cmd|peer|arg"（转给正在运行的实例，同 LANCAT_SLINT_SCRIPT 的一步）
+    if let Some(i) = args.iter().position(|a| a == "--script") {
+        if let Some(step) = args.get(i + 1) {
+            crate::script_step(step);
+        }
+        return;
+    }
     if has("--settings") {
         hook(|h| (h.on_settings)());
     } else if has("--hide-panel") {
