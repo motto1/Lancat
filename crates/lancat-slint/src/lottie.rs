@@ -41,6 +41,14 @@ extern "C" {
 // 链接 thorvg-sys 编出的静态库
 use thorvg_sys as _;
 
+/// ThorVG 的软件渲染器有进程级共享状态（内存池按调度线程号取槽，engine_init(0) 时所有调用方都落在同一槽），
+/// 不能从多个线程同时用：海报线程、悬停线程、UI 线程（聊天贴纸）都要先拿这把锁。
+static TVG: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn tvg_lock() -> std::sync::MutexGuard<'static, ()> {
+    TVG.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn init() {
     static INIT: Once = Once::new();
     INIT.call_once(|| unsafe {
@@ -62,6 +70,7 @@ impl Player {
     pub fn new(json: &str, px: u32) -> Option<Player> {
         init();
         let px = px.max(8);
+        let _g = tvg_lock();
         unsafe {
             let anim = tvg_animation_new();
             if anim.is_null() {
@@ -110,6 +119,7 @@ impl Player {
     }
 
     fn draw(&mut self, frame: f32) {
+        let _g = tvg_lock();
         unsafe {
             tvg_animation_set_frame(self.anim, frame.clamp(0.0, (self.total - 1.0).max(0.0)));
             self.buf.fill(0);
@@ -142,6 +152,7 @@ impl Player {
 
 impl Drop for Player {
     fn drop(&mut self) {
+        let _g = tvg_lock();
         unsafe {
             tvg_canvas_destroy(self.canvas);
             tvg_animation_del(self.anim);
