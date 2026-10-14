@@ -147,7 +147,19 @@ pub fn remove() {
 }
 
 /// 托盘气泡通知（Win10/11 显示为系统通知）；点它打开「权限与诊断」。
+thread_local! {
+    /// 最近一个气泡是不是新版本提醒（点气泡打开「更新」而不是「权限与诊断」）
+    static BALLOON_UPDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 新版本提醒气泡：点它打开设置的「更新」。
+pub fn balloon_update(title: &str, text: &str) {
+    balloon(title, text);
+    BALLOON_UPDATE.with(|b| b.set(true));
+}
+
 pub fn balloon(title: &str, text: &str) {
+    BALLOON_UPDATE.with(|b| b.set(false));
     let Some(h) = hwnd() else { return };
     let mut n = nid(h);
     n.uFlags = NIF_INFO;
@@ -285,7 +297,13 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 slint::Timer::single_shot(std::time::Duration::ZERO, super::toggle_panel);
             }
             WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(h),
-            NIN_BALLOONUSERCLICK => slint::Timer::single_shot(std::time::Duration::ZERO, || crate::open_settings(true)),
+            NIN_BALLOONUSERCLICK => {
+                if BALLOON_UPDATE.with(|b| b.get()) {
+                    slint::Timer::single_shot(std::time::Duration::ZERO, crate::open_settings_update)
+                } else {
+                    slint::Timer::single_shot(std::time::Duration::ZERO, || crate::open_settings(true))
+                }
+            }
             _ => {}
         }
         return LRESULT(0);

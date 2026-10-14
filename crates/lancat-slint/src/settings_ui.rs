@@ -38,7 +38,7 @@ impl SettingsCtl {
         win.set_me_name(me.name.clone().into());
         win.set_me_id(me.id.clone().into());
         win.set_me_port(node.port().to_string().into());
-        win.set_me_ver(me.ver.clone().into());
+        win.set_me_ver(crate::update::VERSION.into());
         win.set_me_os(os_glyph(&me.os).into());
         win.set_emoji_count(crate::emoji_catalog::EMOJI.len() as i32);
         let n = crate::emoji_catalog::EMOJI.len();
@@ -70,6 +70,7 @@ impl SettingsCtl {
         let s = self.node.settings();
         self.load(&s, true);
         self.peers_changed(peers);
+        self.load_update();
         self.win.set_autostart(crate::dock::tray::autostart_enabled());
         self.win.set_autostart_enabled(!crate::dock::tray::test_instance());
         let mons: Vec<SharedString> = crate::dock::monitor_labels().into_iter().map(Into::into).collect();
@@ -91,6 +92,12 @@ impl SettingsCtl {
                 }
             });
         }
+    }
+
+    fn load_update(&self) {
+        let st = crate::update::status();
+        self.win.set_upd_state(st.state.into());
+        self.win.set_upd_text(st.text.into());
     }
 
     pub fn is_open(&self) -> bool {
@@ -127,6 +134,7 @@ impl SettingsCtl {
         w.set_dock_edge(s.dock_edge.clone().into());
         w.set_dock_monitor(s.dock_monitor as i32);
         w.set_theme(s.theme.clone().into());
+        w.set_auto_update(s.auto_update);
         let dir = self.node.receive_dir().display().to_string();
         w.set_recv_dir(dir.clone().into());
         w.set_recv_dir_shown(rtl_shown(&dir).into());
@@ -277,6 +285,26 @@ impl SettingsCtl {
 }
 
 /// scrollIntoView({ behavior: "smooth", block: "start" })（scroll-margin-top 12）+ 区块闪烁 1.4 s
+/// 更新状态变了（检查 / 下载 / 出错）：设置窗口开着就刷新。
+pub fn update_status_changed() {
+    ctl(|sc| sc.load_update());
+}
+
+/// 滚到「更新」（设置页最底下两节之一）。
+pub fn goto_update() {
+    ctl(|sc| {
+        let win = &sc.win;
+        let max = (win.get_content_h() - win.get_view_h()).max(0.0);
+        let from = win.get_scroll_y();
+        let w = win.as_weak();
+        crate::smooth_scroll("settings", from, -max, move |v| {
+            if let Some(win) = w.upgrade() {
+                win.set_scroll_y(v);
+            }
+        });
+    });
+}
+
 fn goto_diag_section(win: &SettingsWindow) {
     let y = win.get_diag_y();
     let max = (win.get_content_h() - win.get_view_h()).max(0.0);
@@ -393,6 +421,10 @@ fn wire(w: &SettingsWindow) {
         });
     });
     w.on_recheck(|| ctl(|sc| sc.recheck()));
+    w.on_check_update(|| crate::update::check_bg(true));
+    w.on_do_update(crate::update::install_bg);
+    w.on_open_release(crate::update::open_release_page);
+    w.on_toggle_auto_update(|| ctl(|sc| sc.update(|s| s.auto_update = !s.auto_update)));
     w.on_run_fix(|id, dry| {
         ctl(move |sc| sc.run_fix(id.to_string(), dry));
     });

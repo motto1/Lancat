@@ -523,6 +523,33 @@ pub fn on_diag_alert(title: &str, detail: &str) {
     }
 }
 
+/// 新版本提醒的 toast 标识：点它打开设置的「更新」。
+pub const UPDATE_TOAST: &str = "__update__";
+
+/// 发现新版本：面板关着时停靠条鼓出提醒（Windows 另弹托盘气泡）。
+pub fn on_update_alert(title: &str) {
+    let spec = with(|d| -> Result<toast::ToastSpec, &'static str> {
+        if d.visible {
+            return Err("panel open");
+        }
+        if d.mv.is_some() {
+            return Err("dock being dragged");
+        }
+        let geo = d.geo.ok_or("no dock geometry yet")?;
+        let dark = crate::theme_is_dark(&d.node.settings().theme);
+        Ok(toast::ToastSpec { peer_id: UPDATE_TOAST.into(), name: "Lancat".into(), text: format!("{title}，点此更新"), edge: current_edge(d), strip: geo.dock, scale: geo.scale, dark, hold_ms: 9000 })
+    });
+    match spec {
+        Some(Ok(spec)) => {
+            log::info!("update alert toast: {title}");
+            toast::show(spec);
+            tray::balloon_update(title, "点此打开 Lancat 设置，一键更新到新版本");
+        }
+        Some(Err(why)) => log::info!("update alert toast not shown: {why}"),
+        None => {}
+    }
+}
+
 /// 拖放（drop.rs 已离开 COM 调用）。
 pub fn on_drag(ev: DragEvent) {
     match ev {

@@ -29,6 +29,7 @@ mod fx;
 mod icons;
 mod lottie;
 mod settings_ui;
+mod update;
 #[cfg(windows)]
 mod win;
 #[cfg(target_os = "linux")]
@@ -1064,6 +1065,11 @@ impl App {
     /// 停靠打开面板：从 toast 打开时切到发消息的那个会话。
     #[allow(dead_code)]
     fn on_dock_open(&mut self, reason: &str) {
+        if reason == format!("toast:{}", dock::UPDATE_TOAST) {
+            self.set_visible(true);
+            slint::Timer::single_shot(std::time::Duration::ZERO, open_settings_update);
+            return;
+        }
         if reason == format!("toast:{}", dock::DIAG_TOAST) {
             self.set_visible(true);
             slint::Timer::single_shot(std::time::Duration::ZERO, || open_settings(true));
@@ -1316,6 +1322,12 @@ fn reveal(path: &str) {
         let dir = std::path::Path::new(path).parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
     }
+}
+
+/// 打开设置并滚到「更新」（新版本提醒的 toast / 托盘气泡点进来）。
+pub(crate) fn open_settings_update() {
+    open_settings(false);
+    slint::Timer::single_shot(Duration::from_millis(80), settings_ui::goto_update);
 }
 
 pub(crate) fn open_settings(goto_diag: bool) {
@@ -1576,6 +1588,9 @@ fn main() {
     let _ = t0();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,zbus=warn,tracing=warn")).init();
 
+    // 刚一键更新完（--wait-pid）：等旧版退出、释放单实例锁和端口后再继续；顺便清理旧程序文件
+    update::early_start();
+
     // 单实例：已有实例（同一数据目录）在跑就把命令行转给它然后退出
     #[cfg(windows)]
     if win::dock_mode() && dock::forward_to_running() {
@@ -1666,6 +1681,7 @@ fn main() {
         }
     });
     wire_ui(&ui);
+    update::start_auto(node.clone());
     if !dock_mode() {
         slint::Timer::single_shot(Duration::from_millis(1500), || {
             with_app(|app| app.emoji.prewarm());

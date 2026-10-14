@@ -767,6 +767,14 @@ export component SettingsWindow inherits Window {
     in property <[string]> manual-peers;
     // 通用
     in property <bool> autostart;
+    // 更新："idle" | "checking" | "latest" | "available" | "downloading" | "error"
+    in property <string> upd-state;
+    in property <string> upd-text;
+    in property <bool> auto-update: true;
+    callback check-update();
+    callback do-update();
+    callback open-release();
+    callback toggle-auto-update();
     in property <bool> autostart-enabled: true;
     in property <string> theme: "system";
     in property <bool> confirm-clear;
@@ -1100,6 +1108,33 @@ export component SettingsWindow inherits Window {
                     label: "聊天记录永久保存在本机";
                     last: true;
                     VerticalLayout { alignment: center; Btn { text: root.confirm-clear ? "再点一次确认清空" : "清空全部聊天记录"; danger: true; clicked => { root.clear-all(); } } }
+                }
+            }
+            Section {
+                title: "更新";
+                Row {
+                    label: root.upd-text;
+                    if root.upd-state == "available": VerticalLayout { alignment: center; Btn { text: "更新说明"; clicked => { root.open-release(); } } }
+                    VerticalLayout {
+                        alignment: center;
+                        Btn {
+                            text: root.upd-state == "available" ? "立即更新" : root.upd-state == "checking" ? "检查中…" : root.upd-state == "downloading" ? "正在更新…" : "检查更新";
+                            primary: root.upd-state == "available";
+                            enabled: root.upd-state != "checking" && root.upd-state != "downloading";
+                            clicked => {
+                                if root.upd-state == "available" {
+                                    root.do-update();
+                                } else {
+                                    root.check-update();
+                                }
+                            }
+                        }
+                    }
+                }
+                Row {
+                    label: "自动检查更新（每 6 小时，有新版本时提醒）";
+                    last: true;
+                    VerticalLayout { alignment: center; Switch { on: root.auto-update; toggled => { root.toggle-auto-update(); } } }
                 }
             }
             Section {

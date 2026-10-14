@@ -47,6 +47,11 @@ jobs:
         shell: bash
         run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> "$GITHUB_ENV"
 
+      - name: 版本号（标签 v1.2.3 → 1.2.3，程序据此判断有没有新版）
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: echo "LANCAT_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
       - name: 编译（release）
         working-directory: crates/lancat-slint
         run: cargo build --release --locked
@@ -61,6 +66,9 @@ jobs:
           cp "crates/lancat-slint/target/release/${{ matrix.bin }}" "dist/$out/"
           cp README.md "dist/$out/"
           cp src/assets/emoji/LICENSE.md "dist/$out/LICENSE-noto-animated-emoji.md"
+          # 一键更新下载的单文件
+          ext=""; [[ "$RUNNER_OS" == Windows ]] && ext=".exe"
+          cp "crates/lancat-slint/target/release/${{ matrix.bin }}" "dist/lancat-slint-${{ matrix.name }}$ext"
           cd dist
           if [[ "$RUNNER_OS" == Windows ]]; then
             7z a -tzip "$out.zip" "$out" >/dev/null
@@ -84,6 +92,8 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: 校验和
+        run: cd dist && sha256sum lancat-slint-* > SHA256SUMS && cat SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*

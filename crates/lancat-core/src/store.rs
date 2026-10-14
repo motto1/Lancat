@@ -88,6 +88,8 @@ pub struct Settings {
     /// Per-adapter override of the automatic physical/virtual classification:
     /// adapter name -> "lan" | "virtual" (missing = automatic).
     pub iface_kinds: std::collections::BTreeMap<String, String>,
+    /// Check GitHub Releases for a newer version in the background and offer it.
+    pub auto_update: bool,
 }
 
 impl Default for Settings {
@@ -108,6 +110,7 @@ impl Default for Settings {
             recent_emoji: vec![],
             panel_keep_alive_s: 60,
             iface_kinds: Default::default(),
+            auto_update: true,
         }
     }
 }

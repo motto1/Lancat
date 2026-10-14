@@ -1,6 +1,6 @@
 [package]
 name = "lancat-slint"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Motto"]
 license = "MIT"
@@ -22,6 +22,8 @@ dirs = "7"
 # Lottie 表情：ThorVG（源码编译，CPU 光栅；bindgen 需要 libclang，Windows 在 C:\Program Files\LLVM）
 thorvg-sys = { version = "=0.3.2", default-features = false, features = ["vendored", "lottie"] }
 flate2 = "1"
+# 一键更新：校验下载的新版（发布里的 SHA256SUMS）
+sha2 = { version = "0.10", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

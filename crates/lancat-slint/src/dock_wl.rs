@@ -516,6 +516,37 @@ pub fn on_diag_alert(title: &str, _detail: &str) {
     }
 }
 
+/// 新版本提醒的 toast 标识：点它打开设置的「更新」。
+pub const UPDATE_TOAST: &str = "__update__";
+
+/// 发现新版本：面板关着时停靠条鼓出提醒（Windows 另弹托盘气泡）。
+pub fn on_update_alert(title: &str) {
+    let spec = with(|d| -> Result<crate::toast_wl::ToastSpec, &'static str> {
+        if d.visible {
+            return Err("panel open");
+        }
+        let (strip, _) = compute(d).ok_or("no dock geometry yet")?;
+        let &(mw, mh, _) = wl::outputs().get(strip.output).ok_or("no output")?;
+        let (w, h, a) = (strip.w as f64, strip.h as f64, strip.along as f64);
+        let rect = match strip.edge.as_str() {
+            "left" => (0.0, a, w, h),
+            "top" => (a, 0.0, w, h),
+            "bottom" => (a, mh as f64 - h, w, h),
+            _ => (mw as f64 - w, a, w, h),
+        };
+        let dark = crate::theme_is_dark(&d.node.settings().theme);
+        Ok(crate::toast_wl::ToastSpec { peer_id: UPDATE_TOAST.into(), name: "Lancat".into(), text: format!("{title}，点此更新"), edge: strip.edge.clone(), strip: rect, output: strip.output, dark, hold_ms: 9000 })
+    });
+    match spec {
+        Some(Ok(spec)) => {
+            log::info!("update alert toast: {title}");
+            crate::toast_wl::show(spec);
+        }
+        Some(Err(why)) => log::info!("update alert toast not shown: {why}"),
+        None => {}
+    }
+}
+
 /// 拖动停靠条换边：旧版在 Wayland 上拿不到全局光标（cursor_position 出错），按下停靠条只是打开面板、
 /// 按下顶栏什么也不做；这里相同，只把 toast 收起（旧版 begin_move 第一件事）。
 pub fn begin_move(_from_strip: bool) {
