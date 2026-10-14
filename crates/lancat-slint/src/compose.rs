@@ -319,6 +319,13 @@ fn render_inner(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usiz
     // 「变得不可见」的焦点项（输入框、表情搜索框）夺走焦点（toast 的背景模糊会让合成持续 2.6 s）。
     // 由此引起的重绘请求由调用方丢掉（Out::Full 之后清 needs_redraw）。
     fx.set_pass(0);
+    // 重新武装渲染器的属性跟踪：上面的 set_pass(0) 让 redraw_tracker 变脏并请求了一次重画（调用方会丢掉它），
+    // 跟踪器此后不再通知任何变化 —— 关面板、换图、hover 动画都不会自己要帧，界面停在最后一帧直到别的事件。
+    // 在 pass 0 下跑一遍只建场景、不光栅化的逐行渲染（不调用 render_fn），依赖重新登记为「全部可见」的完整集合。
+    let t0 = Instant::now();
+    renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
+    renderer.render_by_line(Rearm);
+    phase("rearm", t0);
     if reused {
         renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
     }
@@ -328,6 +335,14 @@ fn render_inner(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usiz
         ui.window().request_redraw();
     }
     Out::Full
+}
+
+/// 只为让渲染器求值场景（重新登记属性依赖）：每行都不调用 render_fn，零光栅化
+struct Rearm;
+
+impl slint::platform::software_renderer::LineBufferProvider for Rearm {
+    type TargetPixel = Bgra;
+    fn process_line(&mut self, _line: usize, _range: core::ops::Range<usize>, _render_fn: impl FnOnce(&mut [Bgra])) {}
 }
 
 fn region_box(r: &slint::platform::software_renderer::PhysicalRegion) -> Option<(i32, i32, u32, u32)> {
