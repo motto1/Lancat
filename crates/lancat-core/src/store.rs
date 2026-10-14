@@ -85,6 +85,9 @@ pub struct Settings {
     /// Seconds a collapsed chat panel (its WebView) is kept alive before it is destroyed to free
     /// memory; 0 = keep it resident (instant re-open, ~100 MB more on Linux).
     pub panel_keep_alive_s: u64,
+    /// Per-adapter override of the automatic physical/virtual classification:
+    /// adapter name -> "lan" | "virtual" (missing = automatic).
+    pub iface_kinds: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -104,6 +107,7 @@ impl Default for Settings {
             theme: "system".into(),
             recent_emoji: vec![],
             panel_keep_alive_s: 60,
+            iface_kinds: Default::default(),
         }
     }
 }

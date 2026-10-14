@@ -476,7 +476,7 @@ impl Node {
     /// on: addresses it was heard on (newest first), then our online Tailscale peers.
     async fn alt_base(&self, peer_id: &str, first: IpAddr, port: u16) -> Option<String> {
         let mut cands: Vec<(IpAddr, u16)> = self.peer_dial_addrs(peer_id).into_iter().filter(|(ip, _)| *ip != first).collect();
-        for ip in netutil::tailscale_peers().await.into_iter().take(32) {
+        for ip in netutil::overlay_peers().await.into_iter().take(32) {
             let ip = IpAddr::V4(ip);
             if ip != first && !cands.iter().any(|(c, _)| *c == ip) {
                 cands.push((ip, port));

@@ -22,7 +22,6 @@ use axum::{Json, Router};
 
 use crate::events::CoreEvent;
 use crate::files::IncomingTransfer;
-use crate::netutil;
 use crate::node::Node;
 use crate::protocol::*;
 use crate::store::FileBody;
@@ -70,7 +69,7 @@ pub(crate) fn spawn(node: Arc<Node>, listener: tokio::net::TcpListener) {
 /// Rejects non-LAN sources and blacklisted devices / addresses.
 async fn guard(State(node): St, ConnectInfo(addr): ConnectInfo<SocketAddr>, req: Request, next: Next) -> Response {
     let ip = addr.ip();
-    if !netutil::is_private(&ip) {
+    if !node.is_trusted_source(&ip) {
         return (StatusCode::FORBIDDEN, "lan only").into_response();
     }
     if node.is_blocked_addr(&ip) {

@@ -206,6 +206,7 @@ impl Node {
         }
         crate::protocol::seed_msg_stamp(store.max_message_ts());
         store.mark_interrupted().ok();
+        netutil::set_iface_overrides(&store.settings().iface_kinds);
 
         let id = match store.kv_get("device_id")? {
             Some(id) => id,
@@ -348,6 +349,10 @@ impl Node {
     pub fn set_settings(&self, s: Settings) -> Result<Settings> {
         let old = self.store.settings();
         self.store.save_settings(&s)?;
+        if s.iface_kinds != old.iface_kinds {
+            netutil::set_iface_overrides(&s.iface_kinds);
+            self.kick_probe("adapter classification changed");
+        }
         if s.device_name != old.device_name && self.cfg.name_override.is_none() {
             let name = if s.device_name.trim().is_empty() { netutil::host_name() } else { s.device_name.trim().to_string() };
             self.me.write().unwrap().name = name;
@@ -795,8 +800,11 @@ impl Node {
             Ok(sa) => sa,
             Err(_) => SocketAddr::new(addr.parse::<IpAddr>().map_err(|_| anyhow!("无效地址: {addr}"))?, DEFAULT_PORT),
         };
-        if !netutil::is_private(&sa.ip()) {
-            bail!("只允许局域网地址");
+        // Any address the user typed is allowed (KDE Connect's rule for custom devices): it may
+        // be an overlay on a public block (Hamachi 25.x) or a routed subnet. From then on its
+        // inbound connections are trusted too (`is_manual_ip`).
+        if sa.ip().is_unspecified() || sa.ip().is_multicast() {
+            bail!("无效地址: {addr}");
         }
         let resp = self
             .http
@@ -838,6 +846,19 @@ impl Node {
         self.links.lock().unwrap().remove(id);
         self.emit(CoreEvent::PeerRemoved { peer_id: id.into() });
         Ok(())
+    }
+
+    /// Addresses the user added by hand: trusted like a LAN source wherever they are.
+    pub(crate) fn is_manual_ip(&self, ip: &IpAddr) -> bool {
+        self.store.settings().manual_peers.iter().any(|a| {
+            let a = a.trim();
+            a.parse::<SocketAddr>().map(|s| s.ip()).or_else(|_| a.parse::<IpAddr>()).is_ok_and(|m| m == *ip)
+        })
+    }
+
+    /// Inbound / gossip gate: private ranges, our overlays' subnets, or an address the user added.
+    pub(crate) fn is_trusted_source(&self, ip: &IpAddr) -> bool {
+        netutil::is_trusted_source(ip) || self.is_manual_ip(ip)
     }
 
     pub(crate) fn is_blocked_addr(&self, ip: &IpAddr) -> bool {
@@ -1183,26 +1204,16 @@ impl Node {
     }
 }
 
-/// Path preference when a peer answers on several addresses: LAN < overlay (CGNAT, Tailscale).
-/// `ip` lies in the subnet of one of our physical network interfaces (not Tailscale, VMs,
-/// containers or VPNs).
+/// `ip` lies in the subnet of one of our physical network interfaces (not an overlay, VPN, VM or
+/// container adapter: classified from the OS's own adapter flags, see `netutil`).
 fn on_physical_lan(ip: &IpAddr) -> bool {
-    let IpAddr::V4(v4) = ip else { return false };
-    netutil::probe_ifaces().iter().any(|i| {
-        if i.is_tailscale() || netutil::is_virtual_iface(&i.name) || i.prefix == 0 || i.prefix >= 31 {
-            return false;
-        }
-        let mask = u32::MAX << (32 - i.prefix as u32);
-        u32::from(*v4) & mask == u32::from(i.ip) & mask
-    })
+    netutil::path_rank(ip) == 0
 }
 
+/// Path preference when a peer answers on several addresses: physical LAN < routed IPv4 <
+/// overlay / VPN < IPv6.
 fn addr_rank(ip: &IpAddr) -> u8 {
-    match ip {
-        IpAddr::V4(v4) if netutil::is_cgnat(v4) => 1,
-        IpAddr::V4(_) => 0,
-        IpAddr::V6(_) => 2,
-    }
+    netutil::path_rank(ip)
 }
 
 pub(crate) fn fmt_sa(sa: &SocketAddr) -> String {

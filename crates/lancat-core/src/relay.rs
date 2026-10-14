@@ -190,7 +190,7 @@ impl Node {
         }
         let port = h.device.port;
         let me = self.me().id;
-        let cands: Vec<IpAddr> = h.addrs.iter().filter_map(|a| a.parse::<IpAddr>().ok()).filter(|ip| crate::netutil::is_private(ip)).take(8).collect();
+        let cands: Vec<IpAddr> = h.addrs.iter().filter_map(|a| a.parse::<IpAddr>().ok()).filter(|ip| self.is_trusted_source(ip)).take(8).collect();
         let tries = cands.iter().map(|ip| {
             let url = format!("http://{}/info", fmt_sa(&SocketAddr::new(*ip, port)));
             let req = self.http.get(url).header(HEADER_DEVICE_ID, me.clone()).timeout(Duration::from_secs(2)).send();

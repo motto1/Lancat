@@ -10,7 +10,8 @@
 //!
 //! Each round probes every private IPv4 interface, virtual LANs included: the directed broadcast
 //! of each broadcast-capable interface, plus unicast to every online Tailscale peer
-//! (`tailscale status --json`), to the last-known address of every remembered device and to
+//! and EasyTier / NetBird (their CLIs), a unicast /24 sweep of layer-3 overlays nobody answered
+//! on, to the last-known address of every remembered device and to
 //! manual peers. A receiver adds the prober and answers by unicast with its own device info,
 //! so one exchange teaches both sides about each other. Liveness afterwards is the per-peer
 //! WebSocket link (ping every 30 s, see `link.rs`), not broadcast silence.
@@ -41,9 +42,10 @@ pub(crate) fn start(node: Arc<Node>) {
             Ok(daemon) => {
                 // mDNS only on physical LANs: overlay VPNs (Tailscale, WireGuard ...) carry no
                 // multicast and container bridges have nobody to find; UDP probing covers those.
+                let virt: Vec<String> = netutil::probe_ifaces().into_iter().filter(|i| i.virt).map(|i| i.name).collect();
                 if let Ok(list) = if_addrs::get_if_addrs() {
                     for i in list {
-                        if netutil::is_virtual_iface(&i.name) {
+                        if netutil::is_virtual_iface(&i.name) || virt.contains(&i.name) {
                             let _ = daemon.disable_interface(IfKind::Name(i.name.clone()));
                         }
                     }
@@ -145,7 +147,7 @@ fn browse(node: Arc<Node>) {
                     continue;
                 }
                 // prefer a private IPv4 address
-                let mut addrs: Vec<IpAddr> = svc.get_addresses().iter().map(|a| a.to_ip_addr()).filter(netutil::is_private).collect();
+                let mut addrs: Vec<IpAddr> = svc.get_addresses().iter().map(|a| a.to_ip_addr()).filter(|ip| node.is_trusted_source(ip)).collect();
                 addrs.sort_by_key(|a| (!a.is_ipv4(), a.is_loopback()));
                 if let Some(ip) = addrs.first() {
                     if !node.is_blocked_addr(ip) {
@@ -191,8 +193,8 @@ async fn probe_loop(node: Arc<Node>, sock: Arc<tokio::net::UdpSocket>) {
         tokio::select! {
             _ = tokio::time::sleep_until(ts_next), if burst.is_none() => {
                 ts_next = tokio::time::Instant::now() + Duration::from_secs(TS_RELIST_SECS);
-                if netutil::probe_ifaces().iter().any(|i| i.is_tailscale()) {
-                    let now = netutil::tailscale_peers().await;
+                if netutil::probe_ifaces().iter().any(|i| i.virt && i.l3) {
+                    let now = netutil::overlay_peers().await;
                     if now.iter().any(|ip| !ts_cache.contains(ip)) {
                         log::info!("tailnet has new peers {:?}: probing", now.iter().filter(|ip| !ts_cache.contains(ip)).collect::<Vec<_>>());
                         burst = Some((tokio::time::Instant::now(), 0));
@@ -213,6 +215,10 @@ async fn probe_loop(node: Arc<Node>, sock: Arc<tokio::net::UdpSocket>) {
         match burst {
             Some((t0, i)) => {
                 probe_round(&node, &sock, i == 0, &mut ts_cache).await;
+                if i == 1 {
+                    // grace over (LocalSend waits 1 s too): sweep layer-3 overlays nobody answered on
+                    sweep_round(&node, &sock).await;
+                }
                 burst = if i + 1 < PROBE_BURST_SECS.len() { Some((t0, i + 1)) } else { None };
                 idle_next = tokio::time::Instant::now() + Duration::from_secs(IDLE_PROBE_SECS);
             }
@@ -231,6 +237,7 @@ async fn probe_loop(node: Arc<Node>, sock: Arc<tokio::net::UdpSocket>) {
 #[derive(Debug, Default)]
 pub(crate) struct ProbeTargets {
     pub broadcast: BTreeSet<Ipv4Addr>,
+    /// Peers listed by overlay CLIs (Tailscale, EasyTier, NetBird).
     pub tailscale: BTreeSet<Ipv4Addr>,
     pub known: BTreeSet<SocketAddr>,
 }
@@ -256,9 +263,9 @@ async fn probe_round(node: &Arc<Node>, sock: &tokio::net::UdpSocket, first: bool
     if ifaces.iter().any(|i| i.broadcast.is_some()) {
         t.broadcast.insert(Ipv4Addr::BROADCAST);
     }
-    // point-to-point overlays: enumerate peers. Only Tailscale exposes a peer list without root.
+    // point-to-point overlays: ask their CLIs for the peer list (Tailscale, EasyTier, NetBird)
     if first {
-        *ts_cache = if ifaces.iter().any(|i| i.is_tailscale()) { netutil::tailscale_peers().await } else { vec![] };
+        *ts_cache = if ifaces.iter().any(|i| i.virt && i.l3) { netutil::overlay_peers().await } else { vec![] };
     }
     let mine: BTreeSet<Ipv4Addr> = ifaces.iter().map(|i| i.ip).collect();
     t.tailscale.extend(ts_cache.iter().filter(|ip| !mine.contains(ip)));
@@ -268,7 +275,7 @@ async fn probe_round(node: &Arc<Node>, sock: &tokio::net::UdpSocket, first: bool
             continue;
         }
         if let Ok(IpAddr::V4(ip)) = d.last_addr.parse::<IpAddr>() {
-            if netutil::is_private(&IpAddr::V4(ip)) && !ip.is_loopback() && !mine.contains(&ip) {
+            if node.is_trusted_source(&IpAddr::V4(ip)) && !ip.is_loopback() && !mine.contains(&ip) {
                 t.known.insert(SocketAddr::from((ip, port)));
             }
         }
@@ -283,9 +290,9 @@ async fn probe_round(node: &Arc<Node>, sock: &tokio::net::UdpSocket, first: bool
     t.known.extend(node.cfg.extra_probe_targets.iter().copied());
 
     if first {
-        let ifs: Vec<String> = ifaces.iter().map(|i| format!("{}={}/{}", i.name, i.ip, i.prefix)).collect();
+        let ifs: Vec<String> = ifaces.iter().map(|i| format!("{}={}/{}{}", i.name, i.ip, i.prefix, if i.l3 { "(vpn-l3)" } else if i.virt { "(vpn)" } else { "" })).collect();
         log::info!(
-            "probe: ifaces [{}] broadcast {:?} tailscale-unicast {:?} last-known/manual {:?}",
+            "probe: ifaces [{}] broadcast {:?} overlay-unicast {:?} last-known/manual {:?}",
             ifs.join(" "),
             t.broadcast,
             t.tailscale,
@@ -306,6 +313,32 @@ async fn probe_round(node: &Arc<Node>, sock: &tokio::net::UdpSocket, first: bool
         if let Err(e) = sock.send_to(&payload, to).await {
             log::debug!("probe to {to}: {e}");
         }
+    }
+}
+
+/// Unicast sweep of small (/24 or narrower) layer-3 overlay subnets that broadcast cannot reach
+/// and where nobody is online yet: WireGuard, EasyTier TUN, Nebula, OpenVPN tun. Mirrors
+/// LocalSend's fallback (only after the grace period, /24 at most, 50 in flight); here it is one
+/// small UDP datagram per host, paced 50 per 20 ms, once per probe burst.
+async fn sweep_round(node: &Arc<Node>, sock: &tokio::net::UdpSocket) {
+    let online: Vec<IpAddr> = node.peers.read().unwrap().values().filter(|p| p.online).map(|p| p.addr).collect();
+    let hosts: Vec<Ipv4Addr> = netutil::probe_ifaces()
+        .iter()
+        .filter(|i| i.virt && i.l3 && i.broadcast.is_none())
+        .filter(|i| !online.iter().any(|a| matches!(a, IpAddr::V4(v4) if i.contains(v4))))
+        .flat_map(|i| i.sweep_hosts())
+        .collect();
+    if hosts.is_empty() {
+        return;
+    }
+    log::info!("probe: sweeping {} addresses on layer-3 overlays", hosts.len());
+    let payload = beacon(node, BeaconOp::Probe);
+    let port = node.cfg.udp_port;
+    for chunk in hosts.chunks(50) {
+        for ip in chunk {
+            let _ = sock.try_send_to(&payload, SocketAddr::from((*ip, port)));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -376,7 +409,7 @@ async fn udp_recv_loop(node: Arc<Node>, sock: Arc<tokio::net::UdpSocket>) {
             r = sock.recv_from(&mut buf) => match r { Ok(v) => v, Err(_) => { tokio::time::sleep(Duration::from_millis(200)).await; continue } },
             _ = stop.changed() => break,
         };
-        if !netutil::is_private(&from.ip()) || node.is_blocked_addr(&from.ip()) {
+        if !node.is_trusted_source(&from.ip()) || node.is_blocked_addr(&from.ip()) {
             continue;
         }
         let Ok(b) = serde_json::from_slice::<Beacon>(&buf[..n]) else { continue };
