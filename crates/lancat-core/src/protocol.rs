@@ -157,6 +157,11 @@ pub struct PeerHint {
     /// Addresses the gossiping peer knows it by, best first.
     #[serde(default)]
     pub addrs: Vec<String>,
+    /// Which connection the gossiping peer has to it (changes when that link is re-made): a
+    /// relayed path that was re-made may have lost what went through it, so queued messages are
+    /// sent again. 0 from older versions.
+    #[serde(default)]
+    pub link: u64,
 }
 
 const RELAY_MAGIC: &[u8; 4] = b"LCR1";

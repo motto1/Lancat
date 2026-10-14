@@ -195,13 +195,31 @@ impl Node {
         let preferred = if dialer { me_id.as_str() < peer_id.as_str() } else { peer_id.as_str() < me_id.as_str() };
         let conn_id = self.conn_seq.fetch_add(1, Ordering::Relaxed);
         let rtt = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
-        {
-            let mut links = self.links.lock().unwrap();
-            if links.get(&peer_id).is_some_and(|l| l.preferred && !preferred) {
+        let last_rx = Arc::new(std::sync::atomic::AtomicU64::new(now_ms() as u64));
+        // The peer only dials while it has no link to us. So a second connection while we still
+        // hold the preferred one is either a simultaneous dial (the old one is fresh and answers:
+        // keep it) or the old one died silently on the peer's side (its network went away, e.g.
+        // Tailscale switched off) and we would hold a dead link until the ping timeout (60–90 s),
+        // rejecting every reconnect meanwhile and forwarding relayed messages into it. Ask the old
+        // connection: if it does not answer within a moment, the new one replaces it.
+        let old = {
+            let links = self.links.lock().unwrap();
+            links.get(&peer_id).filter(|l| l.preferred && !preferred).map(|l| (l.tx.clone(), l.last_rx.clone(), l.conn_id))
+        };
+        if let Some((otx, orx, _)) = &old {
+            if old_link_alive(otx, orx).await {
                 log::debug!("link with {peer_id}: keeping the connection dialed by the smaller id, dropping this one");
                 return;
             }
-            links.insert(peer_id.clone(), Link { tx: out_tx.clone(), data: data_tx.clone(), conn_id, preferred, rtt_ms: rtt.clone() });
+            log::info!("link with {peer_id}: the old connection is silent, replacing it");
+        }
+        {
+            let mut links = self.links.lock().unwrap();
+            // something else registered while we asked: the usual rule
+            if links.get(&peer_id).is_some_and(|l| l.preferred && !preferred && Some(l.conn_id) != old.as_ref().map(|o| o.2)) {
+                return;
+            }
+            links.insert(peer_id.clone(), Link { tx: out_tx.clone(), data: data_tx.clone(), conn_id, preferred, rtt_ms: rtt.clone(), last_rx: last_rx.clone() });
         }
         // the address a working link runs over is the one to dial next time
         self.set_peer_addr(&peer_id, ip);
@@ -246,6 +264,7 @@ impl Node {
                 m = in_rx.recv() => {
                     let Some(f) = m else { closed = true; break };
                     idle = 0;
+                    last_rx.store(now_ms() as u64, Ordering::Relaxed);
                     match f {
                         Frame::Text(t) => match serde_json::from_str::<WsMsg>(&t) {
                             Ok(WsMsg::FileStart { manifest }) => self.link_file_start(&peer_id, manifest, &out_tx, false),
@@ -306,6 +325,24 @@ impl Node {
             self.kick_gossip();
         }
     }
+}
+
+/// Whether a link answers: it heard something in the last 2 s, or it answers a ping within 3 s.
+async fn old_link_alive(tx: &mpsc::UnboundedSender<String>, last_rx: &std::sync::atomic::AtomicU64) -> bool {
+    let at = now_ms() as u64;
+    if at.saturating_sub(last_rx.load(Ordering::Relaxed)) < 2000 {
+        return true;
+    }
+    if tx.send(serde_json::to_string(&WsMsg::Ping).unwrap_or_default()).is_err() {
+        return false;
+    }
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if last_rx.load(Ordering::Relaxed) >= at {
+            return true;
+        }
+    }
+    false
 }
 
 /// One frame read from a link socket.

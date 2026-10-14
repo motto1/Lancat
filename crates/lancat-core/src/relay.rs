@@ -35,6 +35,8 @@ const FORWARD_WAIT: Duration = Duration::from_secs(20);
 #[allow(dead_code)]
 pub(crate) struct RelayHint {
     pub info: DeviceInfo,
+    /// The relay's connection to the target (`PeerHint::link`).
+    pub link: u64,
 }
 
 impl Node {
@@ -45,11 +47,11 @@ impl Node {
 
     /// The peers we have a link to (except `for_peer`), with every address we know them by.
     fn gossip_snapshot(&self, for_peer: &str) -> Vec<PeerHint> {
-        let ids: Vec<String> = self.links.lock().unwrap().keys().filter(|k| k.as_str() != for_peer).cloned().collect();
+        let ids: Vec<(String, u64)> = self.links.lock().unwrap().iter().filter(|(k, _)| k.as_str() != for_peer).map(|(k, l)| (k.clone(), l.conn_id)).collect();
         let peers = self.peers.read().unwrap();
         ids.into_iter()
-            .filter(|id| !self.store.is_blocked(id))
-            .filter_map(|id| {
+            .filter(|(id, _)| !self.store.is_blocked(id))
+            .filter_map(|(id, link)| {
                 let p = peers.get(&id)?;
                 let mut addrs = vec![p.addr.to_string()];
                 for (a, _) in p.seen_at.iter().rev() {
@@ -59,7 +61,7 @@ impl Node {
                         addrs.push(s);
                     }
                 }
-                Some(PeerHint { device: p.info.clone(), addrs })
+                Some(PeerHint { device: p.info.clone(), addrs, link })
             })
             .collect()
     }
@@ -94,15 +96,23 @@ impl Node {
         let hints: Vec<PeerHint> = hints.into_iter().filter(|h| !h.device.id.is_empty() && h.device.id != me && h.device.id != via && !self.store.is_blocked(&h.device.id)).collect();
         let before: HashSet<String> = self.relay_only_targets();
         let mut touched: HashSet<String> = HashSet::new();
+        // targets whose link at `via` was re-made since the last gossip
+        let mut remade: HashSet<String> = HashSet::new();
         {
             let mut r = self.relays.lock().unwrap();
+            for h in &hints {
+                let old = r.get(&h.device.id).and_then(|m| m.get(via)).map(|x| x.link);
+                if h.link != 0 && old.is_some_and(|o| o != h.link) {
+                    remade.insert(h.device.id.clone());
+                }
+            }
             for (t, m) in r.iter_mut() {
                 if m.remove(via).is_some() {
                     touched.insert(t.clone());
                 }
             }
             for h in &hints {
-                r.entry(h.device.id.clone()).or_default().insert(via.to_string(), RelayHint { info: h.device.clone() });
+                r.entry(h.device.id.clone()).or_default().insert(via.to_string(), RelayHint { info: h.device.clone(), link: h.link });
                 touched.insert(h.device.id.clone());
             }
             r.retain(|_, m| !m.is_empty());
@@ -125,6 +135,14 @@ impl Node {
             }
         }
         let after = self.relay_only_targets();
+        // the relay re-made its link to a peer we reach through it: what went through the old
+        // one may be lost, send what is not acknowledged again (the receiver drops duplicates)
+        for t in remade.iter().filter(|t| before.contains(*t) && after.contains(*t) && self.relay_via(t).as_deref() == Some(via)) {
+            log::info!("{t}: relay link at {via} was re-made, resending");
+            let node = self.clone();
+            let t = t.clone();
+            tokio::spawn(async move { node.flush_peer(&t).await });
+        }
         for t in touched.iter().chain(before.iter()) {
             if before.contains(t) != after.contains(t) {
                 self.emit_peer(t);
@@ -426,5 +444,81 @@ mod tests {
         .expect("file finishes through the relay");
         let got = std::fs::read(tb.path().join("recv").join("relay.bin")).unwrap();
         assert!(got == data, "file content differs");
+    }
+
+    /// A TCP forwarder: `cut` closes the far side of every connection and leaves the near side
+    /// open and silent, like a path whose far end vanished (its network switched off).
+    async fn blackhole(listen: std::net::SocketAddr, target: std::net::SocketAddr, src: IpAddr) -> tokio::sync::watch::Sender<bool> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind(listen).await.unwrap();
+        let (cut_tx, cut_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            loop {
+                let Ok((inc, _)) = l.accept().await else { return };
+                if *cut_rx.borrow() {
+                    continue; // dropped: refused
+                }
+                let sock = tokio::net::TcpSocket::new_v4().unwrap();
+                sock.bind(std::net::SocketAddr::new(src, 0)).unwrap();
+                let Ok(out) = sock.connect(target).await else { continue };
+                let mut cut = cut_rx.clone();
+                tokio::spawn(async move {
+                    let (mut ir, mut iw) = inc.into_split();
+                    let (mut or, mut ow) = out.into_split();
+                    let (mut b1, mut b2) = (vec![0u8; 65536], vec![0u8; 65536]);
+                    loop {
+                        if *cut.borrow_and_update() {
+                            break;
+                        }
+                        let step = tokio::select! {
+                            _ = cut.changed() => 0,
+                            r = ir.read(&mut b1) => match r { Ok(n) if n > 0 => { if ow.write_all(&b1[..n]).await.is_err() { return } 1 } _ => return },
+                            r = or.read(&mut b2) => match r { Ok(n) if n > 0 => { if iw.write_all(&b2[..n]).await.is_err() { return } 2 } _ => return },
+                        };
+                        let _ = step;
+                    }
+                    drop((or, ow));
+                    let _keep = (ir, iw);
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        cut_tx
+    }
+
+    /// The preferred link (dialed by the smaller id) dies silently on the other side; when that
+    /// side dials again it must be let in at once, not rejected until the ping timeout (60–90 s),
+    /// and what was sent into the dead link meanwhile arrives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn silently_dead_link_is_replaced_when_the_peer_dials_again() {
+        let (t1, t2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let ip1: IpAddr = "127.0.0.2".parse().unwrap();
+        let ip2: IpAddr = "127.0.0.3".parse().unwrap();
+        let n1 = start(t1.path(), "n1", Some(ip1)).await;
+        let n2 = start(t2.path(), "n2", Some(ip2)).await;
+        let ((small, small_ip), (large, large_ip)) = if n1.me().id < n2.me().id { ((n1, ip1), (n2, ip2)) } else { ((n2, ip2), (n1, ip1)) };
+        let (sid, lid) = (small.me().id, large.me().id);
+        let via: std::net::SocketAddr = format!("127.0.0.5:{}", large.port()).parse().unwrap();
+        let cut = blackhole(via, std::net::SocketAddr::new(large_ip, large.port()), small_ip).await;
+        small.add_peer_addr(&via.to_string()).await.unwrap();
+        until("linked through the forwarder", 15, || small.links.lock().unwrap().contains_key(&lid) && large.links.lock().unwrap().contains_key(&sid)).await;
+
+        cut.send(true).unwrap();
+        until("large side notices", 10, || !large.links.lock().unwrap().contains_key(&sid)).await;
+        assert!(small.links.lock().unwrap().contains_key(&lid), "small side still holds the dead link");
+
+        let mut el = large.subscribe();
+        let m = small.send_text(&lid, "after the path died").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Ok(CoreEvent::Message { message }) = el.recv().await {
+                    if message.id == m.id {
+                        return;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("message arrives over the new link well before the ping timeout");
     }
 }

@@ -134,6 +134,9 @@ pub(crate) struct Link {
     pub preferred: bool,
     /// Last ping round-trip in ms (u64::MAX until measured): picks the fastest relay.
     pub rtt_ms: Arc<AtomicU64>,
+    /// When the last frame arrived on this connection (ms, `now_ms`): tells a live connection from
+    /// one whose path died silently (the peer's interface went away) when the peer dials again.
+    pub last_rx: Arc<AtomicU64>,
 }
 
 pub struct Node {
