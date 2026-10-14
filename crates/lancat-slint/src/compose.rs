@@ -170,6 +170,15 @@ pub enum Out {
     Partial(Option<(i32, i32, u32, u32)>),
     /// 合成了：整帧都变了
     Full,
+    /// 增量合成：只有这块变了（x, y, w, h）；切换 Fx.pass 引起的重绘请求同样不算数
+    Inc((i32, i32, u32, u32)),
+}
+
+impl Out {
+    /// 合成过（调用方丢掉切换 pass 引起的重绘请求）
+    pub fn composed(&self) -> bool {
+        matches!(self, Out::Full | Out::Inc(_))
+    }
 }
 
 fn clear(buf: &mut [Bgra]) {
@@ -252,15 +261,62 @@ fn render_inner(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usiz
         let r = renderer.render(buf, w);
         return Out::Partial(region_box(&r));
     }
-    WAS.with(|x| x.set(true));
+    let was = WAS.with(|x| x.replace(true));
     let ids: Vec<i32> = active.iter().map(|(l, _)| l.id).collect();
     set_flags(&ids);
+    let sig = layer_sig(&active, w, h, scale);
+    // 增量：单层、姿态不变、上一帧也是合成且缓存齐全 → 只重画真正变了的那块（悬停动画 30px 格子等）
+    let mut cmp: Option<(Vec<Bgra>, (usize, usize, usize, usize))> = None;
+    let inc_ok = reused
+        && was
+        && active.len() == 1
+        && INC.with(|c| {
+            let c = c.borrow();
+            c.valid && c.sig == sig && c.base.len() == buf.len()
+        })
+        && TMP.with(|t| t.borrow().len() == buf.len());
+    if inc_ok {
+        // 帧与帧之间一直是 pass 0、且上一帧末尾已在 pass 0 登记过缓存：此时的脏区就是真实变化
+        renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
+        let t0 = Instant::now();
+        let reg = renderer.render_by_line(Rearm);
+        phase("probe", t0);
+        let Some((dx, dy, dw, dh)) = region_box(&reg) else {
+            return finish(&ui, None);
+        };
+        let d = (dx.max(0) as usize, dy.max(0) as usize, ((dx + dw as i32).max(0) as usize).min(w), ((dy + dh as i32).max(0) as usize).min(h));
+        if stats_on() {
+            PH.with(|p| p.borrow_mut().push_str(&format!(" d={},{} {}x{}", d.0, d.1, d.2 - d.0, d.3 - d.1)));
+        }
+        if d.2 > d.0 && d.3 > d.1 {
+            if let Some(o) = incremental(renderer, &fx, buf, w, h, scale, &active[0], d) {
+                fx.set_pass(0);
+                if !inc_check() {
+                    return finish_rearm(renderer, &ui, reused, Some(o));
+                }
+                // LANCAT_INC_CHECK=1：再整帧合成一次，逐像素比对增量结果
+                cmp = Some((buf.to_vec(), o));
+            }
+            // 液态层且脏区落进它的取样范围：整帧合成
+            fx.set_pass(0);
+        } else {
+            return finish(&ui, None);
+        }
+    }
     renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
     fx.set_pass(1);
     clear(buf);
     let t0 = Instant::now();
     renderer.render(buf, w);
     phase("base", t0);
+    BASE_SKIP.with(|b| b.set(None));
+    INC.with(|c| {
+        let mut c = c.borrow_mut();
+        c.base.clear();
+        c.base.extend_from_slice(buf);
+        c.sig = sig.clone();
+        c.valid = active.len() == 1;
+    });
     TMP.with(|t| {
         let mut tmp = t.borrow_mut();
         if tmp.len() != buf.len() {
@@ -275,41 +331,7 @@ fn render_inner(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usiz
                 phase(&format!("r{}", l.id), t0);
             }
             let t0 = Instant::now();
-            // 层矩形（物理 px）与变换
-            let (lx, ly, lw, lh) = (l.x * scale, l.y * scale, l.w * scale, l.h * scale);
-            let (ox, oy) = (lx + p.ox * lw, ly + p.oy * lh);
-            let (tx, ty) = (p.tx * scale, p.ty * scale);
-            let map = |x: f32, y: f32| (ox + (x - ox) * p.s + tx, oy + (y - oy) * p.s + ty);
-            if l.blur > 0.0 && l.lq <= 0.0 {
-                // 纯模糊（表情面板、拖放选择器）：底下的模糊结果与层的姿态无关，按层的静止矩形外扩一圈算一次缓存，
-                // 弹出动画的每帧只按当前矩形裁圆角、乘透明度贴上（模糊半径取静止时的值）
-                let (x0, y0) = map(lx, ly);
-                let (x1, y1) = map(lx + lw, ly + lh);
-                let mg = lw.max(lh) * 0.12 + 16.0 * scale;
-                let region = (
-                    (lx - mg).floor().max(0.0) as usize,
-                    (ly - mg).floor().max(0.0) as usize,
-                    ((lx + lw + mg).ceil().max(0.0) as usize).min(w),
-                    ((ly + lh + mg).ceil().max(0.0) as usize).min(h),
-                );
-                backdrop_static(l.id, buf, w, h, region, (x0, y0, x1, y1), l.r * scale * p.s, l.blur * scale, l.sat, p.op);
-            } else if l.blur > 0.0 || l.lq > 0.0 {
-                let (x0, y0) = map(lx, ly);
-                let (x1, y1) = map(lx + lw, ly + lh);
-                // liquid 的 bevel = min(14, h/2)（CSS px）
-                let bevel = 14.0f32.min(l.h / 2.0) * scale * p.s;
-                backdrop_cached(l.id, buf, w, h, (x0, y0, x1, y1), l.r * scale * p.s, l.blur * scale * p.s, l.sat, l.lq * scale * p.s, bevel, p.op);
-            }
-            if p.identity() {
-                let m = 96.0 * scale;
-                over_rect(buf, &tmp, w, h, (lx - m, ly - m, lx + lw + m, ly + lh + m));
-            } else {
-                // 层内容（含阴影）可能超出层矩形：按矩形外扩 64px 的变换包围盒采样
-                let m = 64.0 * scale;
-                let (bx0, by0) = map(lx - m, ly - m);
-                let (bx1, by1) = map(lx + lw + m, ly + lh + m);
-                xform_into(buf, &tmp, w, h, (bx0, by0, bx1, by1), ox, oy, p.s, tx, ty, p.op);
-            }
+            compose_layer(buf, &tmp, w, h, scale, l, p, (0, 0, w, h), None);
             if stats_on() {
                 phase(&format!("c{}", l.id), t0);
             }
@@ -317,24 +339,268 @@ fn render_inner(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usiz
     });
     // 帧与帧之间回到普通遍：否则基底一直是 visible:false，期间来的指针 / 按键事件会让 Slint 把
     // 「变得不可见」的焦点项（输入框、表情搜索框）夺走焦点（toast 的背景模糊会让合成持续 2.6 s）。
-    // 由此引起的重绘请求由调用方丢掉（Out::Full 之后清 needs_redraw）。
     fx.set_pass(0);
-    // 重新武装渲染器的属性跟踪：上面的 set_pass(0) 让 redraw_tracker 变脏并请求了一次重画（调用方会丢掉它），
-    // 跟踪器此后不再通知任何变化 —— 关面板、换图、hover 动画都不会自己要帧，界面停在最后一帧直到别的事件。
-    // 在 pass 0 下跑一遍只建场景、不光栅化的逐行渲染（不调用 render_fn），依赖重新登记为「全部可见」的完整集合。
-    let t0 = Instant::now();
+    if let Some((inc, o)) = cmp {
+        let (mut n, mut mx) = (0usize, 0i32);
+        let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0, 0);
+        for (i, (a, b)) in inc.iter().zip(buf.iter()).enumerate() {
+            let dd = (a.r as i32 - b.r as i32).abs().max((a.g as i32 - b.g as i32).abs()).max((a.b as i32 - b.b as i32).abs()).max((a.a as i32 - b.a as i32).abs());
+            if dd > 1 {
+                n += 1;
+                mx = mx.max(dd);
+                let (x, y) = (i % w, i / w);
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+        log::info!("inc-check: o={:?} {n} px differ (>1), max {mx}, box {x0},{y0}..{x1},{y1}", o);
+    }
+    finish_rearm(renderer, &ui, reused, None)
+}
+
+fn inc_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LANCAT_INC_CHECK").is_ok_and(|v| v == "1"))
+}
+
+/// 层的几何签名：变了（姿态、矩形、尺寸、缩放）就不能增量
+fn layer_sig(active: &[(crate::FxLayer, Pose)], w: usize, h: usize, scale: f32) -> Vec<f32> {
+    let mut v = vec![w as f32, h as f32, scale];
+    for (l, p) in active {
+        v.extend_from_slice(&[l.id as f32, l.x, l.y, l.w, l.h, l.r, l.blur, l.sat, l.lq, l.shrink, p.tx, p.ty, p.s, p.op, p.ox, p.oy]);
+    }
+    v
+}
+
+/// 层矩形里的基底变化（被层盖住、只经模糊透出）最多拖这么久补画
+const BASE_LAG: Duration = Duration::from_millis(250);
+
+thread_local! {
+    /// 从哪一帧起跳过了基底重画（None = 基底是新的）
+    static BASE_SKIP: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+struct Inc {
+    sig: Vec<f32>,
+    base: Vec<Bgra>,
+    valid: bool,
+}
+
+thread_local! {
+    static INC: RefCell<Inc> = const { RefCell::new(Inc { sig: Vec::new(), base: Vec::new(), valid: false }) };
+}
+
+/// 层的合成几何（物理 px）
+struct Geo {
+    lx: f32,
+    ly: f32,
+    lw: f32,
+    lh: f32,
+    ox: f32,
+    oy: f32,
+    tx: f32,
+    ty: f32,
+}
+
+impl Geo {
+    fn new(l: &crate::FxLayer, p: &Pose, scale: f32) -> Geo {
+        let (lx, ly, lw, lh) = (l.x * scale, l.y * scale, l.w * scale, l.h * scale);
+        Geo { lx, ly, lw, lh, ox: lx + p.ox * lw, oy: ly + p.oy * lh, tx: p.tx * scale, ty: p.ty * scale }
+    }
+    fn map(&self, p: &Pose, x: f32, y: f32) -> (f32, f32) {
+        (self.ox + (x - self.ox) * p.s + self.tx, self.oy + (y - self.oy) * p.s + self.ty)
+    }
+    /// 纯模糊层的取样区域：静止矩形外扩一圈
+    fn bs_region(&self, scale: f32, w: usize, h: usize) -> (usize, usize, usize, usize) {
+        let mg = self.lw.max(self.lh) * 0.12 + 16.0 * scale;
+        (
+            (self.lx - mg).floor().max(0.0) as usize,
+            (self.ly - mg).floor().max(0.0) as usize,
+            ((self.lx + self.lw + mg).ceil().max(0.0) as usize).min(w),
+            ((self.ly + self.lh + mg).ceil().max(0.0) as usize).min(h),
+        )
+    }
+    /// 层内容（含阴影）落到输出上的包围盒
+    fn out_box(&self, p: &Pose, scale: f32) -> (f32, f32, f32, f32) {
+        if p.identity() {
+            let m = 96.0 * scale;
+            (self.lx - m, self.ly - m, self.lx + self.lw + m, self.ly + self.lh + m)
+        } else {
+            let m = 64.0 * scale;
+            let (bx0, by0) = self.map(p, self.lx - m, self.ly - m);
+            let (bx1, by1) = self.map(p, self.lx + self.lw + m, self.ly + self.lh + m);
+            (bx0.min(bx1), by0.min(by1), bx0.max(bx1), by0.max(by1))
+        }
+    }
+}
+
+fn isect(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize)) -> Option<(usize, usize, usize, usize)> {
+    let r = (a.0.max(b.0), a.1.max(b.1), a.2.min(b.2), a.3.min(b.3));
+    (r.2 > r.0 && r.3 > r.1).then_some(r)
+}
+
+fn union(a: (usize, usize, usize, usize), b: (usize, usize, usize, usize)) -> (usize, usize, usize, usize) {
+    (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
+}
+
+fn fbox(b: (f32, f32, f32, f32), w: usize, h: usize) -> (usize, usize, usize, usize) {
+    (b.0.floor().max(0.0) as usize, b.1.floor().max(0.0) as usize, (b.2.ceil().max(0.0) as usize).min(w), (b.3.ceil().max(0.0) as usize).min(h))
+}
+
+/// 一层：背景滤镜 + 内容（只动 clip 内的输出像素）。`bs_win`：增量时纯模糊缓存已更新过，不再按输入比对
+#[allow(clippy::too_many_arguments)]
+fn compose_layer(buf: &mut [Bgra], tmp: &[Bgra], w: usize, h: usize, scale: f32, l: &crate::FxLayer, p: &Pose, clip: (usize, usize, usize, usize), bs_ready: Option<()>) {
+    let g = Geo::new(l, p, scale);
+    let (x0, y0) = g.map(p, g.lx, g.ly);
+    let (x1, y1) = g.map(p, g.lx + g.lw, g.ly + g.lh);
+    if l.blur > 0.0 && l.lq <= 0.0 {
+        // 纯模糊（表情面板、拖放选择器）：底下的模糊结果与层的姿态无关，按层的静止矩形外扩一圈算一次缓存，
+        // 弹出动画的每帧只按当前矩形裁圆角、乘透明度贴上（模糊半径取静止时的值）
+        let region = g.bs_region(scale, w, h);
+        if bs_ready.is_some() {
+            bs_mix(l.id, buf, w, region, (x0, y0, x1, y1), l.r * scale * p.s, p.op, clip);
+        } else {
+            backdrop_static(l.id, buf, w, h, region, (x0, y0, x1, y1), l.r * scale * p.s, l.blur * scale, l.sat, p.op);
+        }
+    } else if l.blur > 0.0 || l.lq > 0.0 {
+        // liquid 的 bevel = min(14, h/2)（CSS px）
+        let bevel = 14.0f32.min(l.h / 2.0) * scale * p.s;
+        backdrop_cached(l.id, buf, w, h, (x0, y0, x1, y1), l.r * scale * p.s, l.blur * scale * p.s, l.sat, l.lq * scale * p.s, bevel, p.op);
+    }
+    let ob = g.out_box(p, scale);
+    let ob = fbox(ob, w, h);
+    let Some(c) = isect(ob, clip) else { return };
+    let cf = (c.0 as f32, c.1 as f32, c.2 as f32, c.3 as f32);
+    if p.identity() {
+        over_rect(buf, tmp, w, h, cf);
+    } else {
+        // 层内容（含阴影）可能超出层矩形：按矩形外扩 64px 的变换包围盒采样
+        xform_into(buf, tmp, w, h, cf, g.ox, g.oy, p.s, g.tx, g.ty, p.op);
+    }
+}
+
+/// 增量合成：只重画脏区 d 影响到的输出。返回输出的变化矩形；None = 做不了（调用方整帧合成）
+#[allow(clippy::too_many_arguments)]
+fn incremental(renderer: &SoftwareRenderer, fx: &Fx<'_>, buf: &mut [Bgra], w: usize, h: usize, scale: f32, lp: &(crate::FxLayer, Pose), d: (usize, usize, usize, usize)) -> Option<(usize, usize, usize, usize)> {
+    let (l, p) = lp;
+    let g = Geo::new(l, p, scale);
+    if l.lq > 0.0 {
+        // 液态 / 折射层的缓存按输入整块比对：脏区碰到它的取样范围就整帧
+        let m = (l.blur * 3.0 + l.lq + 32.0) * scale;
+        let (x0, y0) = g.map(p, g.lx, g.ly);
+        let (x1, y1) = g.map(p, g.lx + g.lw, g.ly + g.lh);
+        let near = fbox((x0.min(x1) - m, y0.min(y1) - m, x0.max(x1) + m, y0.max(y1) + m), w, h);
+        if isect(near, d).is_some() {
+            return None;
+        }
+    }
+    // 逐行渲染（render_by_line）画不出 Path（图标、勾选），只能整遍 render()：
+    // 层整遍重画进 TMP；基底只在脏区伸出层矩形时重画（层矩形里的基底被层盖住，只经模糊透出来：
+    // 这种变化最多攒 BASE_LAG 再补一次基底，悬停动画就不用每帧重画整窗基底）
+    let inner = fbox((g.lx, g.ly, g.lx + g.lw, g.ly + g.lh), w, h);
+    let inside = p.identity() && d.0 >= inner.0 && d.1 >= inner.1 && d.2 <= inner.2 && d.3 <= inner.3;
+    let stale = BASE_SKIP.with(|b| b.get().is_some_and(|t| t.elapsed() >= BASE_LAG));
+    let mut d = d;
     renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
+    if !inside || stale {
+        let t0 = Instant::now();
+        fx.set_pass(1);
+        INC.with(|c| {
+            let mut c = c.borrow_mut();
+            clear(&mut c.base);
+            renderer.render(&mut c.base, w);
+        });
+        BASE_SKIP.with(|b| b.set(None));
+        phase("base-inc", t0);
+        if inside {
+            // 补的基底：模糊取样范围里都可能变了
+            d = union(d, g.bs_region(scale, w, h));
+        }
+    } else {
+        BASE_SKIP.with(|b| {
+            if b.get().is_none() {
+                b.set(Some(Instant::now()));
+            }
+        });
+    }
+    let t0 = Instant::now();
+    fx.set_pass(l.id);
+    TMP.with(|t| {
+        let mut t = t.borrow_mut();
+        clear(&mut t);
+        renderer.render(&mut t[..], w);
+    });
+    phase("layer-inc", t0);
+    let t0 = Instant::now();
+    // 输出受影响的范围
+    let mut o = d;
+    let pure_blur = l.blur > 0.0 && l.lq <= 0.0;
+    let mut bs_ok = false;
+    if pure_blur {
+        let region = g.bs_region(scale, w, h);
+        if let Some(dd) = isect(region, d) {
+            let base = INC.with(|c| std::mem::take(&mut c.borrow_mut().base));
+            let r = bs_update(l.id, &base, w, h, region, l.blur * scale, l.sat, dd);
+            INC.with(|c| c.borrow_mut().base = base);
+            match r {
+                Some(Some(win)) => o = union(o, win),
+                Some(None) => {}
+                None => return None,
+            }
+        }
+        bs_ok = true;
+    }
+    if !p.identity() {
+        let ob = fbox(g.out_box(p, scale), w, h);
+        let lb = fbox((g.lx - 64.0 * scale, g.ly - 64.0 * scale, g.lx + g.lw + 64.0 * scale, g.ly + g.lh + 64.0 * scale), w, h);
+        // 变换层：层内容变了 → 整个变换包围盒重贴
+        if isect(lb, d).is_some() {
+            o = union(o, ob);
+        }
+    }
+    // 输出 = 基底 → 滤镜 → 层，只在 o 里
+    INC.with(|c| {
+        let c = c.borrow();
+        for y in o.1..o.3 {
+            buf[y * w + o.0..y * w + o.2].copy_from_slice(&c.base[y * w + o.0..y * w + o.2]);
+        }
+    });
+    TMP.with(|t| {
+        let tmp = t.borrow();
+        compose_layer(buf, &tmp, w, h, scale, l, p, o, bs_ok.then_some(()));
+    });
+    phase("c-inc", t0);
+    Some(o)
+}
+
+/// 合成帧收尾：pass 0 下重新登记渲染器缓存与属性跟踪
+fn finish_rearm(renderer: &SoftwareRenderer, ui: &PanelWindow, reused: bool, o: Option<(usize, usize, usize, usize)>) -> Out {
+    // set_pass(0) 让 redraw_tracker 变脏并请求了一次重画（调用方会丢掉它），跟踪器此后不再通知任何变化 ——
+    // 在 pass 0 下跑一遍只建场景、不光栅化的逐行渲染（不调用 render_fn），依赖重新登记为「全部可见」的完整集合；
+    // ReusedBuffer：同时把逐项缓存填成 pass 0 的状态，下一帧开头的探测就只剩真实变化
+    let t0 = Instant::now();
+    renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
     renderer.render_by_line(Rearm);
     phase("rearm", t0);
-    if reused {
-        renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
+    if !reused {
+        renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
     }
+    match (finish(ui, o), o) {
+        (Out::Partial(Some(r)), Some(_)) => Out::Inc(r),
+        (_, None) => Out::Full,
+        (x, _) => x,
+    }
+}
+
+fn finish(ui: &PanelWindow, o: Option<(usize, usize, usize, usize)>) -> Out {
     let more = ui.window().has_active_animations();
     LAYER_ANIM.with(|a| a.set(more));
     if more {
         ui.window().request_redraw();
     }
-    Out::Full
+    Out::Partial(o.map(|(x0, y0, x1, y1)| (x0 as i32, y0 as i32, (x1 - x0) as u32, (y1 - y0) as u32)))
 }
 
 /// 只为让渲染器求值场景（重新登记属性依赖）：每行都不调用 render_fn，零光栅化
@@ -715,13 +981,20 @@ fn backdrop_static(id: i32, dst: &mut [Bgra], w: usize, h: usize, region: (usize
             phase("bs-full", t);
         }
     }
-    // 按当前矩形（圆角）× 透明度贴上
+    bs_mix(id, dst, w, region, rect, radius, op, (0, 0, w, h));
+}
+
+
+/// 把纯模糊层缓存的滤后像素按矩形（圆角）× 透明度贴到 dst（只动 clip 内）
+#[allow(clippy::too_many_arguments)]
+fn bs_mix(id: i32, dst: &mut [Bgra], w: usize, region: (usize, usize, usize, usize), rect: (f32, f32, f32, f32), radius: f32, op: f32, clip: (usize, usize, usize, usize)) {
     let t = Instant::now();
     let (rx0, ry0, rx1, ry1) = (rect.0.min(rect.2), rect.1.min(rect.3), rect.0.max(rect.2), rect.1.max(rect.3));
-    let x0 = (rx0.floor().max(0.0) as usize).max(gx0);
-    let y0 = (ry0.floor().max(0.0) as usize).max(gy0);
-    let x1 = (rx1.ceil().max(0.0) as usize).min(gx1);
-    let y1 = (ry1.ceil().max(0.0) as usize).min(gy1);
+    let (gx0, gy0, gx1, gy1) = region;
+    let x0 = (rx0.floor().max(0.0) as usize).max(gx0).max(clip.0);
+    let y0 = (ry0.floor().max(0.0) as usize).max(gy0).max(clip.1);
+    let x1 = (rx1.ceil().max(0.0) as usize).min(gx1).min(clip.2);
+    let y1 = (ry1.ceil().max(0.0) as usize).min(gy1).min(clip.3);
     if x1 <= x0 || y1 <= y0 {
         return;
     }
@@ -762,6 +1035,51 @@ fn backdrop_static(id: i32, dst: &mut [Bgra], w: usize, h: usize, region: (usize
         }
     });
     phase("bs-mix", t);
+}
+
+/// 增量：底图只在 d 里变了 → 更新缓存的输入并只重算受影响的输出窗口；返回重算的窗口
+fn bs_update(id: i32, base: &[Bgra], w: usize, h: usize, region: (usize, usize, usize, usize), sigma: f32, sat: f32, d: (usize, usize, usize, usize)) -> Option<Option<(usize, usize, usize, usize)>> {
+    let (gx0, gy0, gx1, gy1) = region;
+    let reach = backdrop_reach(sigma);
+    let t = Instant::now();
+    let r = BS.with(|m| {
+        let mut m = m.borrow_mut();
+        let c = m.get_mut(&id)?;
+        if c.input.len() != base.len() || c.filt.len() != base.len() {
+            return None;
+        }
+        // 只在真正变了的行列上重算（悬停动画只改层，底图在 d 里没变 → 模糊一点不用重算）
+        let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0usize, 0usize);
+        for y in d.1..d.3 {
+            let (a, b) = (&mut c.input[y * w + d.0..y * w + d.2], &base[y * w + d.0..y * w + d.2]);
+            if a == b {
+                continue;
+            }
+            let l = a.iter().zip(b).position(|(p, q)| p != q).unwrap_or(0);
+            let r = a.len() - a.iter().rev().zip(b.iter().rev()).position(|(p, q)| p != q).unwrap_or(0);
+            x0 = x0.min(d.0 + l);
+            x1 = x1.max(d.0 + r);
+            y0 = y0.min(y);
+            y1 = y1.max(y + 1);
+            a.copy_from_slice(b);
+        }
+        if x0 == usize::MAX {
+            return Some(None);
+        }
+        let d = (x0, y0, x1, y1);
+        let win = (d.0.saturating_sub(reach).max(gx0), d.1.saturating_sub(reach).max(gy0), (d.2 + reach).min(gx1), (d.3 + reach).min(gy1));
+        if win.2 <= win.0 || win.3 <= win.1 {
+            return Some(None);
+        }
+        let mut tmp = c.input.clone();
+        backdrop(&mut tmp, w, h, (gx0 as f32, gy0 as f32, gx1 as f32, gy1 as f32), 0.0, sigma, sat, 0.0, 0.0, 1.0, Some(win));
+        for y in win.1..win.3 {
+            c.filt[y * w + win.0..y * w + win.2].copy_from_slice(&tmp[y * w + win.0..y * w + win.2]);
+        }
+        Some(Some(win))
+    });
+    phase("bs-inc", t);
+    r
 }
 
 /// 模糊的降采样倍数（与 blur_clamped 相同）

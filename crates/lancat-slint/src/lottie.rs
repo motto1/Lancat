@@ -129,15 +129,8 @@ impl Player {
         }
     }
 
-    /// 渲染第 `frame` 帧，返回 slint 图像。
-    pub fn render(&mut self, frame: f32) -> slint::Image {
-        self.draw(frame);
-        let mut pb = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(self.px, self.px);
-        let dst = pb.make_mut_bytes();
-        for (i, p) in self.buf.iter().enumerate() {
-            dst[i * 4..i * 4 + 4].copy_from_slice(&p.to_le_bytes());
-        }
-        slint::Image::from_rgba8_premultiplied(pb)
+    pub fn px(&self) -> u32 {
+        self.px
     }
 
     /// 帧率（每秒帧数）

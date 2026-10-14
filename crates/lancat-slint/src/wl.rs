@@ -1001,14 +1001,18 @@ impl State {
         let sc = self.scale.max(1) as u32;
         let (width, height) = (ps.width * sc, ps.height * sc);
         let n = (width * height) as usize;
-        if self.buf.len() != n {
+        // 缓冲是我们自己的、常驻：ReusedBuffer 局部重画（每帧再整幅拷进 shm）；新分配（尺寸变了 / 收起后释放）时整幅画一次
+        let fresh = self.buf.len() != n;
+        if fresh {
             self.buf = vec![Bgra::default(); n];
+            w.renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
         }
         w.needs_redraw.set(false);
-        // NewBuffer：每帧整幅重画（缓冲是我们自己的，渲染器不保留上一帧状态，surface 重建后也安全）
-        self.buf.iter_mut().for_each(|p| *p = Bgra::default());
-        let out = crate::compose::render(&w.renderer, &mut self.buf, width as usize, height as usize, sc as f32, false);
-        if matches!(out, crate::compose::Out::Full) {
+        let out = crate::compose::render(&w.renderer, &mut self.buf, width as usize, height as usize, sc as f32, true);
+        if fresh {
+            w.renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
+        }
+        if out.composed() {
             w.needs_redraw.set(false);
         }
         // 面板整体的弹出/收起变换

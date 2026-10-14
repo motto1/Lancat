@@ -291,7 +291,7 @@ impl Win32Window {
             }
         } else {
             let o = crate::compose::render(&self.renderer, &mut buf, w, hgt, self.scale.get(), true);
-            if matches!(o, crate::compose::Out::Full) {
+            if o.composed() {
                 // 合成时切换 Fx.pass 引起的重绘请求不算数；层里的动画还在跑就接着画
                 self.needs_redraw.set(crate::compose::layer_anim());
             }
@@ -326,7 +326,7 @@ impl Win32Window {
             return Some(RECT { left: 0, top: 0, right: w as i32, bottom: hgt as i32 });
         }
         match out {
-            crate::compose::Out::Partial(Some((x, y, rw, rh))) => Some(RECT { left: x.max(0), top: y.max(0), right: (x + rw as i32).min(w as i32), bottom: (y + rh as i32).min(hgt as i32) }),
+            crate::compose::Out::Partial(Some((x, y, rw, rh))) | crate::compose::Out::Inc((x, y, rw, rh)) => Some(RECT { left: x.max(0), top: y.max(0), right: (x + rw as i32).min(w as i32), bottom: (y + rh as i32).min(hgt as i32) }),
             _ => None,
         }
     }

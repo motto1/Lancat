@@ -158,135 +158,29 @@ fn poster_cache_dir() -> PathBuf {
     crate::data_dir().join("cache").join("posters")
 }
 
-fn spawn_worker() -> mpsc::Sender<Job> {
-    let (tx, rx) = mpsc::channel::<Job>();
-    std::thread::Builder::new()
-        .name("lancat-posters".into())
-        .spawn(move || {
-            while let Ok(job) = rx.recv() {
-                let px = job.px;
-                let want = (px * px * 4) as usize;
-                let mut buf = job.cache.as_ref().and_then(|p| std::fs::read(p).ok()).filter(|b| b.len() == want);
-                if buf.is_none() {
-                    let json = match job.src {
-                        PosterSrc::Noto(code) => noto_json(&code),
-                        PosterSrc::Json(j) => Some(j),
-                        PosterSrc::Glyph { ch, code, font_px } => match crate::glyph::render(&ch, px, font_px) {
-                            Some(b) => {
-                                buf = Some(b);
-                                None
-                            }
-                            None => noto_json(&code),
-                        },
-                    };
-                    if buf.is_none() {
-                        buf = json.and_then(|j| Player::new(&j, px)).map(|mut p| p.render_raw(0.0));
-                    }
-                    if let (Some(b), Some(path)) = (buf.as_ref(), job.cache.as_ref()) {
-                        if let Some(dir) = path.parent() {
-                            let _ = std::fs::create_dir_all(dir);
-                        }
-                        let _ = std::fs::write(path, b);
-                    }
-                }
-                let key = job.key;
-                post(move |app| app.emoji.poster_done(key, px, buf));
-            }
-        })
-        .expect("poster thread");
-    tx
+// ------------------------------------------------------------------ lottie engine
+
+/// 所有 ThorVG 工作（首帧海报、表情面板悬停、聊天贴纸）都在这一条线程里：
+/// ThorVG 1.1 之前多线程各用各的画布也不安全（thorvg#4120），一条线程天然串行，UI 线程不碰 ThorVG、不会被解析卡住。
+/// 优先级：命令 > 到点的帧（悬停 / 聊天） > 预取 > 海报。
+enum Cmd {
+    Poster(Job),
+    /// 表情面板悬停：只理会最后一条
+    HoverStart { key: String, src: PosterSrc, px: u32 },
+    HoverStop,
+    /// 悬停预取（相邻格）：新的一批替换没做完的旧批
+    Prefetch(Vec<(String, PosterSrc, u32)>),
+    Chat { id: String, e: EmojiPayload, px: u32, ev: ChatEv },
+    ChatClear,
+    Pause,
+    Resume,
+    /// 收起超过 keep-alive：丢掉悬停缓存和聊天里的播放器
+    Release,
 }
 
-// ------------------------------------------------------------------ hover player
-
-/// 表情面板格子的悬停播放放到自己的线程：解压 + 解析 Lottie（几十 ms）和每帧光栅化都不占 UI 线程，
-/// 鼠标扫过一排格子时 UI 不会一格一卡；最近悬停过的动画留在线程里，回到同一格立即开播。
-enum HoverCmd {
-    Start { key: String, src: PosterSrc, px: u32 },
-    Stop,
-}
-
-const HOVER_KEEP: usize = 24;
-const HOVER_FRAME: Duration = Duration::from_millis(33);
-
-fn spawn_hover() -> mpsc::Sender<HoverCmd> {
-    let (tx, rx) = mpsc::channel::<HoverCmd>();
-    std::thread::Builder::new()
-        .name("lancat-emoji-hover".into())
-        .spawn(move || {
-            // (key, px, player)，最近用的在前
-            let mut cache: Vec<(String, u32, Player)> = Vec::new();
-            let mut cur: Option<(String, Instant)> = None;
-            let mut next = Instant::now();
-            loop {
-                let first = if cur.is_some() {
-                    match rx.recv_timeout(next.saturating_duration_since(Instant::now())) {
-                        Ok(c) => Some(c),
-                        Err(mpsc::RecvTimeoutError::Timeout) => None,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
-                } else {
-                    match rx.recv() {
-                        Ok(c) => Some(c),
-                        Err(_) => break,
-                    }
-                };
-                // 只理会最后一条（快速扫过时中间的格子直接跳过）
-                let mut cmd = first;
-                while let Ok(c) = rx.try_recv() {
-                    cmd = Some(c);
-                }
-                match cmd {
-                    Some(HoverCmd::Stop) => cur = None,
-                    Some(HoverCmd::Start { key, src, px }) => {
-                        let ok = match cache.iter().position(|(k, p, _)| *k == key && *p == px) {
-                            Some(i) => {
-                                let e = cache.remove(i);
-                                cache.insert(0, e);
-                                true
-                            }
-                            None => {
-                                let json = match src {
-                                    PosterSrc::Noto(code) | PosterSrc::Glyph { code, .. } => noto_json(&code),
-                                    PosterSrc::Json(j) => Some(j),
-                                };
-                                match json.and_then(|j| Player::new(&j, px)) {
-                                    Some(p) => {
-                                        cache.insert(0, (key.clone(), px, p));
-                                        cache.truncate(HOVER_KEEP);
-                                        true
-                                    }
-                                    None => false,
-                                }
-                            }
-                        };
-                        cur = if ok { Some((key, Instant::now())) } else { None };
-                        next = Instant::now();
-                    }
-                    None => {}
-                }
-                let Some((key, t0)) = cur.as_ref() else { continue };
-                let now = Instant::now();
-                if now < next {
-                    continue;
-                }
-                let Some((_, px, p)) = cache.first_mut() else { continue };
-                let total = p.total.max(1.0);
-                let f = (now.duration_since(*t0).as_secs_f32() * p.fps()) % total;
-                let buf = p.render_raw(f);
-                let (key, px) = (key.clone(), *px);
-                post(move |app| app.emoji.hover_frame(&key, px, buf));
-                next += HOVER_FRAME;
-                if next < now {
-                    next = now + HOVER_FRAME;
-                }
-            }
-        })
-        .expect("hover thread");
-    tx
-}
-
-// ------------------------------------------------------------------ state
+const HOVER_KEEP: usize = 32;
+const FRAME: Duration = Duration::from_millis(33);
+const MAX_PLAYING: usize = 6;
 
 /// 聊天贴纸（旧版 Sticker.svelte mode="chat"）：进入视口（rootMargin 40px）才播，播满 2 遍停在首帧；
 /// 悬停从头循环，离开后播完剩余到满 2 遍；离开视口暂停；同时最多 MAX_PLAYING 个（新的挤掉最早开始的）；
@@ -307,6 +201,307 @@ impl ChatAnim {
     }
 }
 
+struct Engine {
+    node: Arc<Node>,
+    posters: std::collections::VecDeque<Job>,
+    /// (key, px, player)，最近用的在前
+    hover_cache: Vec<(String, u32, Player)>,
+    hover: Option<(String, Instant)>,
+    hover_next: Instant,
+    prefetch: Vec<(String, PosterSrc, u32)>,
+    chat: HashMap<String, ChatAnim>,
+    playing: Vec<String>,
+    paused: bool,
+    chat_next: Instant,
+    last_tick: Instant,
+}
+
+fn src_json(src: PosterSrc) -> Option<String> {
+    match src {
+        PosterSrc::Noto(code) | PosterSrc::Glyph { code, .. } => noto_json(&code),
+        PosterSrc::Json(j) => Some(j),
+    }
+}
+
+impl Engine {
+    fn run(mut self, rx: mpsc::Receiver<Cmd>) {
+        loop {
+            // 下一件到点的事
+            let now = Instant::now();
+            let mut due: Option<Instant> = None;
+            if self.hover.is_some() {
+                due = Some(self.hover_next);
+            }
+            if !self.paused && !self.playing.is_empty() {
+                due = Some(due.map_or(self.chat_next, |d| d.min(self.chat_next)));
+            }
+            let idle_work = !self.prefetch.is_empty() || !self.posters.is_empty();
+            let wait = match due {
+                Some(d) => d.saturating_duration_since(now),
+                None if idle_work => Duration::ZERO,
+                None => Duration::from_secs(3600),
+            };
+            let first = if wait.is_zero() {
+                match rx.try_recv() {
+                    Ok(c) => Some(c),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Err(mpsc::TryRecvError::Disconnected) => return,
+                }
+            } else {
+                match rx.recv_timeout(wait) {
+                    Ok(c) => Some(c),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            };
+            let mut cmds: Vec<Cmd> = first.into_iter().collect();
+            while let Ok(c) = rx.try_recv() {
+                cmds.push(c);
+            }
+            // 悬停只理会最后一条（快速扫过时中间的格子直接跳过）
+            let last_hover = cmds.iter().rposition(|c| matches!(c, Cmd::HoverStart { .. } | Cmd::HoverStop));
+            for (i, c) in cmds.into_iter().enumerate() {
+                match c {
+                    Cmd::HoverStart { .. } | Cmd::HoverStop if Some(i) != last_hover => {}
+                    c => self.apply(c),
+                }
+            }
+            let now = Instant::now();
+            let mut busy = false;
+            if self.hover.is_some() && now >= self.hover_next {
+                self.hover_tick(now);
+                busy = true;
+            }
+            if !self.paused && !self.playing.is_empty() && now >= self.chat_next {
+                self.chat_tick(now);
+                busy = true;
+            }
+            if busy {
+                continue;
+            }
+            // 空闲：一次只做一件低优先级的事，做完回头看命令和帧
+            if let Some((key, src, px)) = self.prefetch.pop() {
+                if !self.hover_cache.iter().any(|(k, p, _)| *k == key && *p == px) && self.hover_cache.len() < HOVER_KEEP {
+                    if let Some(p) = src_json(src).and_then(|j| Player::new(&j, px)) {
+                        self.hover_cache.push((key, px, p));
+                    }
+                }
+            } else if let Some(job) = self.posters.pop_front() {
+                poster_job(job);
+            }
+        }
+    }
+
+    fn apply(&mut self, c: Cmd) {
+        match c {
+            Cmd::Poster(j) => self.posters.push_back(j),
+            Cmd::HoverStop => self.hover = None,
+            Cmd::HoverStart { key, src, px } => {
+                let ok = match self.hover_cache.iter().position(|(k, p, _)| *k == key && *p == px) {
+                    Some(i) => {
+                        let e = self.hover_cache.remove(i);
+                        self.hover_cache.insert(0, e);
+                        true
+                    }
+                    None => match src_json(src).and_then(|j| Player::new(&j, px)) {
+                        Some(p) => {
+                            self.hover_cache.insert(0, (key.clone(), px, p));
+                            self.hover_cache.truncate(HOVER_KEEP);
+                            true
+                        }
+                        None => false,
+                    },
+                };
+                let now = Instant::now();
+                self.hover = if ok { Some((key, now)) } else { None };
+                self.hover_next = now;
+            }
+            Cmd::Prefetch(v) => {
+                // pop() 从尾部取：最想要的放最后
+                self.prefetch = v.into_iter().rev().collect();
+            }
+            Cmd::Chat { id, e, px, ev } => self.chat_event(id, e, px, ev),
+            Cmd::ChatClear => {
+                self.chat.clear();
+                self.playing.clear();
+            }
+            Cmd::Pause => {
+                self.paused = true;
+                self.hover = None;
+            }
+            Cmd::Resume => {
+                self.paused = false;
+                self.last_tick = Instant::now();
+                self.chat_next = self.last_tick;
+            }
+            Cmd::Release => {
+                self.chat.clear();
+                self.playing.clear();
+                self.hover = None;
+                self.hover_cache.clear();
+                self.prefetch.clear();
+            }
+        }
+    }
+
+    fn hover_tick(&mut self, now: Instant) {
+        let Some((key, t0)) = self.hover.as_ref() else { return };
+        let Some((_, px, p)) = self.hover_cache.first_mut() else { return };
+        let total = p.total.max(1.0);
+        let f = (now.duration_since(*t0).as_secs_f32() * p.fps()) % total;
+        let buf = p.render_raw(f);
+        let (key, px) = (key.clone(), *px);
+        post(move |app| app.emoji.hover_frame(&key, px, buf));
+        self.hover_next += FRAME;
+        if self.hover_next < now {
+            self.hover_next = now + FRAME;
+        }
+    }
+
+    fn chat_event(&mut self, id: String, e: EmojiPayload, px: u32, ev: ChatEv) {
+        if !self.chat.contains_key(&id) {
+            if ev == ChatEv::Hidden || ev == ChatEv::HoverOut {
+                return;
+            }
+            let player = lottie_data(&self.node, &e).and_then(|j| Player::new(&j, px));
+            let Some(player) = player else {
+                post(move |app| {
+                    app.emoji.chat_live.remove(&id);
+                });
+                return;
+            };
+            self.chat.insert(id.clone(), ChatAnim { player, frame: 0.0, loops: 0, hover: false, visible: false, bumped: false });
+        }
+        let a = self.chat.get_mut(&id).unwrap();
+        match ev {
+            ChatEv::Visible => a.visible = true,
+            // 离开视口：pause（停在当前帧，不回首帧）
+            ChatEv::Hidden => a.visible = false,
+            ChatEv::HoverIn => {
+                a.hover = true;
+                a.loops = 0;
+                // 悬停算一次「进入」：旧版 mouseenter 时 IntersectionObserver 早已报告可见
+                a.visible = true;
+            }
+            ChatEv::HoverOut => a.hover = false,
+        }
+        // sync()：要播就（重新）排进 playing，否则移出
+        a.bumped = false;
+        let wants = a.wants();
+        let was_idle = self.playing.is_empty();
+        self.playing.retain(|x| *x != id);
+        if wants {
+            self.playing.push(id);
+            while self.playing.len() > MAX_PLAYING {
+                let old = self.playing.remove(0);
+                if let Some(o) = self.chat.get_mut(&old) {
+                    o.bumped = true;
+                }
+            }
+            if was_idle {
+                self.last_tick = Instant::now();
+                self.chat_next = self.last_tick;
+            }
+        }
+    }
+
+    fn chat_tick(&mut self, now: Instant) {
+        let dt = now.duration_since(self.last_tick).as_secs_f32().min(0.2);
+        self.last_tick = now;
+        let mut frames: Vec<(String, u32, Vec<u8>)> = Vec::new();
+        let mut done: Vec<String> = Vec::new();
+        for id in self.playing.clone() {
+            let Some(a) = self.chat.get_mut(&id) else { continue };
+            if !a.wants() {
+                continue;
+            }
+            a.frame += a.player.fps() * dt;
+            let px = a.player.px();
+            if a.frame >= a.player.total {
+                a.frame = 0.0;
+                a.loops += 1;
+                if !a.hover && a.loops >= 2 {
+                    // 播满 2 遍：停在首帧（= 海报）
+                    done.push(id.clone());
+                    frames.push((id, px, a.player.render_raw(0.0)));
+                    continue;
+                }
+            }
+            frames.push((id, px, a.player.render_raw(a.frame)));
+        }
+        self.playing.retain(|x| !done.contains(x));
+        if !frames.is_empty() {
+            post(move |app| {
+                for (id, px, buf) in frames {
+                    app.set_sticker_frame(&id, image_from(&buf, px));
+                }
+            });
+        }
+        self.chat_next += FRAME;
+        if self.chat_next < now {
+            self.chat_next = now + FRAME;
+        }
+    }
+}
+
+fn poster_job(job: Job) {
+    let px = job.px;
+    let want = (px * px * 4) as usize;
+    let mut buf = job.cache.as_ref().and_then(|p| std::fs::read(p).ok()).filter(|b| b.len() == want);
+    if buf.is_none() {
+        let json = match job.src {
+            PosterSrc::Noto(code) => noto_json(&code),
+            PosterSrc::Json(j) => Some(j),
+            PosterSrc::Glyph { ch, code, font_px } => match crate::glyph::render(&ch, px, font_px) {
+                Some(b) => {
+                    buf = Some(b);
+                    None
+                }
+                None => noto_json(&code),
+            },
+        };
+        if buf.is_none() {
+            buf = json.and_then(|j| Player::new(&j, px)).map(|mut p| p.render_raw(0.0));
+        }
+        if let (Some(b), Some(path)) = (buf.as_ref(), job.cache.as_ref()) {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(path, b);
+        }
+    }
+    let key = job.key;
+    post(move |app| app.emoji.poster_done(key, px, buf));
+}
+
+fn spawn_engine(node: Arc<Node>) -> mpsc::Sender<Cmd> {
+    let (tx, rx) = mpsc::channel::<Cmd>();
+    std::thread::Builder::new()
+        .name("lancat-lottie".into())
+        .spawn(move || {
+            // Player 持有 ThorVG 指针（!Send）：引擎在线程里建
+            let now = Instant::now();
+            let eng = Engine {
+                node,
+                posters: Default::default(),
+                hover_cache: Vec::new(),
+                hover: None,
+                hover_next: now,
+                prefetch: Vec::new(),
+                chat: HashMap::new(),
+                playing: Vec::new(),
+                paused: false,
+                chat_next: now,
+                last_tick: now,
+            };
+            eng.run(rx)
+        })
+        .expect("lottie thread");
+    tx
+}
+
+// ------------------------------------------------------------------ state
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ChatEv {
     Visible,
@@ -315,22 +510,18 @@ pub enum ChatEv {
     HoverOut,
 }
 
-const MAX_PLAYING: usize = 6;
-
 pub struct EmojiState {
     node: Arc<Node>,
     posters: HashMap<String, slint::Image>,
     pending: HashSet<String>,
-    worker: mpsc::Sender<Job>,
-    chat: HashMap<String, ChatAnim>,
-    /// 正在播的聊天贴纸，按开始顺序
-    playing: Vec<String>,
-    paused: bool,
-    /// 正在悬停播放的格子（帧由 hover 线程送来）
+    /// Lottie 线程（海报 / 悬停 / 聊天贴纸）
+    eng: mpsc::Sender<Cmd>,
+    /// 交给 Lottie 线程在播的聊天贴纸（这些行的图由帧更新，不再刷海报）
+    pub(crate) chat_live: HashSet<String>,
+    /// 正在悬停播放的格子（帧由 Lottie 线程送来）
     hover: Option<String>,
-    hover_tx: mpsc::Sender<HoverCmd>,
-    timer: slint::Timer,
-    last_tick: Instant,
+    /// 格子 key → (分区, 行)：首帧到了直接改那一格
+    index: HashMap<String, Vec<(usize, usize)>>,
     recent: Vec<String>,
     stickers: Vec<StickerMeta>,
     open: bool,
@@ -352,17 +543,13 @@ const GLYPH_FONT: f32 = 25.0;
 impl EmojiState {
     pub fn new(node: Arc<Node>, s: &Settings) -> Self {
         EmojiState {
-            node,
+            node: node.clone(),
             posters: HashMap::new(),
             pending: HashSet::new(),
-            worker: spawn_worker(),
-            chat: HashMap::new(),
-            playing: Vec::new(),
-            paused: false,
+            eng: spawn_engine(node.clone()),
+            chat_live: HashSet::new(),
             hover: None,
-            hover_tx: spawn_hover(),
-            timer: slint::Timer::default(),
-            last_tick: Instant::now(),
+            index: HashMap::new(),
             recent: s.recent_emoji.clone(),
             stickers: Vec::new(),
             open: false,
@@ -397,7 +584,7 @@ impl EmojiState {
             let src = if e.kind == "noto" && e.data.is_none() { Some(PosterSrc::Noto(e.code.clone())) } else { lottie_data(&self.node, e).map(PosterSrc::Json) };
             match src {
                 Some(src) => {
-                    let _ = self.worker.send(Job { key, src, px, cache });
+                    let _ = self.eng.send(Cmd::Poster(Job { key, src, px, cache }));
                 }
                 None => {
                     self.pending.remove(&key);
@@ -417,7 +604,7 @@ impl EmojiState {
             let safe = em.code.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect::<String>();
             let cache = Some(poster_cache_dir().join(format!("glyph{}-{safe}-{px}.rgba", if cfg!(windows) { "w" } else { "" })));
             let src = PosterSrc::Glyph { ch: em.ch.to_string(), code: em.code.to_string(), font_px: GLYPH_FONT * scale() };
-            let _ = self.worker.send(Job { key, src, px, cache });
+            let _ = self.eng.send(Cmd::Poster(Job { key, src, px, cache }));
         }
         None
     }
@@ -462,16 +649,15 @@ impl EmojiState {
             None
         };
         let Some(cell_key) = cell_key else { return };
+        let Some(spots) = self.index.get(&cell_key) else { return };
         let Some(ui) = ui() else { return };
         let secs = ui.get_emoji_sections();
-        for sec in secs.iter() {
-            let cells = sec.cells.clone();
-            for i in 0..cells.row_count() {
-                if let Some(mut c) = cells.row_data(i) {
-                    if c.key == cell_key.as_str() {
-                        c.img = img.clone();
-                        cells.set_row_data(i, c);
-                    }
+        for &(si, ri) in spots {
+            let Some(sec) = secs.row_data(si) else { continue };
+            if let Some(mut c) = sec.cells.row_data(ri) {
+                if c.key == cell_key.as_str() {
+                    c.img = img.clone();
+                    sec.cells.set_row_data(ri, c);
                 }
             }
         }
@@ -578,6 +764,14 @@ impl EmojiState {
                 }
             }
         }
+        self.index.clear();
+        for (si, sec) in secs.iter().enumerate() {
+            for ri in 0..sec.cells.row_count() {
+                if let Some(c) = sec.cells.row_data(ri) {
+                    self.index.entry(c.key.to_string()).or_default().push((si, ri));
+                }
+            }
+        }
         ui.set_emoji_sections(ModelRc::new(VecModel::from(secs)));
         ui.set_importing(self.importing);
         self.built = self.sig();
@@ -636,77 +830,36 @@ impl EmojiState {
         Some(EmojiPayload { kind: "noto".into(), code: e.code.into(), alt: e.ch.into(), data: None })
     }
 
-    // ---------------- animation ----------------
+    // ---------------- animation（实际工作都在 Lottie 线程） ----------------
 
-    fn ensure_timer(&mut self) {
-        if self.timer.running() {
-            return;
-        }
-        self.last_tick = Instant::now();
-        self.timer.start(slint::TimerMode::Repeated, Duration::from_millis(33), || {
-            with_app(|app| app.tick_emoji());
-        });
-    }
-
-    /// 聊天贴纸事件（视口进出 / 悬停），`panel_visible` = 面板在屏上
-    pub fn chat_event(&mut self, msg_id: &str, e: &EmojiPayload, px: u32, ev: ChatEv, panel_visible: bool) {
-        if !self.chat.contains_key(msg_id) {
+    /// 聊天贴纸事件（视口进出 / 悬停）
+    pub fn chat_event(&mut self, msg_id: &str, e: &EmojiPayload, px: u32, ev: ChatEv, _panel_visible: bool) {
+        if !self.chat_live.contains(msg_id) {
             if ev == ChatEv::Hidden || ev == ChatEv::HoverOut {
                 return;
             }
-            let Some(json) = lottie_data(&self.node, e) else { return };
-            let Some(player) = Player::new(&json, px) else { return };
-            self.chat.insert(msg_id.to_string(), ChatAnim { player, frame: 0.0, loops: 0, hover: false, visible: false, bumped: false });
+            self.chat_live.insert(msg_id.to_string());
         }
-        let a = self.chat.get_mut(msg_id).unwrap();
-        match ev {
-            ChatEv::Visible => a.visible = true,
-            ChatEv::Hidden => a.visible = false,
-            ChatEv::HoverIn => {
-                a.hover = true;
-                a.loops = 0;
-                // 悬停算一次「进入」：旧版 mouseenter 时 IntersectionObserver 早已报告可见
-                a.visible = true;
-            }
-            ChatEv::HoverOut => a.hover = false,
-        }
-        // sync()：要播就（重新）排进 playing，否则移出
-        a.bumped = false;
-        let wants = a.wants();
-        self.playing.retain(|x| x != msg_id);
-        if wants {
-            self.playing.push(msg_id.to_string());
-            while self.playing.len() > MAX_PLAYING {
-                let old = self.playing.remove(0);
-                if let Some(o) = self.chat.get_mut(&old) {
-                    o.bumped = true;
-                }
-            }
-            if panel_visible && !self.paused {
-                self.ensure_timer();
-            }
-        } else if ev == ChatEv::Hidden {
-            // 离开视口：pause（停在当前帧，不回首帧）
-        }
+        let _ = self.eng.send(Cmd::Chat { id: msg_id.to_string(), e: e.clone(), px, ev });
     }
 
     pub fn stop_chat(&mut self) {
-        self.chat.clear();
-        self.playing.clear();
+        self.chat_live.clear();
+        let _ = self.eng.send(Cmd::ChatClear);
     }
 
-    /// 收起超过 keep-alive：丢掉解码好的首帧 / 字形和正在播的贴纸（磁盘缓存还在，下次打开表情面板几乎零成本重建）
+    /// 收起超过 keep-alive：丢掉解码好的首帧 / 字形、悬停缓存和正在播的贴纸（磁盘缓存还在，下次打开表情面板几乎零成本重建）
     pub fn release(&mut self) {
         self.posters.clear();
         self.pending.clear();
-        self.chat.clear();
-        self.playing.clear();
+        self.chat_live.clear();
         self.stop_hover();
-        self.timer.stop();
+        let _ = self.eng.send(Cmd::Release);
         self.prewarmed = false;
         self.released = true;
         // 网格里的格子也引用着首帧图：一起放掉，下次打开重建
         self.built.clear();
+        self.index.clear();
         if let Some(ui) = ui() {
             ui.set_emoji_sections(ModelRc::new(VecModel::<EmojiSection>::default()));
         }
@@ -719,56 +872,83 @@ impl EmojiState {
 
     /// 面板收起：全部暂停（状态保留，旧版 setLottieActive(false)）
     pub fn pause_all(&mut self) {
-        self.paused = true;
         self.stop_hover();
-        self.timer.stop();
+        let _ = self.eng.send(Cmd::Pause);
     }
 
     /// 面板弹出：继续 playing 里的
     pub fn resume_all(&mut self) {
-        self.paused = false;
-        if !self.playing.is_empty() {
-            self.ensure_timer();
-        }
+        let _ = self.eng.send(Cmd::Resume);
     }
 
     fn stop_hover(&mut self) {
         if self.hover.take().is_some() {
-            let _ = self.hover_tx.send(HoverCmd::Stop);
+            let _ = self.eng.send(Cmd::HoverStop);
             if let Some(ui) = ui() {
                 ui.set_emoji_hovered("".into());
-                ui.window().request_redraw();
             }
         }
+    }
+
+    fn hover_src(&self, key: &str) -> Option<PosterSrc> {
+        if by_code(key).is_some() {
+            return Some(PosterSrc::Noto(key.to_string()));
+        }
+        let e = self.payload(key)?;
+        lottie_data(&self.node, &e).map(PosterSrc::Json)
+    }
+
+    pub fn grid_hover_pub(&mut self, key: &str, on: bool) {
+        self.grid_hover(key, on);
+    }
+
+    pub fn hovered_key(&self) -> String {
+        self.hover.clone().unwrap_or_default()
     }
 
     fn grid_hover(&mut self, key: &str, on: bool) {
         if !on {
             if self.hover.as_deref() == Some(key) {
                 self.stop_hover();
-            } else if let Some(ui) = ui() {
-                ui.window().request_redraw();
             }
             return;
         }
-        let src = if by_code(key).is_some() {
-            PosterSrc::Noto(key.to_string())
-        } else {
-            let Some(e) = self.payload(key) else { return };
-            let Some(json) = lottie_data(&self.node, &e) else { return };
-            PosterSrc::Json(json)
-        };
+        let Some(src) = self.hover_src(key) else { return };
         let px = (GRID_PX * scale()) as u32;
         if let Some(ui) = ui() {
             // 新格子先显示静态首帧，上一格立即回到海报
             ui.set_emoji_hovered("".into());
-            ui.window().request_redraw();
         }
         self.hover = Some(key.to_string());
-        let _ = self.hover_tx.send(HoverCmd::Start { key: key.to_string(), src, px });
+        let _ = self.eng.send(Cmd::HoverStart { key: key.to_string(), src, px });
+        // 预取相邻格（同一分区：左右、上下两行）：扫过时下一格多半已解析好
+        let Some(&(si, ri)) = self.index.get(key).and_then(|v| v.first()) else { return };
+        let Some(ui) = ui() else { return };
+        let Some(sec) = ui.get_emoji_sections().row_data(si) else { return };
+        let n = sec.cells.row_count() as i64;
+        let c = self.cols.max(1) as i64;
+        let r = ri as i64;
+        let mut want: Vec<(String, PosterSrc, u32)> = Vec::new();
+        // 越靠后越先做
+        for d in [c + 1, c - 1, -c, c, -1, 1] {
+            let j = r + d;
+            if j < 0 || j >= n || (d.abs() == 1 && j / c != r / c) {
+                continue;
+            }
+            if let Some(cell) = sec.cells.row_data(j as usize) {
+                // 贴纸格要读文件 + 解压：只预取表情
+                if cell.sticker {
+                    continue;
+                }
+                if let Some(src) = self.hover_src(cell.key.as_str()) {
+                    want.push((cell.key.to_string(), src, px));
+                }
+            }
+        }
+        let _ = self.eng.send(Cmd::Prefetch(want));
     }
 
-    /// hover 线程送来的一帧：还停在这格才换图（第一帧到之前一直显示静态首帧）
+    /// Lottie 线程送来的一帧：还停在这格才换图（第一帧到之前一直显示静态首帧）
     fn hover_frame(&mut self, key: &str, px: u32, buf: Vec<u8>) {
         if self.hover.as_deref() != Some(key) || !self.open {
             return;
@@ -778,54 +958,16 @@ impl EmojiState {
             if ui.get_emoji_hovered().as_str() != key {
                 ui.set_emoji_hovered(key.into());
             }
-            // 表情面板是分层合成的（背景模糊）：渲染器的属性跟踪在合成帧之间被丢掉，
-            // 换图不会自己请求重画 → 每帧显式要一次，否则动画停在某帧、新格子迟迟不动
-            ui.window().request_redraw();
         }
     }
-
 }
 
 impl crate::App {
-    fn tick_emoji(&mut self) {
-        let now = Instant::now();
-        let dt = now.duration_since(self.emoji.last_tick).as_secs_f32().min(0.2);
-        self.emoji.last_tick = now;
-        let mut frames: Vec<(String, slint::Image)> = Vec::new();
-        let mut done: Vec<String> = Vec::new();
-        let ids = self.emoji.playing.clone();
-        for id in ids {
-            let Some(a) = self.emoji.chat.get_mut(&id) else { continue };
-            if !a.wants() {
-                continue;
-            }
-            a.frame += a.player.fps() * dt;
-            if a.frame >= a.player.total {
-                a.frame = 0.0;
-                a.loops += 1;
-                if !a.hover && a.loops >= 2 {
-                    // 播满 2 遍：停在首帧（= 海报）
-                    done.push(id.clone());
-                    frames.push((id.clone(), a.player.render(0.0)));
-                    continue;
-                }
-            }
-            frames.push((id.clone(), a.player.render(a.frame)));
-        }
-        self.emoji.playing.retain(|x| !done.contains(x));
-        for (id, img) in frames {
-            self.set_sticker_frame(&id, img);
-        }
-        if self.emoji.playing.is_empty() {
-            self.emoji.timer.stop();
-        }
-    }
-
     /// 海报到了：刷新还没有图的贴纸行
     pub(crate) fn refresh_stickers(&mut self) {
         let ids: Vec<usize> = (0..self.msgs.len()).filter(|&i| self.sticker_of(&self.msgs[i]).is_some()).collect();
         for i in ids {
-            if self.emoji.chat.contains_key(&self.msgs[i].id) {
+            if self.emoji.chat_live.contains(&self.msgs[i].id) {
                 continue;
             }
             self.refresh_row_pub(i);

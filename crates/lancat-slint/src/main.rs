@@ -1817,6 +1817,11 @@ fn run_script(parts: &[String]) {
                     app.open(&id);
                 }
             }
+            "emoji-hover" => {
+                // 测试：悬停表情面板格子（arg = 格子 key；空 = 离开）
+                let (k, on) = if arg.is_empty() { (app.emoji.hovered_key(), false) } else { (arg.clone(), true) };
+                app.emoji.grid_hover_pub(&k, on);
+            }
             "emoji-panel" => {
                 if let Some(ui) = app.ui() {
                     ui.set_emoji_open(true);
