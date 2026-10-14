@@ -2,9 +2,8 @@
 //! Windows 用自写 Win32 Platform（软件渲染 → 预乘 BGRA DIB，Acrylic + DWM 阴影 + 淡入）+ 停靠；
 //! Linux 用自写 SCTK layer-shell 后端（LANCAT_SLINT_WL=1）或 winit。
 //!
-//! 测试隔离（硬性规则）：默认数据目录 `<data>/lancat-slint-dev`、端口 47840、关闭 mDNS/UDP 发现，
-//! 所以不会碰到局域网里的真实设备；对端只能用 LANCAT_PROBE / 手动地址指定本机另一实例。
-//! `LANCAT_SLINT_DISCOVERY=1` 才打开发现（正式替换旧版之前不要用）。
+//! 正式版：与旧版共用数据目录 `<data>/app.lancat.desktop`（设备身份、聊天记录）、端口 47820、mDNS/UDP 发现。
+//! 旧版已归档，不能与旧版同时运行。测试实例用 LANCAT_DATA_DIR / LANCAT_PORT 另开。
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 slint::include_modules!();
@@ -1404,7 +1403,7 @@ fn system_theme_watch() {
 }
 
 pub(crate) fn data_dir() -> std::path::PathBuf {
-    env("LANCAT_DATA_DIR").map(Into::into).unwrap_or_else(|| dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("lancat-slint-dev"))
+    env("LANCAT_DATA_DIR").map(Into::into).unwrap_or_else(|| dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("app.lancat.desktop"))
 }
 
 fn wire_ui(ui: &PanelWindow) {
@@ -1590,14 +1589,6 @@ fn main() {
 
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().thread_name("lancat-core").build().expect("tokio");
     let mut cfg = NodeConfig::new(data_dir()).with_env();
-    if env("LANCAT_PORT").is_none() {
-        cfg.port = 47840;
-        cfg.udp_port = 47840;
-    }
-    if env("LANCAT_SLINT_DISCOVERY").as_deref() != Some("1") {
-        cfg.enable_mdns = false;
-        cfg.enable_udp = false;
-    }
     log::info!("lancat-slint: data {:?} port {} mdns {} udp {}", cfg.data_dir, cfg.port, cfg.enable_mdns, cfg.enable_udp);
     let wanted_port = cfg.port;
     let node = rt.block_on(Node::start(cfg)).expect("start lancat node");
