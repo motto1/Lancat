@@ -528,7 +528,7 @@ pub fn first_run(app: &tauri::AppHandle) {
     let _ = core.0.store.kv_set("win_firewall_rule", "requested");
     let exe = std::env::current_exe().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
     let args = format!(
-        "/c netsh advfirewall firewall add rule name=\"Lancat\" dir=in action=allow program=\"{exe}\" enable=yes profile=private,domain"
+        "/c netsh advfirewall firewall add rule name=\"Lancat\" dir=in action=allow program=\"{exe}\" enable=yes profile=any"
     );
     unsafe {
         let _ = ShellExecuteW(None, w!("runas"), w!("cmd.exe"), &HSTRING::from(args), PCWSTR::null(), SW_HIDE);

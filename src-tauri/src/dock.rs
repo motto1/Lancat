@@ -514,6 +514,13 @@ pub fn open_panel(app: &AppHandle, reason: &str) {
     if reason == "hover" && is_moving() {
         return;
     }
+    // the diagnostics alert pill: straight to 权限与诊断 (the panel stays collapsed)
+    if reason.strip_prefix("toast:") == Some(DIAG_TOAST) {
+        if let Err(e) = crate::diag::goto_diagnostics(app) {
+            log::warn!("open diagnostics from toast: {e}");
+        }
+        return;
+    }
     #[cfg(windows)]
     native_dock::toast_dismiss();
     #[cfg(target_os = "linux")]
@@ -815,6 +822,46 @@ pub fn on_incoming(app: &AppHandle, m: &lancat_core::Message) {
         native_dock::toast_show(
             app,
             native_dock::ToastSpec { peer_id: peer.id.clone(), name: peer.name.clone(), text, edge: current_edge(app), strip: geo.dock, origin: geo.origin, scale: geo.scale, dark, hold_ms },
+        );
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let _ = text;
+}
+
+/// Toast id of the diagnostics alert: a click opens 权限与诊断 instead of a conversation.
+pub const DIAG_TOAST: &str = "__diag__";
+
+/// A new diagnostics alert ("其他设备可能连不进本机"): the banner is inside the panel, so while it
+/// is collapsed the strip turns into a pill once; clicking it opens the diagnostics page.
+pub fn on_diag_alert(app: &AppHandle, title: &str) {
+    let skip = |why: &str| log::debug!("diag alert toast not shown: {why}");
+    if app.state::<DockState>().visible.load(Ordering::SeqCst) {
+        return skip("panel open");
+    }
+    if is_moving() {
+        return skip("dock being dragged");
+    }
+    let text = format!("{title}，点此修复");
+    #[cfg(any(windows, target_os = "linux"))]
+    let core = &app.state::<Core>().0;
+    #[cfg(windows)]
+    {
+        let Some(geo) = *app.state::<DockState>().geo.lock().unwrap() else { return skip("no dock geometry yet") };
+        log::info!("diag alert toast: {title}");
+        let dark = platform::theme_is_dark(&core.settings().theme);
+        native_dock::toast_show(
+            app,
+            native_dock::ToastSpec { peer_id: DIAG_TOAST.into(), name: "Lancat".into(), text, edge: current_edge(app), strip: geo.dock, scale: geo.scale, dark, hold_ms: 9000 },
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Some(geo) = *app.state::<DockState>().geo.lock().unwrap() else { return skip("no dock geometry yet") };
+        log::info!("diag alert toast: {title}");
+        let dark = native_dock::theme_is_dark(&core.settings().theme);
+        native_dock::toast_show(
+            app,
+            native_dock::ToastSpec { peer_id: DIAG_TOAST.into(), name: "Lancat".into(), text, edge: current_edge(app), strip: geo.dock, origin: geo.origin, scale: geo.scale, dark, hold_ms: 9000 },
         );
     }
     #[cfg(not(any(windows, target_os = "linux")))]

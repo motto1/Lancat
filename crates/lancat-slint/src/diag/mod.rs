@@ -417,7 +417,7 @@ fn windows_checks(port: u16, wanted: u16) -> Vec<Check> {
         Err(e) => {
             let mut c = Check::new("firewall", "Windows 防火墙", "unknown", "无法读取防火墙设置");
             c.detail.push(e.clone());
-            c.help = Some("可以在「Windows 安全中心 → 防火墙和网络保护 → 允许应用通过防火墙」里手动放行 Lancat（专用网络）".into());
+            c.help = Some("可以在「Windows 安全中心 → 防火墙和网络保护 → 允许应用通过防火墙」里手动放行 Lancat（勾选专用和公用网络）".into());
             c.fix = Some(fw_fix.clone());
             c.inbound = true;
             out.push(c);
@@ -454,7 +454,7 @@ fn windows_checks(port: u16, wanted: u16) -> Vec<Check> {
             } else if !no_allow.is_empty() {
                 let public_only = no_allow.iter().all(|p| *p == win::PROFILE_PUBLIC) && !allows.is_empty();
                 if public_only {
-                    Check::new("firewall", "Windows 防火墙", "error", "当前是公用网络，放行规则只对专用/域网络生效，入站连接会被拦截")
+                    Check::new("firewall", "Windows 防火墙", "error", "当前是公用网络，旧的放行规则只对专用/域网络生效，其他设备连不进来；点「修复防火墙规则」即可在所有网络上放行")
                 } else {
                     Check::new("firewall", "Windows 防火墙", "error", format!("本程序在{}网络上没有放行规则，Windows 会静默拦截入站连接", profile_names(no_allow.iter().fold(0, |a, p| a | p))))
                 }
@@ -498,16 +498,23 @@ fn windows_checks(port: u16, wanted: u16) -> Vec<Check> {
             let public: Vec<&win::NetProfile> = nets.iter().filter(|n| n.category == 0).collect();
             let names = |v: &[&win::NetProfile]| v.iter().map(|n| format!("「{}」", n.name)).collect::<Vec<_>>().join("、");
             let public_fw_on = snap.as_ref().map(|s| s.enabled[2]).unwrap_or(true);
+            // Lancat already allowed on public networks (rule profile includes public)?
+            let exe_l = exe.clone();
+            let public_allowed = snap.as_ref().is_ok_and(|s| {
+                s.rules.iter().any(|r| r.enabled && r.allow && win::same_path(&r.app, &exe_l) && covers_tcp(r, port) && r.profiles & win::PROFILE_PUBLIC != 0)
+            });
+            // A public network is not an error by itself: Lancat must work on any network. Changing a
+            // trusted (home/office) network to Private is only a recommendation; the firewall check
+            // carries the actual inbound problem (and the banner).
             let mut c = if public.is_empty() {
                 Check::new("network", "网络类型", "ok", format!("专用/域网络：{}", names(&nets.iter().collect::<Vec<_>>())))
-            } else if !public_fw_on {
-                let mut c = Check::new("network", "网络类型", "ok", format!("{} 是公用网络，但公用网络的防火墙已关闭，不影响连接", names(&public)));
-                c.detail.push("打开防火墙后，公用网络上的入站连接会被拦截".into());
+            } else if !public_fw_on || public_allowed {
+                let mut c = Check::new("network", "网络类型", "ok", format!("{} 是公用网络，Lancat 已放行，可以正常使用", names(&public)));
+                c.detail.push("建议：家里、公司等可信网络改为「专用网络」更安全；咖啡店、机场等公共 Wi-Fi 保持公用即可".into());
                 c
             } else {
-                let mut c = Check::new("network", "网络类型", "error", format!("{} 是公用网络：Windows 会拦截其他设备连入", names(&public)));
-                c.detail.push("Lancat 只在专用/域网络上放行；家里或公司的可信网络可以改为「专用」".into());
-                c.inbound = true;
+                let mut c = Check::new("network", "网络类型", "warn", format!("{} 是公用网络，Lancat 还没在公用网络上放行", names(&public)));
+                c.detail.push("点「Windows 防火墙」里的「修复防火墙规则」即可在公用网络上使用；家里、公司等可信网络也可以改为「专用网络」".into());
                 c
             };
             for n in nets.iter() {
@@ -522,7 +529,7 @@ fn windows_checks(port: u16, wanted: u16) -> Vec<Check> {
             if !public.is_empty() {
                 c.fix = Some(FixInfo {
                     id: "network".into(),
-                    label: "改为专用网络".into(),
+                    label: "改为专用网络（推荐）".into(),
                     admin: true,
                     confirm: Some(format!(
                         "将把 {} 设为「专用网络」。只应对家里、公司等可信网络这样做；在咖啡店、机场、酒店等公共 Wi-Fi 上请不要改（同一网络里的其他人将能发现并连接本机）。确定修改吗？",
@@ -559,7 +566,7 @@ fn windows_fix_plan(id: &str, wanted: u16) -> Result<FixPlan, String> {
         "firewall" => {
             // same rules as the installer (src-tauri/windows/hooks.nsh): delete every rule for this
             // exe (incl. "Block" rules left by a dismissed prompt), then allow TCP + UDP on private
-            // and domain networks only. Plus stale Lancat rules for programs that no longer exist.
+            // public and domain networks (Lancat must work on any network). Plus stale Lancat rules for programs that no longer exist.
             let snap = win::firewall_snapshot(std::path::Path::new(&exe), &[port]).ok();
             let stale = snap.as_ref().map(|s| stale_rules(s, &exe)).unwrap_or_default();
             // (netsh args, must succeed)
@@ -567,8 +574,8 @@ fn windows_fix_plan(id: &str, wanted: u16) -> Result<FixPlan, String> {
             for r in &stale {
                 steps.push((format!("advfirewall firewall delete rule name=\"{}\" program=\"{}\"", r.name, r.app), false));
             }
-            steps.push((format!("advfirewall firewall add rule name=\"Lancat\" dir=in action=allow program=\"{exe}\" protocol=TCP localport={port} profile=private,domain"), true));
-            steps.push((format!("advfirewall firewall add rule name=\"Lancat\" dir=in action=allow program=\"{exe}\" protocol=UDP localport={port},5353 profile=private,domain"), true));
+            steps.push((format!("advfirewall firewall add rule name=\"Lancat\" dir=in action=allow program=\"{exe}\" protocol=TCP localport={port} profile=any"), true));
+            steps.push((format!("advfirewall firewall add rule name=\"Lancat\" dir=in action=allow program=\"{exe}\" protocol=UDP localport={port},5353 profile=any"), true));
             let commands = steps.iter().map(|(a, _)| format!("netsh {a}")).collect();
             // Start-Process passes the argument string verbatim (PowerShell's own native-argument
             // quoting would mangle program="C:\path with spaces\lancat.exe")
@@ -583,7 +590,7 @@ fn windows_fix_plan(id: &str, wanted: u16) -> Result<FixPlan, String> {
                 }
             }
             script.push_str("exit $fail\n");
-            Ok(FixPlan { id: id.into(), commands, script, done_msg: "已更新防火墙规则：本程序在专用和域网络上放行".into() })
+            Ok(FixPlan { id: id.into(), commands, script, done_msg: "已更新防火墙规则：本程序在所有网络（专用、公用、域）上放行".into() })
         }
         "network" => {
             let nets = win::network_profiles()?;

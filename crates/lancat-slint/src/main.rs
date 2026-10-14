@@ -1065,6 +1065,11 @@ impl App {
     /// 停靠打开面板：从 toast 打开时切到发消息的那个会话。
     #[allow(dead_code)]
     fn on_dock_open(&mut self, reason: &str) {
+        if reason == format!("toast:{}", dock::DIAG_TOAST) {
+            self.set_visible(true);
+            slint::Timer::single_shot(std::time::Duration::ZERO, || open_settings(true));
+            return;
+        }
         if let Some(id) = reason.strip_prefix("toast:") {
             if self.peers.iter().any(|p| p.id == id) && self.current != id {
                 let id = id.to_string();
@@ -1249,11 +1254,29 @@ impl App {
     }
 }
 
+thread_local! {
+    /// 上一次提醒过的诊断提醒（标题+详情），同一条只在停靠条/托盘提醒一次
+    static LAST_DIAG_ALERT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
 impl App {
     /// 诊断状态变化：齿轮红点 + 横幅 + 设置窗口的检查列表
     pub(crate) fn diag_status(&mut self, st: diag::DiagStatus, last: Option<diag::Diagnostics>) {
         if let Some(ui) = self.ui() {
             ui.set_problems(st.problems as i32);
+            // 新出现的提醒（或换了一条）：面板收起时横幅看不到，停靠条/托盘也提醒一次
+            let key = st.alert.as_ref().map(|a| format!("{}\u{1}{}", a.title, a.detail)).unwrap_or_default();
+            let fresh = !key.is_empty() && LAST_DIAG_ALERT.with(|c| c.replace(key.clone()) != key);
+            if key.is_empty() {
+                LAST_DIAG_ALERT.with(|c| c.borrow_mut().clear());
+            }
+            log::info!("diag status: problems={} alert={:?} fresh={fresh}", st.problems, st.alert.as_ref().map(|a| a.title.as_str()));
+            if fresh {
+                if let Some(a) = &st.alert {
+                    let (t, d) = (a.title.clone(), a.detail.clone());
+                    slint::Timer::single_shot(std::time::Duration::ZERO, move || dock::on_diag_alert(&t, &d));
+                }
+            }
             match &st.alert {
                 Some(a) => {
                     ui.set_banner_title(a.title.clone().into());

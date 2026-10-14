@@ -496,6 +496,33 @@ pub fn on_incoming(m: &lancat_core::Message) {
     }
 }
 
+/// 诊断提醒（其他设备可能连不进本机……）用的 toast 标识：点它打开「权限与诊断」。
+pub const DIAG_TOAST: &str = "__diag__";
+
+/// 新的诊断提醒：面板收起时横幅看不到，停靠条鼓出提醒 + 托盘气泡通知，点哪个都打开诊断页一键修复。
+pub fn on_diag_alert(title: &str, detail: &str) {
+    let spec = with(|d| -> Result<toast::ToastSpec, &'static str> {
+        if d.visible {
+            return Err("panel open");
+        }
+        if d.mv.is_some() {
+            return Err("dock being dragged");
+        }
+        let geo = d.geo.ok_or("no dock geometry yet")?;
+        let dark = crate::theme_is_dark(&d.node.settings().theme);
+        Ok(toast::ToastSpec { peer_id: DIAG_TOAST.into(), name: "Lancat".into(), text: format!("{title}，点此修复"), edge: current_edge(d), strip: geo.dock, scale: geo.scale, dark, hold_ms: 9000 })
+    });
+    match spec {
+        Some(Ok(spec)) => {
+            log::info!("diag alert toast: {title}");
+            toast::show(spec);
+            tray::balloon(title, &format!("{detail}\n点此打开「权限与诊断」一键修复"));
+        }
+        Some(Err(why)) => log::info!("diag alert toast not shown: {why}"),
+        None => {}
+    }
+}
+
 /// 拖放（drop.rs 已离开 COM 调用）。
 pub fn on_drag(ev: DragEvent) {
     match ev {

@@ -18,11 +18,13 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_BINARY, RRF_RT_REG_SZ};
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetSystemMetricsForDpi};
-use windows::Win32::UI::Shell::{ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW};
+use windows::Win32::UI::Shell::{ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const WM_TRAY: u32 = WM_APP + 0x31;
 const ICON_ID: u32 = 1;
+/// 用户点了气泡通知（NOTIFYICON_VERSION 0：lParam 就是这个消息）
+const NIN_BALLOONUSERCLICK: u32 = 0x405;
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const APPROVED_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run");
 const APP_NAME: PCWSTR = w!("Lancat");
@@ -141,6 +143,23 @@ pub fn remove() {
     let Some(h) = hwnd() else { return };
     unsafe {
         let _ = Shell_NotifyIconW(NIM_DELETE, &nid(h));
+    }
+}
+
+/// 托盘气泡通知（Win10/11 显示为系统通知）；点它打开「权限与诊断」。
+pub fn balloon(title: &str, text: &str) {
+    let Some(h) = hwnd() else { return };
+    let mut n = nid(h);
+    n.uFlags = NIF_INFO;
+    let t: Vec<u16> = title.encode_utf16().take(n.szInfoTitle.len() - 1).collect();
+    n.szInfoTitle[..t.len()].copy_from_slice(&t);
+    let b: Vec<u16> = text.encode_utf16().take(n.szInfo.len() - 1).collect();
+    n.szInfo[..b.len()].copy_from_slice(&b);
+    n.dwInfoFlags = NIIF_WARNING;
+    unsafe {
+        if !Shell_NotifyIconW(NIM_MODIFY, &n).as_bool() {
+            log::warn!("tray: balloon failed");
+        }
     }
 }
 
@@ -266,6 +285,7 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 slint::Timer::single_shot(std::time::Duration::ZERO, super::toggle_panel);
             }
             WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(h),
+            NIN_BALLOONUSERCLICK => slint::Timer::single_shot(std::time::Duration::ZERO, || crate::open_settings(true)),
             _ => {}
         }
         return LRESULT(0);

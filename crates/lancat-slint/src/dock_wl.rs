@@ -485,6 +485,37 @@ pub fn on_incoming(m: &lancat_core::Message) {
     }
 }
 
+/// 诊断提醒用的 toast 标识（同 Windows dock::DIAG_TOAST）。
+pub const DIAG_TOAST: &str = "__diag__";
+
+/// 新的诊断提醒：面板关着时停靠条鼓出提醒，点它打开「权限与诊断」。
+pub fn on_diag_alert(title: &str, _detail: &str) {
+    let spec = with(|d| -> Result<crate::toast_wl::ToastSpec, &'static str> {
+        if d.visible {
+            return Err("panel open");
+        }
+        let (strip, _) = compute(d).ok_or("no dock geometry yet")?;
+        let &(mw, mh, _) = wl::outputs().get(strip.output).ok_or("no output")?;
+        let (w, h, a) = (strip.w as f64, strip.h as f64, strip.along as f64);
+        let rect = match strip.edge.as_str() {
+            "left" => (0.0, a, w, h),
+            "top" => (a, 0.0, w, h),
+            "bottom" => (a, mh as f64 - h, w, h),
+            _ => (mw as f64 - w, a, w, h),
+        };
+        let dark = crate::theme_is_dark(&d.node.settings().theme);
+        Ok(crate::toast_wl::ToastSpec { peer_id: DIAG_TOAST.into(), name: "Lancat".into(), text: format!("{title}，点此修复"), edge: strip.edge.clone(), strip: rect, output: strip.output, dark, hold_ms: 9000 })
+    });
+    match spec {
+        Some(Ok(spec)) => {
+            log::info!("diag alert toast: {title}");
+            crate::toast_wl::show(spec);
+        }
+        Some(Err(why)) => log::info!("diag alert toast not shown: {why}"),
+        None => {}
+    }
+}
+
 /// 拖动停靠条换边：旧版在 Wayland 上拿不到全局光标（cursor_position 出错），按下停靠条只是打开面板、
 /// 按下顶栏什么也不做；这里相同，只把 toast 收起（旧版 begin_move 第一件事）。
 pub fn begin_move(_from_strip: bool) {
