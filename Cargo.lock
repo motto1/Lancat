@@ -2170,7 +2170,7 @@ dependencies = [
 
 [[package]]
 name = "lancat"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -2202,7 +2202,7 @@ dependencies = [
 
 [[package]]
 name = "lancat-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",

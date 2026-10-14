@@ -1584,6 +1584,23 @@ fn wire_ui(ui: &PanelWindow) {
     emoji::wire(ui);
 }
 
+/// 启动失败的提示（界面还没起来，用系统对话框 / 通知）。
+fn fatal_dialog(msg: &str) {
+    #[cfg(windows)]
+    unsafe {
+        use windows::core::PCWSTR;
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+        let w = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let (t, m) = (w("Lancat"), w(msg));
+        MessageBoxW(None, PCWSTR(m.as_ptr()), PCWSTR(t.as_ptr()), MB_OK | MB_ICONERROR);
+    }
+    #[cfg(not(windows))]
+    {
+        eprintln!("{msg}");
+        let _ = std::process::Command::new("notify-send").args(["-u", "critical", "-a", "Lancat", "Lancat 无法启动"]).arg(msg).status();
+    }
+}
+
 fn main() {
     let _ = t0();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,zbus=warn,tracing=warn")).init();
@@ -1615,7 +1632,21 @@ fn main() {
     let mut cfg = NodeConfig::new(data_dir()).with_env();
     log::info!("lancat-slint: data {:?} port {} mdns {} udp {}", cfg.data_dir, cfg.port, cfg.enable_mdns, cfg.enable_udp);
     let wanted_port = cfg.port;
-    let node = rt.block_on(Node::start(cfg)).expect("start lancat node");
+    let node = match rt.block_on(Node::start(cfg)) {
+        Ok(n) => n,
+        Err(e) => {
+            // 以前这里直接 panic：双击后什么都不发生。现在告诉用户原因
+            let e = format!("{e:#}");
+            log::error!("start lancat node: {e}");
+            let msg = if e.contains("bind TCP port") {
+                format!("Lancat 无法启动：端口 {wanted_port} 已被占用。\n\n多半是另一个 Lancat（比如旧版）还在运行。请先在托盘图标上右键退出它，再打开这个版本。\n\n详细信息：{e}")
+            } else {
+                format!("Lancat 无法启动。\n\n详细信息：{e}")
+            };
+            fatal_dialog(&msg);
+            std::process::exit(1);
+        }
+    };
     log::info!("node started in {} ms", t0().elapsed().as_millis());
     migrate_keep_alive(&node);
 
