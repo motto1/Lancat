@@ -735,6 +735,10 @@ impl EmojiState {
     fn stop_hover(&mut self) {
         if self.hover.take().is_some() {
             let _ = self.hover_tx.send(HoverCmd::Stop);
+            if let Some(ui) = ui() {
+                ui.set_emoji_hovered("".into());
+                ui.window().request_redraw();
+            }
         }
     }
 
@@ -742,6 +746,8 @@ impl EmojiState {
         if !on {
             if self.hover.as_deref() == Some(key) {
                 self.stop_hover();
+            } else if let Some(ui) = ui() {
+                ui.window().request_redraw();
             }
             return;
         }
@@ -753,6 +759,11 @@ impl EmojiState {
             PosterSrc::Json(json)
         };
         let px = (GRID_PX * scale()) as u32;
+        if let Some(ui) = ui() {
+            // 新格子先显示静态首帧，上一格立即回到海报
+            ui.set_emoji_hovered("".into());
+            ui.window().request_redraw();
+        }
         self.hover = Some(key.to_string());
         let _ = self.hover_tx.send(HoverCmd::Start { key: key.to_string(), src, px });
     }
@@ -767,6 +778,9 @@ impl EmojiState {
             if ui.get_emoji_hovered().as_str() != key {
                 ui.set_emoji_hovered(key.into());
             }
+            // 表情面板是分层合成的（背景模糊）：渲染器的属性跟踪在合成帧之间被丢掉，
+            // 换图不会自己请求重画 → 每帧显式要一次，否则动画停在某帧、新格子迟迟不动
+            ui.window().request_redraw();
         }
     }
 
