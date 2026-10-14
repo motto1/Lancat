@@ -1159,12 +1159,19 @@ impl App {
                     let n = slots.len();
                     slots.push(DropSlot { key: "all".into(), name: "全部设备".into(), os: format!("{n} 台").into(), all: true, ..Default::default() });
                 }
-                ui.set_drop_slots(ModelRc::new(VecModel::from(slots)));
+                // 同一次拖拽里会再来几次（停靠条 → 面板的 enter、异步读到的项数）：设备没变就不换模型，
+                // 否则槽位全部重建，入场动画从头再来、正在进行的焦点动画也被打断
+                let old = ui.get_drop_slots();
+                let same = old.row_count() == slots.len() && slots.iter().enumerate().all(|(i, s)| old.row_data(i).is_some_and(|o| o == *s));
+                if !same || !ui.get_dragging() {
+                    ui.set_drop_slots(ModelRc::new(VecModel::from(slots)));
+                }
                 ui.set_drag_count(n as i32);
                 if !ui.get_dragging() {
                     compose::start(5);
                 }
                 ui.set_dragging(true);
+                ui.window().request_redraw();
             }
             None => {
                 ui.set_dragging(false);
@@ -1224,6 +1231,8 @@ impl App {
         ui.set_drop_focus_idx(idx);
         ui.set_drop_focus_name(name.into());
         ui.set_drop_key(key.into());
+        // 选择器开着时是分层合成的：渲染器只记得最后一层用到的属性，焦点变化不一定会自己请求重画
+        ui.window().request_redraw();
     }
 
     fn drop_files(&mut self, files: Vec<String>, pos: Option<(f32, f32)>) {
@@ -1835,6 +1844,19 @@ fn run_script(parts: &[String]) {
                         ui.set_drop_focus_name(format!("全部 {n} 台设备").into());
                         ui.set_drop_key("all".into());
                     }
+                }
+            }
+            "drag-focus" => {
+                // 测试：只移动焦点（arg = 槽位序号，-1 = 无），等同拖动中指针移到那个头像上
+                if let Some(ui) = app.ui() {
+                    let i: i32 = arg.parse().unwrap_or(-1);
+                    let s = if i >= 0 { ui.get_drop_slots().row_data(i as usize) } else { None };
+                    let key = s.as_ref().map(|s| s.key.to_string()).unwrap_or_default();
+                    let name = if key == "all" { format!("全部 {} 台设备", app.online_peers().len()) } else { s.map(|s| s.name.to_string()).unwrap_or_default() };
+                    ui.set_drop_focus_idx(if key.is_empty() { -1 } else { i });
+                    ui.set_drop_focus_name(name.into());
+                    ui.set_drop_key(key.into());
+                    ui.window().request_redraw();
                 }
             }
             "drag-end" => app.drag_hint(None),

@@ -91,6 +91,7 @@ export struct FxLayer {
     sat: float,         // saturate()
     lq: length,         // liquid 位移深度（0 = 无）
     parent: int,        // 透明度/入场动画随这个层（拖放提示随选择器）
+    shrink: float,      // 常驻缩放 scale(1 - shrink)，绕层中心（拖拽时内容 scale(.97)：位图变换，不重新排版）
 }
 
 // ------------------------------------------------------------------ sidebar
@@ -851,7 +852,8 @@ component DropSlotView inherits Rectangle {
     init => { self.e = 1; }
     animate e { duration: 420ms; delay: root.idx * 45ms; easing: cubic-bezier(0.34, 1.56, 0.64, 1); }
     // 头像：焦点 1.55，非焦点 .86（320 ms 同缓动）
-    property <float> ak: root.focused ? 1.55 : (root.any-focus ? 0.86 : 1);
+    property <float> ak-to: root.focused ? 1.55 : (root.any-focus ? 0.86 : 1);
+    property <float> ak: self.ak-to;
     animate ak { duration: 320ms; easing: cubic-bezier(0.34, 1.56, 0.64, 1); }
     property <length> ty: root.focused ? 16px : 0px;
     animate ty { duration: 320ms; easing: cubic-bezier(0.34, 1.56, 0.64, 1); }
@@ -867,26 +869,53 @@ component DropSlotView inherits Rectangle {
     pure function py(v: length) -> length { return 66px + (v - 66px) * root.pk + root.pdy; }
     opacity: root.op * clamp(root.e, 0, 1);
     Rectangle {
-        property <length> d: 58px * root.ak * root.pk;
+        // CSS 的 transform: scale 是位图变换：头像和它的 box-shadow 一起缩放（阴影的模糊半径也跟着放大）。
+        // 动画中按固定尺寸画好的位图缩放（每帧不重画头像和高斯阴影）；停稳后头像换成按实际尺寸画的清晰版本。
+        property <float> k: root.ak * root.pk;
+        property <length> d: 58px * self.k;
+        property <bool> settled: root.e >= 1 && abs(root.ak - root.ak-to) < 0.0005;
+        property <color> sc: root.s.all ? Theme.accent : root.s.c2;
         x: root.px(42px) - self.d / 2;
         y: root.py(root.top + 29px) - self.d / 2;
         width: self.d;
         height: self.d;
-        border-radius: self.d / 2;
         // box-shadow 320 ms 过渡：两张阴影图交叉淡入
         property <float> fo: root.focused ? 1 : 0;
         animate fo { duration: 320ms; easing: ease; }
-        Shadow { kind: "pick"; opacity: 1 - parent.fo; ew: parent.width; eh: parent.height; r: parent.width / 2; c: root.s.all ? Theme.accent : root.s.c2; }
-        Shadow { kind: "pick-focus"; opacity: parent.fo; visible: parent.fo > 0.001; ew: parent.width; eh: parent.height; r: parent.width / 2; c: root.s.all ? Theme.accent : root.s.c2; }
+        property <length> m1: Fx.shadow-margin("pick");
+        property <length> m2: Fx.shadow-margin("pick-focus");
+        Image {
+            x: -parent.m1 * parent.k;
+            y: -parent.m1 * parent.k;
+            width: (58px + 2 * parent.m1) * parent.k;
+            height: (58px + 2 * parent.m1) * parent.k;
+            image-fit: fill;
+            opacity: 1 - parent.fo;
+            visible: parent.fo < 0.999;
+            source: Fx.shadow("pick", 58px, 58px, 29px, parent.sc, Theme.dark, Fx.dpr * 1.55);
+        }
+        Image {
+            x: -parent.m2 * parent.k;
+            y: -parent.m2 * parent.k;
+            width: (58px + 2 * parent.m2) * parent.k;
+            height: (58px + 2 * parent.m2) * parent.k;
+            image-fit: fill;
+            opacity: parent.fo;
+            visible: parent.fo > 0.001;
+            source: Fx.shadow("pick-focus", 58px, 58px, 29px, parent.sc, Theme.dark, Fx.dpr * 1.55);
+        }
         Image {
             width: parent.width;
             height: parent.height;
-            source: Fx.paint(root.s.all ? "pick-all" : "pick-avatar", parent.width, parent.height, root.s.c2, Theme.dark, Fx.dpr);
+            image-fit: fill;
+            source: parent.settled
+                ? Fx.paint(root.s.all ? "pick-all" : "pick-avatar", parent.width, parent.height, root.s.c2, Theme.dark, Fx.dpr)
+                : Fx.paint(root.s.all ? "pick-all" : "pick-avatar", 58px, 58px, root.s.c2, Theme.dark, Fx.dpr * 1.55);
         }
         Text {
             text: root.s.all ? "全部" : root.s.initials;
             color: #ffffff;
-            font-size: (root.s.all ? 15px : 21px) * root.ak * root.pk;
+            font-size: (root.s.all ? 15px : 21px) * parent.k;
             font-weight: 600;
             horizontal-alignment: center;
             vertical-alignment: center;
@@ -1043,6 +1072,7 @@ export component PanelWindow inherits Window {
     property <length> pop-blur: Theme.native-glass ? 0px : 30px;
     property <float> pop-sat: Theme.native-glass ? 1 : 1.8;
     out property <[FxLayer]> fx-layers: [
+        { id: 10, shown: shell.dk < 0.9995, x: frame + (360px - content.width) / 2, y: frame + (520px - content.height) / 2, w: content.width, h: content.height, r: 0px, blur: 0px, sat: 1, lq: 0px, parent: 0, shrink: 1 - shell.dk },
         { id: 2, shown: emoji-open, x: frame + ep-x, y: frame + ep-y, w: ep-w, h: 288px, r: 14px, blur: pop-blur, sat: pop-sat, lq: 0px, parent: 0 },
         { id: 3, shown: attach-open, x: frame + am-x, y: frame + am-y, w: 120px, h: am-h, r: 9px, blur: pop-blur, sat: pop-sat, lq: 0px, parent: 0 },
         { id: 5, shown: dragging, x: frame, y: frame, w: 360px, h: 520px, r: 14px, blur: 14px, sat: 1.6, lq: 0px, parent: 0 },
@@ -1093,12 +1123,13 @@ export component PanelWindow inherits Window {
         property <float> dk: root.dragging ? 0.97 : 1;
         animate dk { duration: 320ms; easing: cubic-bezier(0.2, 0.9, 0.3, 1); }
         content := Rectangle {
-            visible: Fx.base();
+            // 拖拽时的 scale(.97) 交给合成层 10（位图缩放，和浏览器的 transform 一样不重新排版）
+            visible: Fx.layer(10);
             // Linux 外壳 .5px 边框（画成 1 设备像素）占布局：内容缩进一圈（border-box）
             x: (360px - self.width) / 2;
             y: (520px - self.height) / 2;
-            width: (360px - 2 * root.shell-bw) * shell.dk;
-            height: (520px - 2 * root.shell-bw) * shell.dk;
+            width: 360px - 2 * root.shell-bw;
+            height: 520px - 2 * root.shell-bw;
             VerticalLayout {
                 // ---- header ----
                 Rectangle {

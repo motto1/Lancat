@@ -135,7 +135,18 @@ fn ensure_tick() {
 }
 
 pub fn animating() -> bool {
-    ANIMS.with(|m| !m.borrow().is_empty())
+    ANIMS.with(|m| !m.borrow().is_empty()) || LAYER_ANIM.with(|a| a.get())
+}
+
+/// 合成帧之后要不要接着画（层里有动画在跑）
+pub fn layer_anim() -> bool {
+    LAYER_ANIM.with(|a| a.get())
+}
+
+thread_local! {
+    /// 上一个合成帧里有 Slint 属性动画在跑。分层合成时渲染器只记得最后一层读过的属性，别的层里的动画
+    /// 推进时不会自己请求重画（has_active_animations 也在下一次 update 时清掉），所以由这里接着要帧。
+    static LAYER_ANIM: Cell<bool> = const { Cell::new(false) };
 }
 
 fn pose(id: i32) -> Option<Pose> {
@@ -168,6 +179,19 @@ fn clear(buf: &mut [Bgra]) {
 
 /// 面板的一帧。`reused`：平台平时用 ReusedBuffer（只重画脏区）。
 pub fn render(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize, scale: f32, reused: bool) -> Out {
+    if !stats_on() {
+        return render_inner(renderer, buf, w, h, scale, reused);
+    }
+    thread_local! { static LAST: Cell<Option<Instant>> = const { Cell::new(None) }; }
+    let t = Instant::now();
+    let out = render_inner(renderer, buf, w, h, scale, reused);
+    let gap = LAST.with(|l| l.replace(Some(t))).map(|p| t.duration_since(p).as_secs_f32() * 1000.0).unwrap_or(0.0);
+    let ph = PH.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    log::info!("frame {:.1} ms (gap {:.1} ms){}{ph}", t.elapsed().as_secs_f32() * 1000.0, gap, if matches!(out, Out::Full) { " composed" } else { "" });
+    out
+}
+
+fn render_inner(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize, scale: f32, reused: bool) -> Out {
     let Some(ui) = panel() else {
         let r = renderer.render(buf, w);
         return Out::Partial(region_box(&r));
@@ -181,6 +205,8 @@ pub fn render(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize,
             continue;
         }
         let p = pose(l.id).or_else(|| if l.parent != 0 { pose(l.parent).map(|p| Pose { tx: 0.0, ty: 0.0, s: 1.0, ..p }) } else { None });
+        // 常驻缩放（拖拽时内容 scale(.97)）
+        let p = if l.shrink > 0.0005 { Some(Pose { s: (1.0 - l.shrink) * p.map_or(1.0, |p| p.s), ..p.unwrap_or(Pose::ID) }) } else { p };
         let needs = p.is_some() || l.blur > 0.0 || l.lq > 0.0;
         if needs || any {
             any = true;
@@ -189,7 +215,7 @@ pub fn render(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize,
     }
     let set_flags = |ids: &[i32]| {
         let has = |i: i32| ids.contains(&i);
-        let pairs: [(i32, fn(&Fx, bool)); 8] = [
+        let pairs: [(i32, fn(&Fx, bool)); 9] = [
             (2, |f, v| f.set_a2(v)),
             (3, |f, v| f.set_a3(v)),
             (4, |f, v| f.set_a4(v)),
@@ -198,12 +224,16 @@ pub fn render(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize,
             (7, |f, v| f.set_a7(v)),
             (8, |f, v| f.set_a8(v)),
             (9, |f, v| f.set_a9(v)),
+            (10, |f, v| f.set_a10(v)),
         ];
         for (i, set) in pairs {
             set(&fx, has(i));
         }
     };
+    let shown: Vec<i32> = active.iter().filter(|(l, _)| l.blur > 0.0 || l.lq > 0.0).map(|(l, _)| l.id).collect();
+    drop_bd_cache(&shown);
     if active.is_empty() {
+        LAYER_ANIM.with(|a| a.set(false));
         if fx.get_pass() != 0 {
             fx.set_pass(0);
             set_flags(&[]);
@@ -228,7 +258,9 @@ pub fn render(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize,
     renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
     fx.set_pass(1);
     clear(buf);
+    let t0 = Instant::now();
     renderer.render(buf, w);
+    phase("base", t0);
     TMP.with(|t| {
         let mut tmp = t.borrow_mut();
         if tmp.len() != buf.len() {
@@ -237,7 +269,12 @@ pub fn render(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize,
         for (l, p) in &active {
             fx.set_pass(l.id);
             clear(&mut tmp);
+            let t0 = Instant::now();
             renderer.render(&mut tmp[..], w);
+            if stats_on() {
+                phase(&format!("r{}", l.id), t0);
+            }
+            let t0 = Instant::now();
             // 层矩形（物理 px）与变换
             let (lx, ly, lw, lh) = (l.x * scale, l.y * scale, l.w * scale, l.h * scale);
             let (ox, oy) = (lx + p.ox * lw, ly + p.oy * lh);
@@ -248,16 +285,20 @@ pub fn render(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize,
                 let (x1, y1) = map(lx + lw, ly + lh);
                 // liquid 的 bevel = min(14, h/2)（CSS px）
                 let bevel = 14.0f32.min(l.h / 2.0) * scale * p.s;
-                backdrop(buf, w, h, (x0, y0, x1, y1), l.r * scale * p.s, l.blur * scale * p.s, l.sat, l.lq * scale * p.s, bevel, p.op);
+                backdrop_cached(l.id, buf, w, h, (x0, y0, x1, y1), l.r * scale * p.s, l.blur * scale * p.s, l.sat, l.lq * scale * p.s, bevel, p.op);
             }
             if p.identity() {
-                over_all(buf, &tmp);
+                let m = 96.0 * scale;
+                over_rect(buf, &tmp, w, h, (lx - m, ly - m, lx + lw + m, ly + lh + m));
             } else {
                 // 层内容（含阴影）可能超出层矩形：按矩形外扩 64px 的变换包围盒采样
                 let m = 64.0 * scale;
                 let (bx0, by0) = map(lx - m, ly - m);
                 let (bx1, by1) = map(lx + lw + m, ly + lh + m);
                 xform_into(buf, &tmp, w, h, (bx0, by0, bx1, by1), ox, oy, p.s, tx, ty, p.op);
+            }
+            if stats_on() {
+                phase(&format!("c{}", l.id), t0);
             }
         }
     });
@@ -267,6 +308,11 @@ pub fn render(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize,
     fx.set_pass(0);
     if reused {
         renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
+    }
+    let more = ui.window().has_active_animations();
+    LAYER_ANIM.with(|a| a.set(more));
+    if more {
+        ui.window().request_redraw();
     }
     Out::Full
 }
@@ -303,38 +349,28 @@ fn over_all(dst: &mut [Bgra], src: &[Bgra]) {
     }
 }
 
-#[inline]
-fn sample(src: &[Bgra], w: usize, h: usize, x: f32, y: f32) -> [f32; 4] {
-    // 双线性（像素中心在 +0.5）
-    let fx = x - 0.5;
-    let fy = y - 0.5;
-    let x0 = fx.floor();
-    let y0 = fy.floor();
-    let ax = fx - x0;
-    let ay = fy - y0;
-    let mut acc = [0f32; 4];
-    for (dy, wy) in [(0i32, 1.0 - ay), (1, ay)] {
-        let yy = y0 as i32 + dy;
-        if yy < 0 || yy >= h as i32 || wy == 0.0 {
-            continue;
-        }
-        for (dx, wx) in [(0i32, 1.0 - ax), (1, ax)] {
-            let xx = x0 as i32 + dx;
-            if xx < 0 || xx >= w as i32 || wx == 0.0 {
-                continue;
-            }
-            let p = src[yy as usize * w + xx as usize];
-            let k = wx * wy;
-            acc[0] += p.b as f32 * k;
-            acc[1] += p.g as f32 * k;
-            acc[2] += p.r as f32 * k;
-            acc[3] += p.a as f32 * k;
+/// 只叠一个矩形（层矩形外扩阴影边距）：小层（提示、toast）不必扫整幅
+fn over_rect(dst: &mut [Bgra], src: &[Bgra], w: usize, h: usize, r: (f32, f32, f32, f32)) {
+    let x0 = r.0.floor().max(0.0) as usize;
+    let y0 = r.1.floor().max(0.0) as usize;
+    let x1 = (r.2.ceil().max(0.0) as usize).min(w);
+    let y1 = (r.3.ceil().max(0.0) as usize).min(h);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    if x0 == 0 && y0 == 0 && x1 == w && y1 == h {
+        return over_all(dst, src);
+    }
+    for y in y0..y1 {
+        let (d, s) = (&mut dst[y * w + x0..y * w + x1], &src[y * w + x0..y * w + x1]);
+        for (d, s) in d.iter_mut().zip(s) {
+            over_px(d, *s);
         }
     }
-    acc
 }
 
-/// src 按「以 (ox,oy) 缩放 s 再平移 (tx,ty)」变换后叠到 dst 上（只算包围盒内），乘 opacity
+/// src 按「以 (ox,oy) 缩放 s 再平移 (tx,ty)」变换后叠到 dst 上（只算包围盒内），乘 opacity。
+/// 缩放是各向同性的：每列 / 每行的源坐标和权重先算好，像素里只做定点双线性。
 #[allow(clippy::too_many_arguments)]
 fn xform_into(dst: &mut [Bgra], src: &[Bgra], w: usize, h: usize, bbox: (f32, f32, f32, f32), ox: f32, oy: f32, s: f32, tx: f32, ty: f32, op: f32) {
     if s <= 0.001 || op <= 0.001 {
@@ -342,18 +378,50 @@ fn xform_into(dst: &mut [Bgra], src: &[Bgra], w: usize, h: usize, bbox: (f32, f3
     }
     let x0 = bbox.0.min(bbox.2).floor().max(0.0) as usize;
     let y0 = bbox.1.min(bbox.3).floor().max(0.0) as usize;
-    let x1 = (bbox.0.max(bbox.2).ceil() as usize).min(w);
-    let y1 = (bbox.1.max(bbox.3).ceil() as usize).min(h);
+    let x1 = (bbox.0.max(bbox.2).ceil().max(0.0) as usize).min(w);
+    let y1 = (bbox.1.max(bbox.3).ceil().max(0.0) as usize).min(h);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    // 源坐标（像素中心在 +0.5）→ (左/上邻居下标, 右/下邻居的 8 位权重)
+    let map = |d: usize, o: f32, t: f32| {
+        let v = o + (d as f32 + 0.5 - t - o) / s - 0.5;
+        let f = v.floor();
+        (f as i32, ((v - f) * 256.0).round().min(256.0) as u32)
+    };
+    let cols: Vec<(i32, u32)> = (x0..x1).map(|x| map(x, ox, tx)).collect();
+    let opk = (op.clamp(0.0, 1.0) * 256.0).round() as u32;
+    let (wi, hi) = (w as i32, h as i32);
+    let px = |x: i32, y: i32| -> [u32; 4] {
+        if x < 0 || y < 0 || x >= wi || y >= hi {
+            [0; 4]
+        } else {
+            let p = src[y as usize * w + x as usize];
+            [p.b as u32, p.g as u32, p.r as u32, p.a as u32]
+        }
+    };
     for y in y0..y1 {
-        let sy = oy + (y as f32 + 0.5 - ty - oy) / s;
-        for x in x0..x1 {
-            let sx = ox + (x as f32 + 0.5 - tx - ox) / s;
-            let c = sample(src, w, h, sx, sy);
-            if c[3] < 0.5 {
+        let (sy, wy) = map(y, oy, ty);
+        if sy < -1 || sy >= hi {
+            continue;
+        }
+        let row = &mut dst[y * w..(y + 1) * w];
+        for (i, x) in (x0..x1).enumerate() {
+            let (sx, wx) = cols[i];
+            if sx < -1 || sx >= wi {
                 continue;
             }
-            let p = Bgra { b: (c[0] * op + 0.5) as u8, g: (c[1] * op + 0.5) as u8, r: (c[2] * op + 0.5) as u8, a: (c[3] * op + 0.5) as u8 };
-            over_px(&mut dst[y * w + x], p);
+            let (p00, p01, p10, p11) = (px(sx, sy), px(sx + 1, sy), px(sx, sy + 1), px(sx + 1, sy + 1));
+            let mut c = [0u32; 4];
+            for k in 0..4 {
+                let top = p00[k] * (256 - wx) + p01[k] * wx;
+                let bot = p10[k] * (256 - wx) + p11[k] * wx;
+                c[k] = ((top * (256 - wy) + bot * wy + (1 << 15)) >> 16) * opk >> 8;
+            }
+            if c[3] == 0 {
+                continue;
+            }
+            over_px(&mut row[x], Bgra { b: c[0].min(255) as u8, g: c[1].min(255) as u8, r: c[2].min(255) as u8, a: c[3].min(255) as u8 });
         }
     }
 }
@@ -414,15 +482,169 @@ fn liquid_n(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32, bevel:
 
 /// 在 dst 的 rect 区域做 backdrop-filter：[liquid 位移] → blur(σ) → saturate(sat)，裁成圆角，按 opacity 混合
 #[allow(clippy::too_many_arguments)]
-fn backdrop(dst: &mut [Bgra], w: usize, h: usize, rect: (f32, f32, f32, f32), radius: f32, sigma: f32, sat: f32, depth: f32, bevel: f32, op: f32) {
+/// 背景滤镜的结果按层缓存：下面的已合成像素和参数都没变（拖放选择器悬停时选择器底下的面板是静止的）
+/// 就直接贴上一帧的结果，省掉整幅高斯模糊。
+struct BdCache {
+    key: [f32; 10],
+    w: usize,
+    input: Vec<Bgra>,
+    output: Vec<Bgra>,
+}
+
+thread_local! {
+    static PH: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+fn stats_on() -> bool {
+    static STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STATS.get_or_init(|| std::env::var_os("LANCAT_FRAME_STATS").is_some())
+}
+
+fn phase(name: &str, t: Instant) {
+    if stats_on() {
+        PH.with(|p| p.borrow_mut().push_str(&format!(" {name}={:.1}", t.elapsed().as_secs_f32() * 1000.0)));
+    }
+}
+
+thread_local! {
+    static BD: RefCell<HashMap<i32, BdCache>> = RefCell::new(HashMap::new());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn backdrop_cached(id: i32, dst: &mut [Bgra], w: usize, h: usize, rect: (f32, f32, f32, f32), radius: f32, sigma: f32, sat: f32, depth: f32, bevel: f32, op: f32) {
+    let key = [rect.0, rect.1, rect.2, rect.3, radius, sigma, sat, depth, bevel, op];
+    let t = Instant::now();
+    // None = 要整幅重算；Some(None) = 全中；Some(Some(win)) = 只有这块输入变了（已外扩成受影响的输出范围）
+    let plan: Option<Option<(usize, usize, usize, usize)>> = BD.with(|m| {
+        let m = m.borrow();
+        let c = m.get(&id)?;
+        if c.key != key || c.w != w || c.input.len() != dst.len() {
+            return None;
+        }
+        // 逐行比，记下变化的外接框
+        let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0usize, 0usize);
+        for y in 0..h {
+            let (a, b) = (&c.input[y * w..(y + 1) * w], &dst[y * w..(y + 1) * w]);
+            if a == b {
+                continue;
+            }
+            let l = a.iter().zip(b).position(|(p, q)| p != q).unwrap_or(0);
+            let r = w - a.iter().rev().zip(b.iter().rev()).position(|(p, q)| p != q).unwrap_or(0);
+            x0 = x0.min(l);
+            x1 = x1.max(r);
+            y0 = y0.min(y);
+            y1 = y1.max(y + 1);
+        }
+        if x0 == usize::MAX {
+            return Some(None);
+        }
+        let r = backdrop_reach(sigma);
+        let win = (x0.saturating_sub(r), y0.saturating_sub(r), (x1 + r).min(w), (y1 + r).min(h));
+        if stats_on() {
+            PH.with(|p| p.borrow_mut().push_str(&format!(" d{id}=[{x0},{y0}..{x1},{y1}]")));
+        }
+        // 液态位移会从层内别处取样：变化碰到层（含读取外扩）就整块重算；碰不到时局部路径什么也不用算
+        if depth > 0.0 {
+            let (rx0, ry0, rx1, ry1) = (rect.0.min(rect.2), rect.1.min(rect.3), rect.0.max(rect.2), rect.1.max(rect.3));
+            let touches = (win.0 as f32) < rx1 + r as f32 && (win.2 as f32) > rx0 - r as f32 && (win.1 as f32) < ry1 + r as f32 && (win.3 as f32) > ry0 - r as f32;
+            return if touches { None } else { Some(Some(win)) };
+        }
+        if (win.2 - win.0) * (win.3 - win.1) * 2 > w * h {
+            return None;
+        }
+        Some(Some(win))
+    });
+    match plan {
+        Some(None) => {
+            BD.with(|m| dst.copy_from_slice(&m.borrow()[&id].output));
+            phase("bd-hit", t);
+        }
+        Some(Some(win)) => {
+            let input = dst.to_vec();
+            backdrop(dst, w, h, rect, radius, sigma, sat, depth, bevel, op, Some(win));
+            BD.with(|m| {
+                let mut m = m.borrow_mut();
+                let c = m.get_mut(&id).expect("cache entry");
+                // 窗口外贴上一帧的结果，窗口内是刚算的
+                for y in 0..h {
+                    let row = y * w;
+                    if y < win.1 || y >= win.3 {
+                        dst[row..row + w].copy_from_slice(&c.output[row..row + w]);
+                    } else {
+                        dst[row..row + win.0].copy_from_slice(&c.output[row..row + win.0]);
+                        dst[row + win.2..row + w].copy_from_slice(&c.output[row + win.2..row + w]);
+                    }
+                }
+                c.input = input;
+                c.output.copy_from_slice(dst);
+            });
+            phase("bd-part", t);
+        }
+        None => {
+            let input = dst.to_vec();
+            backdrop(dst, w, h, rect, radius, sigma, sat, depth, bevel, op, None);
+            BD.with(|m| {
+                let mut m = m.borrow_mut();
+                let c = m.entry(id).or_insert_with(|| BdCache { key, w, input: Vec::new(), output: Vec::new() });
+                c.key = key;
+                c.w = w;
+                c.input = input;
+                c.output.clear();
+                c.output.extend_from_slice(dst);
+            });
+            phase("bd-full", t);
+        }
+    }
+}
+
+/// 层关闭后丢掉它的滤镜缓存（不常驻几 MB）
+fn drop_bd_cache(shown: &[i32]) {
+    BD.with(|m| m.borrow_mut().retain(|id, _| shown.contains(id)));
+}
+
+/// 模糊的降采样倍数（与 blur_clamped 相同）
+fn blur_factor(sigma: f32) -> usize {
+    if sigma < 0.3 {
+        1
+    } else if sigma > 12.0 {
+        4
+    } else if sigma > 6.0 {
+        2
+    } else {
+        1
+    }
+}
+
+/// 背景滤镜的影响半径（物理 px）：输出像素只取决于这个距离内的输入
+fn backdrop_reach(sigma: f32) -> usize {
+    (sigma * 3.0).ceil() as usize + 2 + 2 * blur_factor(sigma)
+}
+
+/// `win`：只重算这个矩形里的输出（物理 px，右下不含）；别处的 dst 不动。读取范围自动外扩，降采样网格与整幅时对齐。
+#[allow(clippy::too_many_arguments)]
+fn backdrop(dst: &mut [Bgra], w: usize, h: usize, rect: (f32, f32, f32, f32), radius: f32, sigma: f32, sat: f32, depth: f32, bevel: f32, op: f32, win: Option<(usize, usize, usize, usize)>) {
     let (rx0, ry0, rx1, ry1) = (rect.0.min(rect.2), rect.1.min(rect.3), rect.0.max(rect.2), rect.1.max(rect.3));
     let pad = (sigma * 3.0).ceil() as i32 + 2;
-    let ix0 = (rx0.floor() as i32 - pad).max(0) as usize;
-    let iy0 = (ry0.floor() as i32 - pad).max(0) as usize;
-    let ix1 = ((rx1.ceil() as i32 + pad).max(0) as usize).min(w);
-    let iy1 = ((ry1.ceil() as i32 + pad).max(0) as usize).min(h);
+    let mut ix0 = (rx0.floor() as i32 - pad).max(0) as usize;
+    let mut iy0 = (ry0.floor() as i32 - pad).max(0) as usize;
+    let mut ix1 = ((rx1.ceil() as i32 + pad).max(0) as usize).min(w);
+    let mut iy1 = ((ry1.ceil() as i32 + pad).max(0) as usize).min(h);
     if ix1 <= ix0 || iy1 <= iy0 {
         return;
+    }
+    let (wx0, wy0, wx1, wy1) = win.unwrap_or((0, 0, w, h));
+    if win.is_some() {
+        let f = blur_factor(sigma);
+        let r = backdrop_reach(sigma);
+        let a0 = wx0.saturating_sub(r).max(ix0);
+        let b0 = wy0.saturating_sub(r).max(iy0);
+        ix0 += (a0 - ix0) / f * f;
+        iy0 += (b0 - iy0) / f * f;
+        ix1 = (wx1 + r).min(ix1);
+        iy1 = (wy1 + r).min(iy1);
+        if ix1 <= ix0 || iy1 <= iy0 {
+            return;
+        }
     }
     let (bw, bh) = (ix1 - ix0, iy1 - iy0);
     // 平面 f32（预乘）
@@ -464,8 +686,17 @@ fn backdrop(dst: &mut [Bgra], w: usize, h: usize, rect: (f32, f32, f32, f32), ra
         }
     }
     if sigma >= 0.3 {
-        for c in ch.iter_mut() {
-            blur_clamped(c, bw, bh, sigma);
+        // 四个通道互不相干：各开一个线程（整幅 σ14 的模糊单线程要 ~40 ms，拖放选择器每帧都可能要）
+        if bw * bh >= 16 * 1024 {
+            std::thread::scope(|sc| {
+                for c in ch.iter_mut() {
+                    sc.spawn(move || blur_clamped(c, bw, bh, sigma));
+                }
+            });
+        } else {
+            for c in ch.iter_mut() {
+                blur_clamped(c, bw, bh, sigma);
+            }
         }
     }
     if (sat - 1.0).abs() > 0.001 {
@@ -485,8 +716,14 @@ fn backdrop(dst: &mut [Bgra], w: usize, h: usize, rect: (f32, f32, f32, f32), ra
     }
     let op = op.clamp(0.0, 1.0);
     for y in 0..bh {
+        if iy0 + y < wy0 || iy0 + y >= wy1 {
+            continue;
+        }
         let py = (iy0 + y) as f32 + 0.5;
         for x in 0..bw {
+            if ix0 + x < wx0 || ix0 + x >= wx1 {
+                continue;
+            }
             let px = (ix0 + x) as f32 + 0.5;
             let c = rrect_cov(px, py, rx0, ry0, rx1, ry1, radius) * op;
             if c <= 0.0 {
@@ -519,7 +756,7 @@ fn bilinear(src: &[f32], w: usize, h: usize, x: f32, y: f32) -> f32 {
 
 /// 高斯近似（三次盒式），边缘取边上的值；σ 大时先 2×/4× 降采样再升回来（大半径下看不出差别）
 fn blur_clamped(buf: &mut [f32], w: usize, h: usize, sigma: f32) {
-    let f = if sigma > 12.0 { 4 } else if sigma > 6.0 { 2 } else { 1 };
+    let f = blur_factor(sigma);
     if f == 1 {
         blur_full(buf, w, h, sigma);
         return;

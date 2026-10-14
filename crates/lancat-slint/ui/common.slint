@@ -58,6 +58,7 @@ export global Fx {
     in-out property <bool> a7;
     in-out property <bool> a8;
     in-out property <bool> a9;
+    in-out property <bool> a10;
     /// box-shadow 图（只画在元素外部的外阴影 + 元素内部的 inset 阴影）；kind 见 fx.rs
     pure callback shadow(string, length, length, length, color, bool, float) -> image;
     pure callback shadow-margin(string) -> length;
@@ -81,7 +82,7 @@ export global Fx {
         return pass == 0 || pass == id || (pass == 1 && !act(id));
     }
     public pure function act(id: int) -> bool {
-        return (id == 2 && a2) || (id == 3 && a3) || (id == 4 && a4) || (id == 5 && a5) || (id == 6 && a6) || (id == 7 && a7) || (id == 8 && a8) || (id == 9 && a9);
+        return (id == 2 && a2) || (id == 3 && a3) || (id == 4 && a4) || (id == 5 && a5) || (id == 6 && a6) || (id == 7 && a7) || (id == 8 && a8) || (id == 9 && a9) || (id == 10 && a10);
     }
 }
 
