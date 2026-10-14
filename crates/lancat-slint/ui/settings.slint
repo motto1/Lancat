@@ -831,7 +831,8 @@ export component SettingsWindow inherits Window {
             padding-left: 22px;
             padding-right: 22px;
             padding-top: 18px;
-            padding-bottom: 30px;
+            // 旧版最后一个 section 还有 margin-bottom 14px（滚到底时多出的留白）
+            padding-bottom: 30px + 14px;
             spacing: 14px;
             HorizontalLayout {
                 spacing: 10px;
@@ -1127,7 +1128,9 @@ export component SettingsWindow inherits Window {
         view-h: fl.height;
         content-h: fl.content-height;
         pos <=> fl.content-y;
-        hovered: hov.has-hover || self.hov;
+        // 设置页是根文档滚动：WebView2 里 :hover 覆盖整页（指针在窗口内就显示滑块），
+        // WebKitGTK 只有指针压在滚动条上才算（实测），所以 Linux 只看滚动条自身
+        hovered: (Fx.gtk ? false : hov.has-hover) || self.hov;
     }
     if root.csd: CsdBar {
         x: 0;

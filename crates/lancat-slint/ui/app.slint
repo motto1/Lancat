@@ -371,7 +371,8 @@ component FileCard inherits Rectangle {
             HorizontalLayout {
                 spacing: 0px;
                 // 一个行框：fmeta 和状态文字在同一行内，行高由含中文的整行决定
-                property <length> mh: Fx.lb(10.5px * root.k, root.m.fmeta + root.m.fst, fmt.preferred-height);
+                // Windows：行框取两段里较高的（「已送达」走 YaHei 回退，比「2.3 MB」高 1.33px，旧版整行按它撑高）
+                property <length> mh: Fx.lb(10.5px * root.k, root.m.fmeta + root.m.fst, max(fmt.preferred-height, fst.preferred-height));
                 fmt := Text { text: root.m.fmeta; font-size: 10.5px * root.k; color: Theme.text-2; height: parent.mh; vertical-alignment: center; }
                 Rectangle {
                     horizontal-stretch: 1;
