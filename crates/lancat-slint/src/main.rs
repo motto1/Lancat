@@ -1,6 +1,6 @@
 //! Lancat 面板（Slint 版）：直接起 lancat-core 节点，功能与旧版 Svelte 面板一致（见 docs/slint/inventory.md）。
 //! Windows 用自写 Win32 Platform（软件渲染 → 预乘 BGRA DIB，Acrylic + DWM 阴影 + 淡入）+ 停靠；
-//! Linux 用自写 SCTK layer-shell 后端（LANCAT_SLINT_WL=1）或 winit。
+//! Linux 在 Wayland 下默认用自写 SCTK layer-shell 后端（LANCAT_SLINT_WL=0 退回 winit）。
 //!
 //! 正式版：与旧版共用数据目录 `<data>/app.lancat.desktop`（设备身份、聊天记录）、端口 47820、mDNS/UDP 发现。
 //! 旧版已归档，不能与旧版同时运行。测试实例用 LANCAT_DATA_DIR / LANCAT_PORT 另开。
@@ -1575,9 +1575,9 @@ fn main() {
 
     #[cfg(windows)]
     slint::platform::set_platform(Box::new(win::Win32Platform::new())).expect("set platform");
-    // LANCAT_SLINT_WL=1 用自写的 SCTK layer-shell 后端（默认仍是 winit）
+    // Wayland 下默认用自写的 SCTK layer-shell 后端（LANCAT_SLINT_WL=0 退回 winit）
     #[cfg(target_os = "linux")]
-    if env("LANCAT_SLINT_WL").as_deref() == Some("1") {
+    if env("LANCAT_SLINT_WL").as_deref() != Some("0") && std::env::var_os("WAYLAND_DISPLAY").is_some() {
         if dock::forward_to_running() {
             return;
         }
