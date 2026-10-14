@@ -24,6 +24,7 @@ const ASSET: &str = "lancat-slint-windows-x64.exe";
 const ASSET: &str = "lancat-slint-linux-x64";
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Release {
     /// 不带 v 的版本号
     pub version: String,
@@ -291,7 +292,8 @@ fn short(e: &str) -> String {
 /// 启动后 30 s 查一次，之后每 6 小时一次（设置里关掉「自动检查更新」就不查）。
 pub fn start_auto(node: std::sync::Arc<lancat_core::Node>) {
     let n = node.clone();
-    slint::Timer::single_shot(std::time::Duration::from_secs(30), move || {
+    let first = std::env::var("LANCAT_SLINT_UPDATE_DELAY").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+    slint::Timer::single_shot(std::time::Duration::from_secs(first), move || {
         if n.settings().auto_update {
             check_bg(false);
         }
@@ -328,6 +330,11 @@ pub fn check_bg(manual: bool) {
                     *n = v.clone();
                     first
                 });
+                // 测试：LANCAT_SLINT_AUTOUPDATE=1 发现新版就直接装（验证下载 / 替换 / 重启整条链路）
+                if std::env::var_os("LANCAT_SLINT_AUTOUPDATE").is_some() {
+                    slint::Timer::single_shot(std::time::Duration::ZERO, install_bg);
+                    return;
+                }
                 if !manual && first {
                     crate::dock::on_update_alert(&format!("Lancat {v} 已发布"));
                 }
