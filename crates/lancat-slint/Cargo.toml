@@ -59,3 +59,5 @@ inherits = "release"
 lto = false
 codegen-units = 16
 opt-level = "s"
+# 只重编改动的部分：改一行代码后重编从约 100 s 降到约 10 s（Windows 实测）
+incremental = true

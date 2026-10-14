@@ -226,6 +226,8 @@ cargo build --release                 # 正式构建（opt-level z + fat LTO，�
 cargo build --profile fastrel         # 快速优化构建（无 LTO），测量与日常调试用
 ```
 
+`fastrel` 开了增量编译，Windows 上用 Rust 自带的 `rust-lld` 链接（见 `.cargo/config.toml`）。在 16 线程的笔记本上实测：从零编译约 4.5 分钟，改一行代码后重编约 10–13 秒（原来约 100 秒）。从零编译的大头是依赖库（Slint 编译器、字体库、ThorVG、windows 接口库）和 `lancat-slint` 本身（.slint 生成的代码，约 90 秒）。
+
 产物：`crates/lancat-slint/target/release/lancat-slint`（Windows 为 `lancat-slint.exe`）。
 
 `thorvg-sys` 从源码编译 ThorVG，`bindgen` 需要 **libclang** 和 C++ 编译器。
