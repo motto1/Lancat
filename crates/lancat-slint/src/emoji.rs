@@ -6,7 +6,7 @@ use crate::emoji_catalog::{Emoji, CATEGORIES, EMOJI};
 use crate::lottie::Player;
 use crate::{post, with_app, EmojiCell, EmojiSection, PanelWindow};
 use lancat_core::{EmojiPayload, Node, Settings};
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::PathBuf;
@@ -250,6 +250,8 @@ pub struct EmojiState {
     cols: usize,
     prewarmed: bool,
     released: bool,
+    /// 上次建好的网格的签名（列数 / 最近使用 / 贴纸 / 搜索词）：没变就不重建模型（重建 = 一百多个格子重新实例化）
+    built: String,
 }
 
 const GRID_PX: f32 = 30.0;
@@ -278,6 +280,7 @@ impl EmojiState {
             cols: 7,
             prewarmed: false,
             released: false,
+            built: String::new(),
         }
     }
 
@@ -341,19 +344,58 @@ impl EmojiState {
                 let _ = self.glyph(em, px);
             }
         }
+        // 网格模型也先建好：第一次打开表情面板时不用在弹出动画的第一帧里建
+        if let Some(ui) = ui() {
+            self.cols = ui.get_emoji_cols().max(1) as usize;
+        }
+        self.stickers = list_stickers(&self.node);
+        if self.query.is_empty() && self.sig() != self.built {
+            self.rebuild_sections();
+        }
+    }
+
+    fn sig(&self) -> String {
+        let st: Vec<&str> = self.stickers.iter().map(|s| s.id.as_str()).collect();
+        let rc: Vec<&String> = self.recent.iter().take(21).collect();
+        format!("{}|{}|{:?}|{:?}", self.query.trim().to_lowercase(), self.cols, rc, st)
+    }
+
+    /// 首帧到了：只换用到它的格子的图（不重建整个网格）
+    fn patch_cells(&self, key: &str, img: &slint::Image) {
+        let cell_key = if let Some(r) = key.strip_prefix("glyph:") {
+            r.rsplit_once(':').map(|(c, _)| c.to_string())
+        } else if let Some(r) = key.strip_prefix("sticker:") {
+            r.rsplit_once(':').map(|(c, _)| format!("s:{c}"))
+        } else {
+            None
+        };
+        let Some(cell_key) = cell_key else { return };
+        let Some(ui) = ui() else { return };
+        let secs = ui.get_emoji_sections();
+        for sec in secs.iter() {
+            let cells = sec.cells.clone();
+            for i in 0..cells.row_count() {
+                if let Some(mut c) = cells.row_data(i) {
+                    if c.key == cell_key.as_str() {
+                        c.img = img.clone();
+                        cells.set_row_data(i, c);
+                    }
+                }
+            }
+        }
     }
 
     fn poster_done(&mut self, key: String, px: u32, buf: Option<Vec<u8>>) {
         self.pending.remove(&key);
         let Some(buf) = buf else { return };
         let img = image_from(&buf, px);
-        self.posters.insert(key.clone(), img);
-        // chat rows waiting for it / the open grid
+        self.posters.insert(key.clone(), img.clone());
+        // chat rows waiting for it / the grid
         if key.ends_with(&format!(":{}", (160.0 * scale()) as u32)) {
             with_app_later(|app| app.refresh_stickers());
         }
-        if self.open {
-            self.queue_rebuild();
+        if !self.built.is_empty() {
+            self.patch_cells(&key, &img);
         }
     }
 
@@ -446,6 +488,7 @@ impl EmojiState {
         }
         ui.set_emoji_sections(ModelRc::new(VecModel::from(secs)));
         ui.set_importing(self.importing);
+        self.built = self.sig();
     }
 
     pub fn opened_pub(&mut self, open: bool) {
@@ -457,13 +500,18 @@ impl EmojiState {
         if open {
             self.stickers = list_stickers(&self.node);
             self.query.clear();
+            let mut empty = true;
             if let Some(ui) = ui() {
                 ui.set_emoji_query("".into());
                 ui.set_emoji_scroll(0.0);
                 ui.set_emoji_tab("recent".into());
                 self.cols = ui.get_emoji_cols().max(1) as usize;
+                empty = ui.get_emoji_sections().row_count() == 0;
             }
-            self.rebuild_sections();
+            // 内容没变就沿用上次的网格（旧版组件常驻，打开即显示）
+            if empty || self.sig() != self.built {
+                self.rebuild_sections();
+            }
             if let Some(ui) = ui() {
                 ui.invoke_focus_emoji_search();
             }
@@ -565,6 +613,11 @@ impl EmojiState {
         self.timer.stop();
         self.prewarmed = false;
         self.released = true;
+        // 网格里的格子也引用着首帧图：一起放掉，下次打开重建
+        self.built.clear();
+        if let Some(ui) = ui() {
+            ui.set_emoji_sections(ModelRc::new(VecModel::<EmojiSection>::default()));
+        }
     }
 
     /// 释放过：下次弹出时让聊天里的贴纸重新取首帧

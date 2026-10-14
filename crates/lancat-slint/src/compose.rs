@@ -280,7 +280,20 @@ fn render_inner(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usiz
             let (ox, oy) = (lx + p.ox * lw, ly + p.oy * lh);
             let (tx, ty) = (p.tx * scale, p.ty * scale);
             let map = |x: f32, y: f32| (ox + (x - ox) * p.s + tx, oy + (y - oy) * p.s + ty);
-            if l.blur > 0.0 || l.lq > 0.0 {
+            if l.blur > 0.0 && l.lq <= 0.0 {
+                // 纯模糊（表情面板、拖放选择器）：底下的模糊结果与层的姿态无关，按层的静止矩形外扩一圈算一次缓存，
+                // 弹出动画的每帧只按当前矩形裁圆角、乘透明度贴上（模糊半径取静止时的值）
+                let (x0, y0) = map(lx, ly);
+                let (x1, y1) = map(lx + lw, ly + lh);
+                let mg = lw.max(lh) * 0.12 + 16.0 * scale;
+                let region = (
+                    (lx - mg).floor().max(0.0) as usize,
+                    (ly - mg).floor().max(0.0) as usize,
+                    ((lx + lw + mg).ceil().max(0.0) as usize).min(w),
+                    ((ly + lh + mg).ceil().max(0.0) as usize).min(h),
+                );
+                backdrop_static(l.id, buf, w, h, region, (x0, y0, x1, y1), l.r * scale * p.s, l.blur * scale, l.sat, p.op);
+            } else if l.blur > 0.0 || l.lq > 0.0 {
                 let (x0, y0) = map(lx, ly);
                 let (x1, y1) = map(lx + lw, ly + lh);
                 // liquid 的 bevel = min(14, h/2)（CSS px）
@@ -600,6 +613,140 @@ fn backdrop_cached(id: i32, dst: &mut [Bgra], w: usize, h: usize, rect: (f32, f3
 /// 层关闭后丢掉它的滤镜缓存（不常驻几 MB）
 fn drop_bd_cache(shown: &[i32]) {
     BD.with(|m| m.borrow_mut().retain(|id, _| shown.contains(id)));
+    BS.with(|m| m.borrow_mut().retain(|id, _| shown.contains(id)));
+}
+
+/// 纯模糊层的缓存：region 内「模糊 + 饱和度」之后的像素（与层的当前姿态、圆角、透明度无关）
+struct BsCache {
+    key: [f32; 6],
+    w: usize,
+    input: Vec<Bgra>,
+    filt: Vec<Bgra>,
+}
+
+thread_local! {
+    static BS: RefCell<HashMap<i32, BsCache>> = RefCell::new(HashMap::new());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn backdrop_static(id: i32, dst: &mut [Bgra], w: usize, h: usize, region: (usize, usize, usize, usize), rect: (f32, f32, f32, f32), radius: f32, sigma: f32, sat: f32, op: f32) {
+    let (gx0, gy0, gx1, gy1) = region;
+    if gx1 <= gx0 || gy1 <= gy0 || op <= 0.001 {
+        return;
+    }
+    let key = [gx0 as f32, gy0 as f32, gx1 as f32, gy1 as f32, sigma, sat];
+    let reach = backdrop_reach(sigma);
+    let t = Instant::now();
+    // None = 整块重算；Some(None) = 输入没变；Some(Some(win)) = 只重算 win
+    let plan: Option<Option<(usize, usize, usize, usize)>> = BS.with(|m| {
+        let m = m.borrow();
+        let c = m.get(&id)?;
+        if c.key != key || c.w != w || c.input.len() != dst.len() {
+            return None;
+        }
+        let (ry0, ry1) = (gy0.saturating_sub(reach), (gy1 + reach).min(h));
+        let (rx0, rx1) = (gx0.saturating_sub(reach), (gx1 + reach).min(w));
+        let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0usize, 0usize);
+        for y in ry0..ry1 {
+            let (a, b) = (&c.input[y * w + rx0..y * w + rx1], &dst[y * w + rx0..y * w + rx1]);
+            if a == b {
+                continue;
+            }
+            let l = a.iter().zip(b).position(|(p, q)| p != q).unwrap_or(0);
+            let r = a.len() - a.iter().rev().zip(b.iter().rev()).position(|(p, q)| p != q).unwrap_or(0);
+            x0 = x0.min(rx0 + l);
+            x1 = x1.max(rx0 + r);
+            y0 = y0.min(y);
+            y1 = y1.max(y + 1);
+        }
+        if x0 == usize::MAX {
+            return Some(None);
+        }
+        let win = (x0.saturating_sub(reach).max(gx0), y0.saturating_sub(reach).max(gy0), (x1 + reach).min(gx1), (y1 + reach).min(gy1));
+        if win.2 <= win.0 || win.3 <= win.1 {
+            return Some(None);
+        }
+        if (win.2 - win.0) * (win.3 - win.1) * 2 > (gx1 - gx0) * (gy1 - gy0) {
+            return None;
+        }
+        Some(Some(win))
+    });
+    let recompute = |win: (usize, usize, usize, usize), full: bool| {
+        let mut tmp = dst.to_vec();
+        backdrop(&mut tmp, w, h, (gx0 as f32, gy0 as f32, gx1 as f32, gy1 as f32), 0.0, sigma, sat, 0.0, 0.0, 1.0, Some(win));
+        BS.with(|m| {
+            let mut m = m.borrow_mut();
+            let c = m.entry(id).or_insert_with(|| BsCache { key, w, input: Vec::new(), filt: Vec::new() });
+            if full || c.filt.len() != dst.len() {
+                c.filt = vec![Bgra::default(); dst.len()];
+            }
+            for y in win.1..win.3 {
+                c.filt[y * w + win.0..y * w + win.2].copy_from_slice(&tmp[y * w + win.0..y * w + win.2]);
+            }
+            c.key = key;
+            c.w = w;
+            c.input.clear();
+            c.input.extend_from_slice(dst);
+        });
+    };
+    match plan {
+        Some(None) => phase("bs-hit", t),
+        Some(Some(win)) => {
+            recompute(win, false);
+            phase("bs-part", t);
+        }
+        None => {
+            recompute(region, true);
+            phase("bs-full", t);
+        }
+    }
+    // 按当前矩形（圆角）× 透明度贴上
+    let t = Instant::now();
+    let (rx0, ry0, rx1, ry1) = (rect.0.min(rect.2), rect.1.min(rect.3), rect.0.max(rect.2), rect.1.max(rect.3));
+    let x0 = (rx0.floor().max(0.0) as usize).max(gx0);
+    let y0 = (ry0.floor().max(0.0) as usize).max(gy0);
+    let x1 = (rx1.ceil().max(0.0) as usize).min(gx1);
+    let y1 = (ry1.ceil().max(0.0) as usize).min(gy1);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let op = op.clamp(0.0, 1.0);
+    let r = radius.min((rx1 - rx0) / 2.0).min((ry1 - ry0) / 2.0).max(0.0);
+    BS.with(|m| {
+        let m = m.borrow();
+        let Some(c) = m.get(&id) else { return };
+        for y in y0..y1 {
+            let py = y as f32 + 0.5;
+            // 不在圆角带里的行：整行内部覆盖率只看左右边
+            let in_band = py < ry0 + r || py > ry1 - r;
+            let row = y * w;
+            for x in x0..x1 {
+                let px = x as f32 + 0.5;
+                let cov = if !in_band && px > rx0 + r.max(1.0) && px < rx1 - r.max(1.0) {
+                    ((py - ry0).min(ry1 - py) + 0.5).clamp(0.0, 1.0)
+                } else {
+                    rrect_cov(px, py, rx0, ry0, rx1, ry1, radius)
+                };
+                let k = cov * op;
+                if k <= 0.0 {
+                    continue;
+                }
+                let n = c.filt[row + x];
+                let d = &mut dst[row + x];
+                if k >= 0.999 {
+                    *d = n;
+                    continue;
+                }
+                let ki = (k * 256.0) as i32;
+                let mixv = |o: u8, n: u8| (o as i32 + (((n as i32 - o as i32) * ki) >> 8)).clamp(0, 255) as u8;
+                d.b = mixv(d.b, n.b);
+                d.g = mixv(d.g, n.g);
+                d.r = mixv(d.r, n.r);
+                d.a = mixv(d.a, n.a);
+            }
+        }
+    });
+    phase("bs-mix", t);
 }
 
 /// 模糊的降采样倍数（与 blur_clamped 相同）

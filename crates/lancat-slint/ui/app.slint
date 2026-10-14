@@ -97,6 +97,23 @@ export struct FxLayer {
 // ------------------------------------------------------------------ sidebar
 
 /// 头像 + 选中环 + 在线点 + 未读徽标 + 勾选，整体按 k 缩放（旧版 transform 作用在 .avatar 上，子元素一起缩放）
+/// 侧栏头像的 box-shadow（38px 圆）：随 transform 缩放
+component AvShadow inherits Image {
+    in property <string> kind;
+    in property <float> k: 1;
+    in property <bool> settled: true;
+    in property <color> c: transparent;
+    property <length> m: Fx.shadow-margin(kind);
+    x: -self.m * self.k;
+    y: -self.m * self.k;
+    width: (38px + 2 * self.m) * self.k;
+    height: self.width;
+    image-fit: fill;
+    source: self.settled
+        ? Fx.shadow(kind, 38px * self.k, 38px * self.k, 19px * self.k, c, Theme.dark, Fx.dpr)
+        : Fx.shadow(kind, 38px, 38px, 19px, c, Theme.dark, Fx.dpr * 1.2);
+}
+
 component AvatarGroup inherits Rectangle {
     in property <PeerItem> peer;
     in property <bool> all;
@@ -104,7 +121,11 @@ component AvatarGroup inherits Rectangle {
     in property <bool> ring;
     in property <bool> hot;
     in property <float> k: 1;
+    // k 停稳了：头像 / 阴影换成按实际尺寸画的清晰版本；动画中用固定尺寸画好的位图缩放（CSS transform 的做法，
+    // 每帧不重画渐变圆和高斯阴影；缩写字母画在位图里，和圆形一起缩放，不会错位）
+    in property <bool> settled: true;
     property <length> s: 38px * k;
+    property <string> pk: "side-avatar|" + root.peer.initials;
     width: 0px;
     height: 0px;
     // 选中环：box-shadow 0 0 0 2px glass-strong, 0 0 0 4px accent（随头像缩放），120 ms 淡入
@@ -139,8 +160,8 @@ component AvatarGroup inherits Rectangle {
         animate op { duration: 160ms; easing: cubic-bezier(0.2, 0.8, 0.3, 1); }
         // 拖放热区：外加 0 6px 18px accent 45% 光晕
         // .item.active/.selected/.drop-hot 的 box-shadow 换成选中环（+ 热区光晕），原来的投影与 inset 高光随之没有
-        if root.hot: Shadow { kind: "avatar-hot"; opacity: av.op; ew: parent.width; eh: parent.height; r: parent.width / 2; c: Theme.accent; }
-        if !root.all && !root.ring: Shadow { kind: "avatar"; opacity: av.op; ew: parent.width; eh: parent.height; r: parent.width / 2; }
+        if root.hot: AvShadow { kind: "avatar-hot"; opacity: av.op; k: root.k; settled: root.settled; c: Theme.accent; }
+        if !root.all && !root.ring: AvShadow { kind: "avatar"; opacity: av.op; k: root.k; settled: root.settled; }
         if root.all: Rectangle {
             border-radius: parent.width / 2;
             background: root.active ? Theme.accent : Theme.hover;
@@ -153,18 +174,11 @@ component AvatarGroup inherits Rectangle {
             height: parent.height;
             opacity: av.op;
             image-fit: fill;
-            source: Fx.paint("side-avatar", parent.width, parent.height, root.peer.c2, Theme.dark, Fx.dpr);
+            source: root.settled
+                ? Fx.paint(root.pk, parent.width, parent.height, root.peer.c2, Theme.dark, Fx.dpr)
+                : Fx.paint(root.pk, 38px, 38px, root.peer.c2, Theme.dark, Fx.dpr * 1.2);
         }
-        if !root.all && !root.ring: Shadow { kind: "avatar-inset"; opacity: av.op; ew: parent.width; eh: parent.height; r: parent.width / 2; }
-        if !root.all: Text {
-            opacity: av.op;
-            text: root.peer.initials;
-            color: #ffffff;
-            font-size: 13px * root.k;
-            font-weight: 600;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-        }
+        if !root.all && !root.ring: AvShadow { kind: "avatar-inset"; opacity: av.op; k: root.k; settled: root.settled; }
         if root.all: Icon {
             d: Icons.grid;
             size: 17px * root.k;
@@ -237,7 +251,8 @@ component SidebarItem inherits Rectangle {
     property <string> label: root.all ? "全部" : root.peer.name;
     property <length> label-h: Fx.lb(10px, root.label, 13px);
     height: 5px + 38px + 3px + root.label-h + 5px;
-    property <float> k: root.drop-hot ? 1.18 : (ta.pressed ? 0.94 : (ta.has-hover ? 1.05 : 1));
+    property <float> k-to: root.drop-hot ? 1.18 : (ta.pressed ? 0.94 : (ta.has-hover ? 1.05 : 1));
+    property <float> k: self.k-to;
     animate k { duration: 160ms; easing: cubic-bezier(0.2, 0.9, 0.3, 1.4); }
     ta := TipArea {
         tip: root.all ? "全部在线设备（群发）" : root.peer.name + (root.peer.online ? "" : "（离线）") + "\nShift+点击可多选";
@@ -259,6 +274,7 @@ component SidebarItem inherits Rectangle {
         ring: root.active || root.peer.picked || root.drop-hot;
         hot: root.drop-hot;
         k: root.k;
+        settled: abs(root.k - root.k-to) < 0.0005;
     }
     Text {
         y: 5px + 38px + 3px;
@@ -353,9 +369,13 @@ component FileCard inherits Rectangle {
         }
         VerticalLayout {
             horizontal-stretch: 1;
+            // 文件名再长也不能把卡片撑宽（CSS min-width:0 + ellipsis）：只读输入框的最小宽度 = 整串文字宽
+            min-width: 0px;
             alignment: center;
             spacing: 0px;
             Rectangle {
+                min-width: 0px;
+                clip: true;
                 height: Fx.lb(12.5px * root.k, root.m.fname, fnm.preferred-height);
                 fnm := Text { width: parent.width; height: parent.height; vertical-alignment: center; text: root.m.fname; font-size: 12.5px * root.k; font-weight: 500; color: Theme.text; overflow: elide; }
                 // 文件名可选中：选中时换成只读输入框（省略号版本留给静止态）
@@ -377,6 +397,8 @@ component FileCard inherits Rectangle {
                 fmt := Text { text: root.m.fmeta; font-size: 10.5px * root.k; color: Theme.text-2; height: parent.mh; vertical-alignment: center; }
                 Rectangle {
                     horizontal-stretch: 1;
+                    min-width: 0px;
+                    clip: true;
                     height: parent.mh;
                     fst := Text { width: parent.width; height: parent.height; vertical-alignment: center; text: root.m.fst; font-size: 10.5px * root.k; color: root.m.failed ? Theme.danger : Theme.text-2; overflow: elide; }
                     TipArea { tip: root.m.failed ? root.m.err : ""; }
@@ -904,21 +926,15 @@ component DropSlotView inherits Rectangle {
             visible: parent.fo > 0.001;
             source: Fx.shadow("pick-focus", 58px, 58px, 29px, parent.sc, Theme.dark, Fx.dpr * 1.55);
         }
+        // 缩写字母画在头像位图里（字号按整数物理像素取的 Text 在缩放动画里会和圆形错位、一跳一跳）
+        property <string> lbl: (root.s.all ? "pick-all|全部" : "pick-avatar|" + root.s.initials);
         Image {
             width: parent.width;
             height: parent.height;
             image-fit: fill;
             source: parent.settled
-                ? Fx.paint(root.s.all ? "pick-all" : "pick-avatar", parent.width, parent.height, root.s.c2, Theme.dark, Fx.dpr)
-                : Fx.paint(root.s.all ? "pick-all" : "pick-avatar", 58px, 58px, root.s.c2, Theme.dark, Fx.dpr * 1.55);
-        }
-        Text {
-            text: root.s.all ? "全部" : root.s.initials;
-            color: #ffffff;
-            font-size: (root.s.all ? 15px : 21px) * parent.k;
-            font-weight: 600;
-            horizontal-alignment: center;
-            vertical-alignment: center;
+                ? Fx.paint(parent.lbl, parent.width, parent.height, root.s.c2, Theme.dark, Fx.dpr)
+                : Fx.paint(parent.lbl, 58px, 58px, root.s.c2, Theme.dark, Fx.dpr * 1.55);
         }
     }
     nm := Text {

@@ -204,3 +204,217 @@ pub fn render(ch: &str, px: u32, font_px: f32) -> Option<Vec<u8>> {
 pub fn render(_ch: &str, _px: u32, _font_px: f32) -> Option<Vec<u8>> {
     None
 }
+
+// ------------------------------------------------------------------ 单行文字 → alpha 遮罩
+
+/// 一行文字画进 w×h（物理像素）的 alpha 遮罩：水平居中（按前进宽度），垂直按行框（ascent+descent）居中，
+/// 与 Slint `Text { horizontal-alignment: center; vertical-alignment: center; }` 的排法相同。
+/// 拖放选择器头像里的缩写字母要和头像位图一起缩放（软件渲染器的字号按整数物理像素取，动画中会和圆形错位），
+/// 所以画进头像位图里。`weight` 是 CSS 字重。
+#[cfg(windows)]
+pub fn text_mask(text: &str, family: &str, weight: i32, font_px: f32, w: u32, h: u32) -> Option<Vec<u8>> {
+    use std::cell::RefCell;
+    use windows::core::{w, HSTRING};
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Direct2D::Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT};
+    use windows::Win32::Graphics::Direct2D::{
+        D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES,
+        D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+    };
+    use windows::Win32::Graphics::DirectWrite::{
+        DWriteCreateFactory, IDWriteFactory, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+        DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_WORD_WRAPPING_NO_WRAP,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+    use windows::Win32::Graphics::Gdi::{CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS};
+
+    struct G {
+        _d2d: ID2D1Factory,
+        dw: IDWriteFactory,
+        rt: ID2D1DCRenderTarget,
+    }
+    thread_local! {
+        static T_: RefCell<Option<G>> = const { RefCell::new(None) };
+    }
+    if w == 0 || h == 0 || w > 2048 || h > 2048 || text.is_empty() {
+        return None;
+    }
+    T_.with(|cell| unsafe {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            let props = D2D1_RENDER_TARGET_PROPERTIES {
+                r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                usage: D2D1_RENDER_TARGET_USAGE_NONE,
+                minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+            };
+            let g = (|| -> windows::core::Result<G> {
+                let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+                let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+                let rt = d2d.CreateDCRenderTarget(&props)?;
+                Ok(G { _d2d: d2d, dw, rt })
+            })()
+            .map_err(|e| log::warn!("text_mask: Direct2D init failed: {e}"))
+            .ok()?;
+            *slot = Some(g);
+        }
+        let g = slot.as_ref()?;
+        let fam = HSTRING::from(family);
+        let fmt = g.dw.CreateTextFormat(&fam, None, DWRITE_FONT_WEIGHT(weight), DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, font_px, w!("zh-cn")).ok()?;
+        let _ = fmt.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        let _ = fmt.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        let _ = fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let layout = g.dw.CreateTextLayout(&wide, &fmt, w as f32, h as f32).ok()?;
+
+        let (wi, hi) = (w as i32, h as i32);
+        let mem = CreateCompatibleDC(None);
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: wi, biHeight: -hi, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default() },
+            ..Default::default()
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut out = None;
+        if let Ok(bmp) = CreateDIBSection(Some(mem), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+            let old = SelectObject(mem, bmp.into());
+            let rc = RECT { left: 0, top: 0, right: wi, bottom: hi };
+            if g.rt.BindDC(mem, &rc).is_ok() {
+                g.rt.BeginDraw();
+                g.rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+                g.rt.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
+                if let Ok(b) = g.rt.CreateSolidColorBrush(&D2D1_COLOR_F { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }, None) {
+                    g.rt.DrawTextLayout(windows_numerics::Vector2 { X: 0.0, Y: 0.0 }, &layout, &b, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                }
+                if g.rt.EndDraw(None, None).is_ok() && !bits.is_null() {
+                    let n = (w * h) as usize;
+                    let px = std::slice::from_raw_parts(bits as *const u8, n * 4);
+                    out = Some((0..n).map(|i| px[i * 4 + 3]).collect::<Vec<u8>>());
+                }
+            }
+            SelectObject(mem, old);
+            let _ = DeleteObject(bmp.into());
+        }
+        let _ = DeleteDC(mem);
+        out
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub fn text_mask(text: &str, family: &str, weight: i32, font_px: f32, w: u32, h: u32) -> Option<Vec<u8>> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use swash::scale::{Render, ScaleContext, Source};
+    use swash::shape::ShapeContext;
+    use swash::zeno::{Format, Vector};
+    use swash::FontRef;
+
+    type Face = Option<(Arc<Vec<u8>>, usize)>;
+    static FACES: OnceLock<Mutex<HashMap<String, (Face, Face)>>> = OnceLock::new();
+    thread_local! {
+        static CTX: RefCell<(ShapeContext, ScaleContext)> = RefCell::new((ShapeContext::new(), ScaleContext::new()));
+    }
+    if w == 0 || h == 0 || w > 2048 || h > 2048 || text.is_empty() {
+        return None;
+    }
+    // fontconfig 的字重刻度：600 → 180（semibold），400 → 80，700 → 200
+    let fcw = match weight {
+        ..=350 => 50,
+        351..=450 => 80,
+        451..=550 => 100,
+        551..=650 => 180,
+        651..=750 => 200,
+        _ => 210,
+    };
+    let fc = |pat: &str| -> Face {
+        let out = std::process::Command::new("fc-match").args(["-f", "%{file}\t%{index}", pat]).output().ok()?;
+        let s = String::from_utf8_lossy(&out.stdout).to_string();
+        let mut it = s.split('\t');
+        let file = it.next()?.to_string();
+        let idx: usize = it.next().unwrap_or("0").trim().parse().unwrap_or(0);
+        let data = std::fs::read(&file).ok()?;
+        // 可变字体的命名实例编码在高 16 位；字面序号只要低 16 位，字重另外按 wght 轴设
+        Some((Arc::new(data), idx & 0xffff))
+    };
+    let (prim, cjk) = {
+        let map = FACES.get_or_init(|| Mutex::new(HashMap::new()));
+        let key = format!("{family}|{fcw}");
+        let mut m = map.lock().ok()?;
+        m.entry(key)
+            .or_insert_with(|| {
+                let fam = if family.is_empty() { "sans-serif" } else { family };
+                let p = fc(&format!("{fam}:weight={fcw}"));
+                let c = fc(&format!("{fam}:weight={fcw}:charset=4e2d")).or_else(|| fc(&format!("sans-serif:lang=zh-cn:weight={fcw}")));
+                (p, c)
+            })
+            .clone()
+    };
+    let (pd, pi) = prim?;
+    let pf = FontRef::from_index(&pd, pi)?;
+    let cf = cjk.as_ref().and_then(|(d, i)| FontRef::from_index(d, *i));
+    let wght = [swash::Setting { tag: swash::tag_from_bytes(b"wght"), value: weight as f32 }];
+    // 按字分段：主字体没有的字形交给中文字体
+    let mut runs: Vec<(FontRef, String)> = Vec::new();
+    for ch in text.chars() {
+        let f = if pf.charmap().map(ch) != 0 { pf } else { cf.filter(|c| c.charmap().map(ch) != 0).unwrap_or(pf) };
+        match runs.last_mut() {
+            Some((lf, s)) if lf.key == f.key => s.push(ch),
+            _ => runs.push((f, ch.to_string())),
+        }
+    }
+    CTX.with(|c| {
+        let (shape, scale) = &mut *c.borrow_mut();
+        // (字体, 字形, x) —— x 是相对行首的笔位置
+        let mut glyphs: Vec<(FontRef, u16, f32)> = Vec::new();
+        let mut pen = 0f32;
+        let (mut asc, mut desc) = (0f32, 0f32);
+        for (f, s) in &runs {
+            let m = f.metrics(&[]);
+            let u = m.units_per_em.max(1) as f32;
+            asc = asc.max(m.ascent / u * font_px);
+            desc = desc.max(m.descent.abs() / u * font_px);
+            let mut shaper = shape.builder(*f).size(font_px).variations(wght.iter().copied()).build();
+            shaper.add_str(s);
+            shaper.shape_with(|cl| {
+                for g in cl.glyphs {
+                    glyphs.push((*f, g.id, pen + g.x));
+                    pen += g.advance;
+                }
+            });
+        }
+        let ox = (w as f32 - pen) / 2.0;
+        let base = h as f32 / 2.0 + (asc - desc) / 2.0;
+        let mut v = vec![0u8; (w * h) as usize];
+        for (f, id, x) in glyphs {
+            let gx = ox + x;
+            let (ix, iy) = (gx.floor(), base.floor());
+            let mut scaler = scale.builder(f).size(font_px).hint(false).variations(wght.iter().copied()).build();
+            let Some(img) = Render::new(&[Source::Outline]).format(Format::Alpha).offset(Vector::new(gx - ix, base - iy)).render(&mut scaler, id) else { continue };
+            let (gw, gh) = (img.placement.width as i32, img.placement.height as i32);
+            let (x0, y0) = (ix as i32 + img.placement.left, iy as i32 - img.placement.top);
+            for yy in 0..gh {
+                let dy = y0 + yy;
+                if dy < 0 || dy >= h as i32 {
+                    continue;
+                }
+                for xx in 0..gw {
+                    let dx = x0 + xx;
+                    if dx < 0 || dx >= w as i32 {
+                        continue;
+                    }
+                    let a = img.data[(yy * gw + xx) as usize];
+                    let o = &mut v[(dy as u32 * w + dx as u32) as usize];
+                    *o = (*o as u32 + a as u32).min(255) as u8;
+                }
+            }
+        }
+        Some(v)
+    })
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn text_mask(_text: &str, _family: &str, _weight: i32, _font_px: f32, _w: u32, _h: u32) -> Option<Vec<u8>> {
+    None
+}

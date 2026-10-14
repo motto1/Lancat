@@ -358,6 +358,18 @@ fn inset_into(out: &mut [[f32; 4]], elem: &[f32], bw: usize, bh: usize, g: (f32,
     }
 }
 
+/// 界面字体族（与 .slint 的 Fx.font 相同）
+fn ui_font() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        crate::metrics::ui_family().unwrap_or_else(|| "sans-serif".into())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        "Segoe UI Variable Text".into()
+    }
+}
+
 pub fn paint(kind: &str, w: f32, h: f32, c: Color, dark: bool, dpr: f32) -> Image {
     if w <= 0.5 || h <= 0.5 {
         return Image::default();
@@ -368,6 +380,8 @@ pub fn paint(kind: &str, w: f32, h: f32, c: Color, dark: bool, dpr: f32) -> Imag
         let bw = (w * dpr).ceil().max(1.0) as usize;
         let bh = (h * dpr).ceil().max(1.0) as usize;
         let mut out = vec![[0f32; 4]; bw * bh];
+        // "pick-avatar|AB"：头像里的白色缩写字母一起画进位图（和圆形一起缩放，不会错位）
+        let (kind, label) = kind.split_once('|').unwrap_or((kind, ""));
         match kind {
             // :root.native-glass .glass::before —— radial(90% 55% at 12% 0, sheen, transparent 70%)
             // + linear(180deg, sheen 0, transparent 22%) + inset rim-top / rim-side / rim-low + 0 -18px 30px -24px rim-low；
@@ -476,6 +490,23 @@ pub fn paint(kind: &str, w: f32, h: f32, c: Color, dark: bool, dpr: f32) -> Imag
                 }
             }
             _ => {}
+        }
+        // 头像里的白色缩写（600，居中）：拖放选择器 21px（「全部」15px）/ 58px，侧栏 13px / 38px
+        if !label.is_empty() {
+            let ratio = match kind {
+                "pick-all" => 15.0 / 58.0,
+                "pick-avatar" => 21.0 / 58.0,
+                _ => 13.0 / 38.0,
+            };
+            let fpx = ratio * w.min(h) * dpr;
+            if let Some(m) = crate::glyph::text_mask(label, &ui_font(), 600, fpx, bw as u32, bh as u32) {
+                for (k, a) in m.iter().enumerate() {
+                    if *a > 0 {
+                        let a = *a as f32 / 255.0;
+                        over_pm(&mut out[k], [a, a, a, a]);
+                    }
+                }
+            }
         }
         to_image(&out, bw, bh)
     })
