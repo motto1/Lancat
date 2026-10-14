@@ -257,6 +257,10 @@ cargo build --release
 
 小技巧：把 `CARGO_TARGET_DIR` 指到空间大的盘。通过 SSH 远程构建时，SSH 断开后子进程会被杀掉，长时间构建可放进一个临时的交互式计划任务里跑。
 
+### 云端编译与发布
+
+推送 `v*` 标签（如 `git tag v0.1.0 && git push origin v0.1.0`）后，GitHub Actions（`.github/workflows/release.yml`）会在云上编译 Windows 和 Linux 的 Slint 版（release），打包成 `Lancat-<版本>-windows-x64.zip` 和 `Lancat-<版本>-linux-x64.tar.gz`，发布到仓库的 Releases 页面。在 Actions 页面手动运行则只编译、不发布。
+
 ### Tauri 版（旧版）
 
 需要 Node ≥ 20。

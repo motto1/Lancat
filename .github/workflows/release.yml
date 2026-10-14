@@ -1,0 +1,90 @@
+# 推送 v* 标签（如 v0.1.0）时，在云上编译 Windows 和 Linux 的 Slint 版并发布到 GitHub Release。
+# 也可以在 Actions 页面手动运行（只编译、上传构建产物，不发布）。
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+            bin: lancat-slint.exe
+          - os: ubuntu-24.04
+            name: linux-x64
+            bin: lancat-slint
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/lancat-slint -> target
+          key: ${{ matrix.name }}
+
+      - name: Linux 依赖
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev libxkbcommon-dev libfontconfig-dev libfreetype-dev libwayland-dev
+
+      - name: Windows 环境
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> "$GITHUB_ENV"
+
+      - name: 编译（release）
+        working-directory: crates/lancat-slint
+        run: cargo build --release --locked
+
+      - name: 打包
+        shell: bash
+        run: |
+          ver="${GITHUB_REF_NAME}"
+          [[ "$GITHUB_REF_TYPE" == tag ]] || ver="dev-${GITHUB_SHA::7}"
+          out="Lancat-${ver}-${{ matrix.name }}"
+          mkdir -p "dist/$out"
+          cp "crates/lancat-slint/target/release/${{ matrix.bin }}" "dist/$out/"
+          cp README.md "dist/$out/"
+          cp src/assets/emoji/LICENSE.md "dist/$out/LICENSE-noto-animated-emoji.md"
+          cd dist
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            7z a -tzip "$out.zip" "$out" >/dev/null
+          else
+            tar czf "$out.tar.gz" "$out"
+          fi
+          rm -rf "$out"
+          ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
