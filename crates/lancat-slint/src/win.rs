@@ -141,6 +141,12 @@ impl slint::platform::Platform for Win32Platform {
                     }
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
+                    // WM_PAINT 之后回到外层：paint 里的补渲染会再失效一块，动画进行中会一直有新的
+                    // WM_PAINT，留在这里就永远跑不到 update_timers_and_animations（动画时间不走、
+                    // 定时器和 invoke_from_event_loop 全饿死，界面卡死在那一帧）
+                    if msg.message == WM_PAINT {
+                        break;
+                    }
                 }
             }
             loop {
@@ -348,7 +354,8 @@ impl Win32Window {
         let h = self.hwnd.get();
         // 在 WM_PAINT 里才发现有新变化（两次循环之间又改了东西）：先渲染，拷完本次失效区后
         // 再把这次的脏区单独失效，否则落在 rcPaint 外的那部分新内容就永远不会被拷到窗口上。
-        let late = if self.needs_redraw.get() { self.render() } else { None };
+        // 动画进行中的脏区交给外层循环按 16 ms 节奏画，这里补画会和 WM_PAINT 互相触发
+        let late = if self.needs_redraw.get() && !self.window.has_active_animations() { self.render() } else { None };
         let size = self.size.get();
         let (w, hgt) = (size.width as usize, size.height as usize);
         let buf0 = self.buf.borrow();

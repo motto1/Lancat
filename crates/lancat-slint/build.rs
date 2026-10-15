@@ -4,6 +4,17 @@ use std::io::Write;
 fn main() {
     slint_build::compile("ui/app.slint").expect("compile slint ui");
 
+    // Windows：把 assets/icon.ico 编进 exe 资源（ID 1），资源管理器和快捷方式显示应用图标
+    println!("cargo:rerun-if-changed=assets/icon.ico");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        #[cfg(windows)]
+        {
+            let mut res = winresource::WindowsResource::new();
+            res.set_icon("assets/icon.ico");
+            res.compile().expect("embed windows icon");
+        }
+    }
+
     let dir = std::env::var("LANCAT_EMOJI_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src/assets/emoji"));
     println!("cargo:rerun-if-env-changed=LANCAT_EMOJI_DIR");
     println!("cargo:rerun-if-changed={}", dir.display());
