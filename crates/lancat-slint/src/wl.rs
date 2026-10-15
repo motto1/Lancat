@@ -70,6 +70,10 @@ use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_manager_v3::ZwpTextInputManagerV3,
     zwp_text_input_v3::{self, ZwpTextInputV3},
 };
+use smithay_client_toolkit::reexports::protocols_wlr::screencopy::v1::client::{
+    zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1},
+    zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
+};
 
 // ------------------------------------------------------------------ pixels
 
@@ -329,6 +333,10 @@ struct PanelSurf {
     morph: Option<crate::morph::Anim>,
     /// 变形最近一帧（中途反向从这里接着走）
     mlast: Option<crate::morph::Frame>,
+    /// 面板背后那块屏幕（wlr-screencopy 截的，已模糊；面板 surface 物理 px），变形时当玻璃底；收起时沿用
+    glass: Option<Vec<Bgra>>,
+    /// Some(开始时间) = 打开变形在等背景截图（最多等 CAP_WAIT，拿不到就只用色调）
+    cap_wait: Option<Instant>,
     closing: bool,
     focus_req: bool,
 }
@@ -409,7 +417,27 @@ struct State {
     /// 已松开、正在后台读数据的拖放
     dnd_drop: Option<(DragOffer, bool, (f32, f32))>,
     toast: Option<ToastSurf>,
+    /// wlr-screencopy（niri / sway / Hyprland 都有）；没有就没有玻璃背景
+    screencopy: Option<ZwlrScreencopyManagerV1>,
+    cap: Option<Cap>,
+    cap_gen: u64,
+    cap_pool: Option<SlotPool>,
 }
+
+/// 一次进行中的背景截图
+struct Cap {
+    gen: u64,
+    frame: ZwlrScreencopyFrameV1,
+    /// compositor 给的 shm 格式 / 宽 / 高 / 行跨度
+    fmt: Option<(wl_shm::Format, u32, u32, u32)>,
+    buf: Option<smithay_client_toolkit::shm::slot::Buffer>,
+    y_invert: bool,
+    /// 要的尺寸（面板 surface 物理 px）
+    out: (usize, usize),
+}
+
+/// 打开变形最多等背景截图这么久
+const CAP_WAIT: Duration = Duration::from_millis(120);
 
 #[derive(Default)]
 struct TiPending {
@@ -539,6 +567,7 @@ impl WlPlatform {
         let ti_manager = bind_ti(&globals, &qh);
         let xdg = XdgShell::bind(&globals, &qh).map_err(|e| log::warn!("xdg-shell unavailable ({e}): settings window disabled")).ok();
         let ddm = DataDeviceManagerState::bind(&globals, &qh).map_err(|e| log::warn!("wl_data_device_manager unavailable ({e}): no drag & drop")).ok();
+        let screencopy = globals.bind::<ZwlrScreencopyManagerV1, _, _>(&qh, 1..=3, ScData).map_err(|e| log::info!("wlr-screencopy unavailable ({e}): panel morph without glass backdrop")).ok();
         let mut state = State {
             registry_state: RegistryState::new(&globals),
             seat_state: SeatState::new(&globals, &qh),
@@ -576,6 +605,10 @@ impl WlPlatform {
             dnd_on: None,
             dnd_gen: 0,
             dnd_drop: None,
+            screencopy,
+            cap: None,
+            cap_gen: 0,
+            cap_pool: None,
         };
         // 一次往返：拿到输出信息（dock 算位置要用）和 seat 能力
         queue.roundtrip(&mut state).map_err(|e| e.to_string())?;
@@ -873,6 +906,8 @@ impl State {
                             ps.layer.set_size(p.w, p.h);
                             ps.layer.commit();
                             ps.place = p;
+                            // 换了位置：原来截的背景对不上了
+                            ps.glass = None;
                         }
                     }
                     Some(ps) => {
@@ -905,6 +940,8 @@ impl State {
                             anim: if m { None } else { Some(PanelAnim { opening: true, start: Instant::now(), from: (0.0, 0.0, 1.0, 1.0) }) },
                             morph: None,
                             mlast: None,
+                            glass: None,
+                            cap_wait: None,
                             closing: false,
                             focus_req: false,
                         });
@@ -912,6 +949,12 @@ impl State {
                             let (strip, card, rs, rc) = self.morph_rects();
                             if let Some(ps) = self.panel.as_mut() {
                                 ps.morph = Some(crate::morph::Anim::new(true, strip, card, rs, rc, &ps.place.edge, 0.0, 0.0));
+                            }
+                            // 面板 surface 还没上屏：现在截它背后的屏幕当玻璃底
+                            if self.start_capture() {
+                                if let Some(ps) = self.panel.as_mut() {
+                                    ps.cap_wait = Some(Instant::now());
+                                }
                             }
                         }
                     }
@@ -1057,6 +1100,99 @@ impl State {
         }
     }
 
+    /// 截面板 surface 背后那块屏幕（异步，结果在 cap_ready 里放进 panel.glass）。true = 已发出请求
+    fn start_capture(&mut self) -> bool {
+        let Some(mgr) = self.screencopy.as_ref() else { return false };
+        let Some(ps) = self.panel.as_ref() else { return false };
+        let p = ps.place.clone();
+        let outs = OUTPUTS.with(|o| o.borrow().clone());
+        let Some(&(ow, oh, _)) = outs.get(p.output).or(outs.first()) else { return false };
+        let Some(out) = self.output(p.output) else { return false };
+        let (w, h) = (p.w as i32, p.h as i32);
+        // 与 anchor_of / margins 一致：输出内的逻辑坐标
+        let (x, y) = match p.edge.as_str() {
+            "left" => (p.inset, p.along),
+            "top" => (p.along, p.inset),
+            "bottom" => (p.along, oh - p.inset - h),
+            _ => (ow - p.inset - w, p.along),
+        };
+        if let Some(old) = self.cap.take() {
+            old.frame.destroy();
+        }
+        self.cap_gen += 1;
+        let gen = self.cap_gen;
+        let sc = self.scale.max(1) as usize;
+        let frame = mgr.capture_output_region(0, &out, x, y, w, h, &self.qh, ScFrame(gen));
+        self.cap = Some(Cap { gen, frame, fmt: None, buf: None, y_invert: false, out: (p.w as usize * sc, p.h as usize * sc) });
+        true
+    }
+
+    /// 收到 shm 格式后：建缓冲、让 compositor 拷进来
+    fn cap_copy(&mut self, gen: u64) {
+        let Some(cap) = self.cap.as_mut().filter(|c| c.gen == gen && c.buf.is_none()) else { return };
+        let Some((fmt, w, h, stride)) = cap.fmt else {
+            log::info!("screencopy: no usable shm format");
+            self.cap_end(gen, false);
+            return;
+        };
+        if self.cap_pool.is_none() {
+            self.cap_pool = SlotPool::new((stride * h) as usize, &self.shm).ok();
+        }
+        let Some(pool) = self.cap_pool.as_mut() else { return self.cap_end(gen, false) };
+        let r = pool.create_buffer(w as i32, h as i32, stride as i32, fmt).map(|(b, _)| b);
+        match r {
+            Ok(b) => {
+                cap.frame.copy(b.wl_buffer());
+                cap.buf = Some(b);
+            }
+            Err(e) => {
+                log::info!("screencopy buffer: {e}");
+                self.cap_end(gen, false);
+            }
+        }
+    }
+
+    /// 截图结束（ok = 已拷好）：转成 BGRA、缩放到面板 surface 尺寸、模糊，交给面板
+    fn cap_end(&mut self, gen: u64, ok: bool) {
+        if self.cap.as_ref().is_none_or(|c| c.gen != gen) {
+            return;
+        }
+        let Some(cap) = self.cap.take() else { return };
+        cap.frame.destroy();
+        let mut glass = None;
+        if let (true, Some((fmt, w, h, stride)), Some(b), Some(pool)) = (ok, cap.fmt, cap.buf.as_ref(), self.cap_pool.as_mut()) {
+            if let Some(data) = b.canvas(pool) {
+                let (w, h, stride) = (w as usize, h as usize, stride as usize);
+                let (ow, oh) = cap.out;
+                let swap = matches!(fmt, wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888);
+                if w > 0 && h > 0 && ow > 0 && oh > 0 && data.len() >= stride * h {
+                    let mut px = vec![Bgra::default(); ow * oh];
+                    for y in 0..oh {
+                        let sy = (y * h / oh).min(h - 1);
+                        let sy = if cap.y_invert { h - 1 - sy } else { sy };
+                        let row = &data[sy * stride..];
+                        for x in 0..ow {
+                            let sx = (x * w / ow).min(w - 1) * 4;
+                            let (c0, c1, c2) = (row[sx], row[sx + 1], row[sx + 2]);
+                            px[y * ow + x] = if swap { Bgra { b: c2, g: c1, r: c0, a: 255 } } else { Bgra { b: c0, g: c1, r: c2, a: 255 } };
+                        }
+                    }
+                    let sc = self.scale.max(1) as f64;
+                    glass = Some(crate::morph::blur_half(&px, ow, oh, (11.0 * sc).max(2.0)));
+                }
+            }
+        }
+        drop(cap);
+        if let Some(ps) = self.panel.as_mut() {
+            if glass.is_some() {
+                ps.glass = glass;
+            } else if ps.cap_wait.is_some() {
+                // 截不到：不再等，直接只用色调
+                ps.cap_wait = Some(Instant::now().checked_sub(CAP_WAIT).unwrap_or_else(Instant::now));
+            }
+        }
+    }
+
     /// 变形的起止矩形（面板 surface 内物理 px）：停靠条（裁到 surface 里）、面板卡片，以及各自的圆角
     fn morph_rects(&self) -> (crate::morph::R, crate::morph::R, f64, f64) {
         let sc = self.scale.max(1) as f64;
@@ -1091,6 +1227,16 @@ impl State {
     fn draw_panel(&mut self) {
         let Some(w) = self.win.upgrade() else { return };
         let Some(ps) = self.panel.as_mut() else { return };
+        // 打开变形先等背景截图（surface 不上屏），到了 / 超时再从头开始计时
+        if let Some(t0) = ps.cap_wait {
+            if ps.morph.is_some() && ps.glass.is_none() && t0.elapsed() < CAP_WAIT {
+                return;
+            }
+            ps.cap_wait = None;
+            if let Some(a) = ps.morph.as_mut() {
+                a.restart();
+            }
+        }
         let sc = self.scale.max(1) as u32;
         let (width, height) = (ps.width * sc, ps.height * sc);
         let n = (width * height) as usize;
@@ -1132,7 +1278,7 @@ impl State {
                 if f.done {
                     self.xbuf.iter_mut().for_each(|p| *p = Bgra::default());
                 } else {
-                    crate::morph::render(&mut self.xbuf, wu, hu, &f, None, &c, &look);
+                    crate::morph::render(&mut self.xbuf, wu, hu, &f, ps.glass.as_deref().filter(|g| g.len() == n), &c, &look);
                 }
                 let Ok((buffer, canvas)) = self.pool.create_buffer(width as i32, height as i32, width as i32 * 4, wl_shm::Format::Argb8888) else { return };
                 // SAFETY: Bgra is repr(C) 4 bytes
@@ -2033,6 +2179,52 @@ thread_local! {
 }
 
 // ------------------------------------------------------------------ text-input-v3
+
+/// wlr-screencopy 管理器的 user data
+pub struct ScData;
+/// 一次截图帧的 user data：属于第几次截图
+pub struct ScFrame(u64);
+
+impl Dispatch2<ZwlrScreencopyManagerV1, State> for ScData {
+    fn event(&self, _: &mut State, _: &ZwlrScreencopyManagerV1, _: <ZwlrScreencopyManagerV1 as wayland_client::Proxy>::Event, _: &Connection, _: &QueueHandle<State>) {}
+}
+
+impl Dispatch2<ZwlrScreencopyFrameV1, State> for ScFrame {
+    fn event(&self, s: &mut State, frame: &ZwlrScreencopyFrameV1, ev: zwlr_screencopy_frame_v1::Event, _: &Connection, _: &QueueHandle<State>) {
+        use wayland_client::{Proxy, WEnum};
+        use zwlr_screencopy_frame_v1::Event;
+        let gen = self.0;
+        if s.cap.as_ref().is_none_or(|c| c.gen != gen) {
+            return;
+        }
+        match ev {
+            Event::Buffer { format: WEnum::Value(f), width, height, stride } => {
+                let usable = matches!(f, wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888 | wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888);
+                if let Some(c) = s.cap.as_mut() {
+                    if usable && c.fmt.is_none() {
+                        c.fmt = Some((f, width, height, stride));
+                    }
+                }
+                // v1/v2 没有 buffer_done：拿到格式就拷
+                if frame.version() < 3 {
+                    s.cap_copy(gen);
+                }
+            }
+            Event::BufferDone => s.cap_copy(gen),
+            Event::Flags { flags: WEnum::Value(fl) } => {
+                if let Some(c) = s.cap.as_mut() {
+                    c.y_invert = fl.contains(zwlr_screencopy_frame_v1::Flags::YInvert);
+                }
+            }
+            Event::Ready { .. } => s.cap_end(gen, true),
+            Event::Failed => {
+                log::info!("screencopy failed: panel morph without glass backdrop");
+                s.cap_end(gen, false);
+            }
+            _ => {}
+        }
+    }
+}
 
 /// text-input-v3 对象的 user data（本地类型，才能给它实现 SCTK 的 Dispatch2）。
 pub struct TiData;
