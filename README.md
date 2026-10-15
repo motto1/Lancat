@@ -141,3 +141,4 @@ docs/                 架构、开发、性能、对齐记录
 - UI 框架 [Slint](https://slint.dev)，Lottie 渲染 [ThorVG](https://www.thorvg.org)。
 - 内置表情 Google [Noto Animated Emoji](https://googlefonts.github.io/noto-emoji-animation/)，CC BY 4.0，见 `src/assets/emoji/LICENSE.md`。Telegram 贴纸不内置，只能自行导入。
 - 代码以 [GPL-3.0](LICENSE) 开源。
+- 友情链接：[LINUX DO](https://linux.do)，新的理想型社区。

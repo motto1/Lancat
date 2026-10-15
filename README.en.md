@@ -130,3 +130,4 @@ If Lancat saves you a few clicks, a ⭐ helps a lot.
 - UI: [Slint](https://slint.dev). Lottie: [ThorVG](https://www.thorvg.org).
 - Bundled emoji: Google [Noto Animated Emoji](https://googlefonts.github.io/noto-emoji-animation/), CC BY 4.0.
 - Code: [GPL-3.0](LICENSE).
+- Friends: [LINUX DO](https://linux.do) community.
