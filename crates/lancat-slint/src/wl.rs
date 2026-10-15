@@ -323,8 +323,12 @@ struct PanelSurf {
     configured: bool,
     width: u32,
     height: u32,
-    /// 弹出（弹簧）/ 收起（exitTo）动画；None = 静止
+    /// 弹出（弹簧）/ 收起（exitTo）动画；None = 静止（LANCAT_WL_MORPH=0 时用）
     anim: Option<PanelAnim>,
+    /// 液态玻璃变形（从停靠条长出来 / 缩回去，crate::morph）；Some = 正在变形
+    morph: Option<crate::morph::Anim>,
+    /// 变形最近一帧（中途反向从这里接着走）
+    mlast: Option<crate::morph::Frame>,
     closing: bool,
     focus_req: bool,
 }
@@ -425,6 +429,15 @@ struct PanelAnim {
 }
 
 const EXIT_MS: f32 = 220.0;
+
+/// 面板是否用液态玻璃变形（默认开；LANCAT_WL_MORPH=0 退回旧版弹簧缩放）
+fn use_morph() -> bool {
+    static U: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *U.get_or_init(|| std::env::var("LANCAT_WL_MORPH").map(|v| v != "0").unwrap_or(true))
+}
+
+/// 面板当前是不是深色主题（dock 打开 / 收起时写，变形的色调用）
+pub static MORPH_DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// springCurve：半隐式欧拉 dt = 1/240，每 1/60 s 取样，直到 |p-1| < .0008 且 |v| < .01（与旧版完全同一算法）
 fn spring_curve() -> &'static [(f32, f32)] {
@@ -638,7 +651,7 @@ impl slint::platform::Platform for WlPlatform {
             pump_wheel();
             slint::platform::update_timers_and_animations();
             state.sync_ime();
-            let fading = state.panel.as_ref().is_some_and(|p| p.configured && p.anim.is_some()) || crate::compose::animating();
+            let fading = state.panel.as_ref().is_some_and(|p| p.configured && (p.anim.is_some() || p.morph.is_some())) || crate::compose::animating();
             if let Some(w) = state.win.upgrade() {
                 let ready = state.panel.as_ref().is_some_and(|p| p.configured);
                 if ready && (w.needs_redraw.get() || w.window.has_active_animations() || fading) {
@@ -865,13 +878,42 @@ impl State {
                     Some(ps) => {
                         // 正在收起又被打开：旧版 anim.cancel() 后重新 springTo（从固定起点），surface 不重建
                         ps.closing = false;
-                        ps.anim = Some(PanelAnim { opening: true, start: Instant::now(), from: (0.0, 0.0, 1.0, 1.0) });
                         ps.layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
                         ps.layer.commit();
+                        if use_morph() {
+                            let (strip, card, rs, rc) = self.morph_rects();
+                            if let Some(ps) = self.panel.as_mut() {
+                                let (from, fr, fc, fg) = match ps.mlast {
+                                    Some(f) if ps.morph.is_some() => (f.rect, f.radius, f.content, f.grow),
+                                    _ => (strip, rs, 0.0, 0.0),
+                                };
+                                ps.morph = Some(crate::morph::Anim::new(true, from, card, fr, rc, &ps.place.edge, fc, fg));
+                            }
+                        } else {
+                            ps.anim = Some(PanelAnim { opening: true, start: Instant::now(), from: (0.0, 0.0, 1.0, 1.0) });
+                        }
                     }
                     None => {
                         let layer = self.new_layer("lancat-panel", &p, KeyboardInteractivity::OnDemand);
-                        self.panel = Some(PanelSurf { layer, place: p, configured: false, width: W, height: H, anim: Some(PanelAnim { opening: true, start: Instant::now(), from: (0.0, 0.0, 1.0, 1.0) }), closing: false, focus_req: false });
+                        let m = use_morph();
+                        self.panel = Some(PanelSurf {
+                            layer,
+                            place: p,
+                            configured: false,
+                            width: W,
+                            height: H,
+                            anim: if m { None } else { Some(PanelAnim { opening: true, start: Instant::now(), from: (0.0, 0.0, 1.0, 1.0) }) },
+                            morph: None,
+                            mlast: None,
+                            closing: false,
+                            focus_req: false,
+                        });
+                        if m {
+                            let (strip, card, rs, rc) = self.morph_rects();
+                            if let Some(ps) = self.panel.as_mut() {
+                                ps.morph = Some(crate::morph::Anim::new(true, strip, card, rs, rc, &ps.place.edge, 0.0, 0.0));
+                            }
+                        }
                     }
                 }
             }
@@ -879,11 +921,27 @@ impl State {
                 if let Some(ps) = self.panel.as_mut() {
                     if !ps.closing {
                         let edge = ps.place.edge.clone();
-                        let from = if !ps.configured { (0.0, 0.0, 1.0, 0.0) } else { ps.anim.and_then(|a| a.pose(&edge)).unwrap_or((0.0, 0.0, 1.0, 1.0)) };
                         ps.closing = true;
-                        ps.anim = Some(PanelAnim { opening: false, start: Instant::now(), from });
                         ps.layer.set_keyboard_interactivity(KeyboardInteractivity::None);
                         ps.layer.commit();
+                        if use_morph() {
+                            let configured = ps.configured;
+                            let (strip, card, rs, rc) = self.morph_rects();
+                            if let Some(ps) = self.panel.as_mut() {
+                                if configured {
+                                    let (from, fr, fc, fg) = match ps.mlast {
+                                        Some(f) if ps.morph.as_ref().is_some_and(|a| a.opening) => (f.rect, f.radius, f.content, f.grow),
+                                        _ => (card, rc, 1.0, 1.0),
+                                    };
+                                    ps.morph = Some(crate::morph::Anim::new(false, from, strip, fr, rs, &edge, fc, fg));
+                                } else {
+                                    ps.morph = None;
+                                }
+                            }
+                        } else {
+                            let from = if !ps.configured { (0.0, 0.0, 1.0, 0.0) } else { ps.anim.and_then(|a| a.pose(&edge)).unwrap_or((0.0, 0.0, 1.0, 1.0)) };
+                            ps.anim = Some(PanelAnim { opening: false, start: Instant::now(), from });
+                        }
                     }
                 }
             }
@@ -983,7 +1041,11 @@ impl State {
 
     /// 淡出结束：销毁面板 surface，释放像素缓冲。
     fn finish_close(&mut self) {
-        let done = self.panel.as_ref().is_some_and(|p| p.closing && (!p.configured || p.anim.is_none_or(|a| a.start.elapsed().as_secs_f32() * 1000.0 >= EXIT_MS)));
+        let done = self.panel.as_ref().is_some_and(|p| {
+            p.closing
+                && (!p.configured
+                    || if use_morph() { p.morph.as_ref().is_none_or(|a| a.frame().done) } else { p.anim.is_none_or(|a| a.start.elapsed().as_secs_f32() * 1000.0 >= EXIT_MS) })
+        });
         if done {
             self.panel = None;
             self.kb_on_panel = false;
@@ -993,6 +1055,37 @@ impl State {
                 w.window.dispatch_event(WindowEvent::PointerExited);
             }
         }
+    }
+
+    /// 变形的起止矩形（面板 surface 内物理 px）：停靠条（裁到 surface 里）、面板卡片，以及各自的圆角
+    fn morph_rects(&self) -> (crate::morph::R, crate::morph::R, f64, f64) {
+        let sc = self.scale.max(1) as f64;
+        let (pw, ph) = self.panel.as_ref().map(|p| (p.place.w as f64, p.place.h as f64)).unwrap_or((W as f64, H as f64));
+        let fr = FRAME as f64;
+        let card = [fr * sc, fr * sc, (pw - fr) * sc, (ph - fr) * sc];
+        let (edge, p_along, p_inset) = self.panel.as_ref().map(|p| (p.place.edge.clone(), p.place.along as f64, p.place.inset as f64)).unwrap_or_default();
+        let vertical = edge == "left" || edge == "right";
+        let (s_along, s_len, s_thick) = match self.strip.as_ref() {
+            Some(s) => (s.place.along as f64, if vertical { s.place.h as f64 } else { s.place.w as f64 }, if vertical { s.place.w as f64 } else { s.place.h as f64 }),
+            None => (p_along, if vertical { ph } else { pw }, 6.0),
+        };
+        let span = if vertical { ph } else { pw };
+        let depth = if vertical { pw } else { ph };
+        // 沿边：条的范围换到 surface 坐标再裁进去；往外：条在离边 0..thick，面板 surface 从离边 inset 开始
+        let a0 = (s_along - p_along).clamp(0.0, span - 1.0);
+        let a1 = (s_along + s_len - p_along).clamp(a0 + 1.0, span);
+        let o0 = (0.0 - p_inset).max(0.0);
+        let o1 = (s_thick - p_inset).max(o0 + 2.0).min(depth);
+        // o 从屏幕边往里量；换成 surface 坐标
+        let (x0, y0, x1, y1) = match edge.as_str() {
+            "left" => (o0, a0, o1, a1),
+            "right" => (depth - o1, a0, depth - o0, a1),
+            "top" => (a0, o0, a1, o1),
+            _ => (a0, depth - o1, a1, depth - o0),
+        };
+        let strip = [x0 * sc, y0 * sc, x1 * sc, y1 * sc];
+        let rs = ((strip[2] - strip[0]).min(strip[3] - strip[1]) / 2.0).max(1.0);
+        (strip, card, rs, 14.0 * sc)
     }
 
     fn draw_panel(&mut self) {
@@ -1014,6 +1107,44 @@ impl State {
         }
         if out.composed() {
             w.needs_redraw.set(false);
+        }
+        // 液态玻璃变形：从停靠条长出来 / 缩回去
+        if let Some(a) = ps.morph.as_ref() {
+            let f = a.frame();
+            let opening = a.opening;
+            ps.mlast = Some(f);
+            if f.done && opening {
+                ps.morph = None;
+            } else {
+                let fr = (FRAME * sc) as usize;
+                let (wu, hu) = (width as usize, height as usize);
+                let (cw, ch) = (wu.saturating_sub(2 * fr), hu.saturating_sub(2 * fr));
+                let mut content = Vec::with_capacity(cw * ch);
+                for y in 0..ch {
+                    let o = (y + fr) * wu + fr;
+                    content.extend_from_slice(&self.buf[o..o + cw]);
+                }
+                if self.xbuf.len() != n {
+                    self.xbuf = vec![Bgra::default(); n];
+                }
+                let look = crate::morph::Look { dark: MORPH_DARK.load(std::sync::atomic::Ordering::Relaxed), scale: sc as f64, accent: self.strip_look.accent };
+                let c = crate::morph::Content { px: &content, w: cw, h: ch, at: (fr as f64, fr as f64) };
+                if f.done {
+                    self.xbuf.iter_mut().for_each(|p| *p = Bgra::default());
+                } else {
+                    crate::morph::render(&mut self.xbuf, wu, hu, &f, None, &c, &look);
+                }
+                let Ok((buffer, canvas)) = self.pool.create_buffer(width as i32, height as i32, width as i32 * 4, wl_shm::Format::Argb8888) else { return };
+                // SAFETY: Bgra is repr(C) 4 bytes
+                let bytes = unsafe { std::slice::from_raw_parts(self.xbuf.as_ptr() as *const u8, n * 4) };
+                canvas[..n * 4].copy_from_slice(bytes);
+                let s = ps.layer.wl_surface();
+                s.damage_buffer(0, 0, width as i32, height as i32);
+                if buffer.attach_to(s).is_ok() {
+                    ps.layer.commit();
+                }
+                return;
+            }
         }
         // 面板整体的弹出/收起变换
         let edge = ps.place.edge.clone();
@@ -1525,6 +1656,9 @@ impl LayerShellHandler for State {
             // 弹出动画从第一帧真正上屏开始算
             if let Some(a) = ps.anim.as_mut() {
                 a.start = Instant::now();
+            }
+            if let Some(a) = ps.morph.as_mut() {
+                a.restart();
             }
         }
         let (pw, ph) = (ps.width, ps.height);

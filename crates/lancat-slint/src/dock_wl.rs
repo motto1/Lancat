@@ -385,6 +385,7 @@ pub fn open_panel(reason: &str) {
             d.entered = reason == "hover" || reason == "drag";
             d.leave_timer.stop();
         }
+        wl::MORPH_DARK.store(crate::theme_is_dark(&d.node.settings().theme), std::sync::atomic::Ordering::Relaxed);
         (!was, compute(d))
     });
     let Some((first, geo)) = first else { return };
@@ -407,6 +408,7 @@ pub fn hide_panel() {
             return false;
         }
         d.visible = false;
+        wl::MORPH_DARK.store(crate::theme_is_dark(&d.node.settings().theme), std::sync::atomic::Ordering::Relaxed);
         d.leave_timer.stop();
         d.hover_timer.stop();
         d.panel_in = false;

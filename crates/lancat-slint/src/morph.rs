@@ -64,6 +64,12 @@ impl Anim {
         Anim { opening, from, to, from_r, to_r, from_c, from_g, vertical_edge: edge == "left" || edge == "right", t0: Instant::now(), slow: env_ms_scale() }
     }
 
+    /// 从现在重新计时（Wayland：第一帧真正上屏时才开始）
+    #[allow(dead_code)]
+    pub fn restart(&mut self) {
+        self.t0 = Instant::now();
+    }
+
     pub fn frame(&self) -> Frame {
         let t = self.t0.elapsed().as_secs_f64() / self.slow;
         let (out, along) = if self.opening { (OPEN_OUT, OPEN_ALONG) } else { (CLOSE_OUT, CLOSE_ALONG) };
