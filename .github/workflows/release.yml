@@ -65,6 +65,7 @@ jobs:
           mkdir -p "dist/$out"
           cp "crates/lancat-slint/target/release/${{ matrix.bin }}" "dist/$out/"
           cp README.md "dist/$out/"
+          cp LICENSE "dist/$out/LICENSE"
           cp src/assets/emoji/LICENSE.md "dist/$out/LICENSE-noto-animated-emoji.md"
           # 一键更新下载的单文件
           ext=""; [[ "$RUNNER_OS" == Windows ]] && ext=".exe"
