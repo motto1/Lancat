@@ -106,6 +106,7 @@ component Field inherits Rectangle {
     out property <bool> focused: ti.has-focus;
     callback edited(string);
     callback accepted(string);
+    public function grab() { ti.focus(); }
     border-radius: 6px;
     background: Theme.glass-strong;
     border-width: 1phx;
@@ -765,12 +766,32 @@ export component SettingsWindow inherits Window {
     in property <[DevItem]> devices;
     in-out property <string> blocked-ips;
     in property <[string]> manual-peers;
+    // 公网连接
+    in property <bool> public-access;
+    in property <string> pair-code;
+    in property <[DevItem]> paired-remotes;   // id / name / sub
+    in property <[DevItem]> remote-peers;     // id = 地址
+    callback toggle-public();
+    callback regen-code();
+    callback unpair(string);
+    callback remove-remote(string);
+    callback add-remote(string, string);
+    public function focus-remote-code() { f-rcode.grab(); }
+    public function focus-remote-addr() { f-raddr.grab(); }
+    in-out property <string> remote-addr;
+    in-out property <string> remote-code;
+    in property <string> remote-msg;
+    in property <bool> remote-msg-bad;
+    out property <length> pub-y: pub-sec.y;
+    out property <length> pub-addr-y: pub-sec.y + pub-join.y;
     // 通用
     in property <bool> autostart;
     // 更新："idle" | "checking" | "latest" | "available" | "downloading" | "error"
     in property <string> upd-state;
     in property <string> upd-text;
     in property <bool> auto-update: true;
+    in property <bool> message-sound: true;
+    callback toggle-message-sound();
     callback check-update();
     callback do-update();
     callback open-release();
@@ -1083,11 +1104,77 @@ export component SettingsWindow inherits Window {
                     }
                 }
             }
+            pub-sec := Section {
+                title: "公网连接";
+                Row {
+                    label: "允许通过公网地址连接";
+                    last: !root.public-access;
+                    VerticalLayout { alignment: center; Switch { on: root.public-access; toggled => { root.toggle-public(); } } }
+                }
+                if root.public-access: Row {
+                    label: "配对码";
+                    last: true;
+                    VerticalLayout { alignment: center; Text { text: root.pair-code; font-size: 14px; font-family: "Cascadia Mono"; font-weight: 600; color: Theme.text; } }
+                    VerticalLayout { alignment: center; Btn { text: "换一个"; clicked => { root.regen-code(); } } }
+                }
+                if root.public-access: Note { text: "用 Cloudflare Tunnel 或 frp 把本机 TCP 47820 端口开到公网（frpc / cloudflared 要和 Lancat 在同一台电脑上），把地址和配对码发给对方。对方在 Lancat 的「设置 → 公网连接 → 连接别人开放的地址」里填上即可。配对后对方不再需要配对码；换配对码不影响已配对的设备。"; }
+                if !root.public-access: Note { text: "打开后，别人可以通过你用 Cloudflare Tunnel / frp 开出去的地址连过来，但必须先输入配对码。只在局域网用就不用打开。"; }
+                for d in root.paired-remotes: Rectangle {
+                    min-height: 34px;
+                    HorizontalLayout {
+                        spacing: 10px;
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Text { text: d.name; font-size: 12.5px; color: Theme.text; overflow: elide; }
+                            Text { text: d.sub; font-size: 10.5px; color: Theme.text-3; overflow: elide; }
+                        }
+                        VerticalLayout { alignment: center; Btn { text: "解除配对"; danger: true; clicked => { root.unpair(d.id); } } }
+                    }
+                }
+                pub-join := VerticalLayout {
+                    padding-top: 10px;
+                    padding-bottom: 2px;
+                    spacing: 6px;
+                    Text { text: "连接别人开放的地址"; font-size: 13px; color: Theme.text; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        f-raddr := Field { height: 26px; horizontal-stretch: 3; mono: true; text <=> root.remote-addr; placeholder: "https://lancat.example.com 或 域名:端口"; accepted => { f-rcode.grab(); } }
+                        f-rcode := Field { height: 26px; width: 110px; mono: true; text <=> root.remote-code; placeholder: "配对码"; accepted => { root.add-remote(root.remote-addr, root.remote-code); } }
+                        VerticalLayout { alignment: center; Btn { text: "连接"; clicked => { root.add-remote(root.remote-addr, root.remote-code); } } }
+                    }
+                    if root.remote-msg != "": Text { text: root.remote-msg; font-size: 11.5px; color: root.remote-msg-bad ? Theme.danger : Theme.text-2; wrap: word-wrap; }
+                    Note { text: "地址和配对码由对方提供：对方在自己 Lancat 的「设置 → 公网连接」里打开开关就能看到配对码。只需配对一次，以后自动连接。"; }
+                }
+                if root.remote-peers.length > 0: VerticalLayout {
+                    padding-top: 8px;
+                    spacing: 5px;
+                    Text { text: "我连接的公网地址"; font-size: 13px; color: Theme.text; }
+                    for d in root.remote-peers: Rectangle {
+                        min-height: 34px;
+                        HorizontalLayout {
+                            spacing: 10px;
+                            VerticalLayout { alignment: center; Rectangle { width: 8px; height: 8px; border-radius: 4px; background: d.online ? Theme.online : Theme.text-3; } }
+                            VerticalLayout {
+                                alignment: center;
+                                horizontal-stretch: 1;
+                                Text { text: d.name; font-size: 12.5px; color: Theme.text; overflow: elide; }
+                                Text { text: d.sub; font-size: 10.5px; color: Theme.text-3; overflow: elide; }
+                            }
+                            VerticalLayout { alignment: center; Btn { text: "移除"; clicked => { root.remove-remote(d.id); } } }
+                        }
+                    }
+                }
+            }
             Section {
                 title: "通用";
                 Row {
                     label: "开机自动启动";
                     VerticalLayout { alignment: center; Switch { on: root.autostart; enabled: root.autostart-enabled; toggled => { root.toggle-autostart(); } } }
+                }
+                Row {
+                    label: "新消息提示音";
+                    VerticalLayout { alignment: center; Switch { on: root.message-sound; toggled => { root.toggle-message-sound(); } } }
                 }
                 Row {
                     label: "外观";

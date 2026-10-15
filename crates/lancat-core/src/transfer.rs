@@ -449,6 +449,10 @@ impl Node {
         }
         let (ip, port) = self.peer_addr(peer_id).ok_or_else(|| terr(ErrCode::PeerOffline, "对方地址未知"))?;
         let linked = || self.links.lock().unwrap().contains_key(peer_id);
+        // public peer: the link is the only path
+        if ip.is_unspecified() {
+            return if linked() { Ok(Route::Link) } else { Err(terr(ErrCode::PeerOffline, "对方不在线")) };
+        }
         let known_blocked = matches!(self.http_unreachable.lock().unwrap().get(peer_id), Some((a, t)) if *a == ip && t.elapsed() < Duration::from_secs(60));
         if known_blocked && linked() {
             return Ok(Route::Link);

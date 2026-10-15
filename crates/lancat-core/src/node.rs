@@ -190,6 +190,12 @@ pub struct Node {
     /// Peers whose queue is being flushed right now -> "flush again when done" flag.
     flushing: Mutex<HashMap<String, bool>>,
     pub(crate) udp: OnceLock<Arc<tokio::net::UdpSocket>>,
+    /// Wakes the public-address dialer (remote.rs).
+    pub(crate) remote_kick: tokio::sync::Notify,
+    /// Public addresses being dialed right now.
+    pub(crate) remote_busy: Mutex<HashSet<String>>,
+    /// Recent wrong pair codes (rate limit).
+    pub(crate) pair_fails: Mutex<std::collections::VecDeque<Instant>>,
     stopped: AtomicBool,
     shutdown_tx: watch::Sender<bool>,
     pub(crate) rt: tokio::runtime::Handle,
@@ -270,6 +276,9 @@ impl Node {
             hk_kick: tokio::sync::Notify::new(),
             flushing: Mutex::new(HashMap::new()),
             udp: OnceLock::new(),
+            remote_kick: tokio::sync::Notify::new(),
+            remote_busy: Mutex::new(HashSet::new()),
+            pair_fails: Mutex::new(Default::default()),
             stopped: AtomicBool::new(false),
             shutdown_tx,
             rt: tokio::runtime::Handle::current(),
@@ -279,6 +288,7 @@ impl Node {
         crate::discovery::start(node.clone());
         node.clone().spawn_housekeeping();
         node.clone().spawn_gossip();
+        node.clone().spawn_remote();
         log::info!("lancat node {} ({}) listening on :{}", node.me().id, node.me().name, port);
         Ok(node)
     }
@@ -476,6 +486,9 @@ impl Node {
             return;
         }
         let Some((ip, port)) = self.peer_addr(peer_id) else { return };
+        if ip.is_unspecified() {
+            return; // public link: there is no address to connect back to
+        }
         if self.answers_as(peer_id, ip, port).await {
             self.http_unreachable.lock().unwrap().remove(peer_id);
             return;
@@ -676,7 +689,7 @@ impl Node {
             if !p.online {
                 return;
             }
-            if timed_out {
+            if timed_out || p.addr.is_unspecified() {
                 p.online = false;
                 None
             } else {
@@ -856,6 +869,12 @@ impl Node {
         })
     }
 
+    /// A peer reached over the public path (tunnel / internet): its address is a placeholder
+    /// (0.0.0.0), everything goes over its link, nothing dials or probes it directly.
+    pub(crate) fn is_remote(&self, id: &str) -> bool {
+        self.peer_addr(id).is_some_and(|(ip, _)| ip.is_unspecified())
+    }
+
     /// Inbound / gossip gate: private ranges, our overlays' subnets, or an address the user added.
     pub(crate) fn is_trusted_source(&self, ip: &IpAddr) -> bool {
         netutil::is_trusted_source(ip) || self.is_manual_ip(ip)
@@ -989,7 +1008,7 @@ impl Node {
 
     /// Sends our Hello over HTTP so a peer that cannot discover us learns our address/port.
     pub(crate) async fn introduce(&self, peer_id: &str) {
-        if self.links.lock().unwrap().contains_key(peer_id) {
+        if self.is_remote(peer_id) || self.links.lock().unwrap().contains_key(peer_id) {
             return;
         }
         if let Err(e) = self.post_msg(peer_id, &WsMsg::Hello { device: self.me() }).await {
@@ -1007,6 +1026,9 @@ impl Node {
 
     async fn post_msg(&self, peer_id: &str, wire: &WsMsg) -> Result<Option<WsMsg>> {
         let (ip, port) = self.peer_addr(peer_id).ok_or_else(|| anyhow!("unknown peer"))?;
+        if ip.is_unspecified() {
+            bail!("public peer: link only");
+        }
         let resp = self
             .http
             .post(format!("http://{}/msg", fmt_sa(&SocketAddr::new(ip, port))))

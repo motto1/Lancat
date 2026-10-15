@@ -275,7 +275,7 @@ async fn probe_round(node: &Arc<Node>, sock: &tokio::net::UdpSocket, first: bool
             continue;
         }
         if let Ok(IpAddr::V4(ip)) = d.last_addr.parse::<IpAddr>() {
-            if node.is_trusted_source(&IpAddr::V4(ip)) && !ip.is_loopback() && !mine.contains(&ip) {
+            if !ip.is_unspecified() && node.is_trusted_source(&IpAddr::V4(ip)) && !ip.is_loopback() && !mine.contains(&ip) {
                 t.known.insert(SocketAddr::from((ip, port)));
             }
         }
@@ -344,6 +344,9 @@ async fn sweep_round(node: &Arc<Node>, sock: &tokio::net::UdpSocket) {
 
 /// Probes one address right away (e.g. a peer whose link just dropped).
 pub(crate) fn probe_addr(node: &Node, ip: IpAddr) {
+    if ip.is_unspecified() {
+        return;
+    }
     if let Some(sock) = node.udp.get() {
         let _ = sock.try_send_to(&beacon(node, BeaconOp::Probe), SocketAddr::new(ip, node.cfg.udp_port));
     }

@@ -20,6 +20,7 @@ use tokio_tungstenite::tungstenite::Message as TMsg;
 use crate::errors::ErrCode;
 use crate::node::{fmt_sa, Link, Node};
 use crate::protocol::*;
+pub(crate) use crate::remote::LinkCtx;
 
 impl Node {
     /// Dials the peer if we are the designated dialer and no link exists.
@@ -64,6 +65,9 @@ impl Node {
 
     async fn dial_to(self: Arc<Self>, peer_id: String, at: Option<IpAddr>) -> anyhow::Result<()> {
         let (ip, port) = self.peer_addr(&peer_id).ok_or_else(|| anyhow::anyhow!("no address"))?;
+        if ip.is_unspecified() {
+            anyhow::bail!("public peer: dialed by remote.rs");
+        }
         let ip = at.unwrap_or(ip);
         let url = format!("ws://{}/ws", fmt_sa(&SocketAddr::new(ip, port)));
         let mut req = url.into_client_request()?;
@@ -71,6 +75,18 @@ impl Node {
         // disable_nagle: small frames (text, typing, acks, pings) go out at once instead of
         // waiting up to ~40 ms for Nagle/delayed-ACK to coalesce them
         let (ws, _) = tokio::time::timeout(Duration::from_secs(5), tokio_tungstenite::connect_async_with_config(req, None, true)).await??;
+        self.spawn_client_link(ws, Some(peer_id), ip, LinkCtx::Lan);
+        Ok(())
+    }
+
+    /// Runs a dialed WebSocket as a link (LAN dial or public address).
+    pub(crate) fn spawn_client_link(
+        self: Arc<Self>,
+        ws: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        peer_id: Option<String>,
+        ip: IpAddr,
+        ctx: LinkCtx,
+    ) {
         let (mut sink, mut stream) = ws.split();
         let (in_tx, in_rx) = mpsc::unbounded_channel::<Frame>();
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
@@ -103,14 +119,13 @@ impl Node {
             }
         });
         tokio::spawn(async move {
-            self.run_link(Some(peer_id), ip, in_rx, out_tx, data_tx, true).await;
+            self.run_link(peer_id, ip, in_rx, out_tx, data_tx, true, ctx).await;
             end_io(reader, writer).await;
         });
-        Ok(())
     }
 
     /// Accept side, called from the axum WebSocket upgrade.
-    pub(crate) async fn accept_ws(self: Arc<Self>, socket: axum::extract::ws::WebSocket, ip: IpAddr) {
+    pub(crate) async fn accept_ws(self: Arc<Self>, socket: axum::extract::ws::WebSocket, ip: IpAddr, ctx: LinkCtx) {
         use axum::extract::ws::Message as AMsg;
         let (mut sink, mut stream) = socket.split();
         let (in_tx, in_rx) = mpsc::unbounded_channel::<Frame>();
@@ -142,7 +157,7 @@ impl Node {
                 }
             }
         });
-        self.run_link(None, ip, in_rx, out_tx, data_tx, false).await;
+        self.run_link(None, ip, in_rx, out_tx, data_tx, false, ctx).await;
         end_io(reader, writer).await;
     }
 
@@ -155,6 +170,7 @@ impl Node {
         out_tx: mpsc::UnboundedSender<String>,
         data_tx: mpsc::Sender<Vec<u8>>,
         dialer: bool,
+        ctx: LinkCtx,
     ) {
         // whatever happens below, a dial attempt to `expected` is over when this returns or registers
         struct DialGuard<'a>(&'a Node, Option<String>);
@@ -179,6 +195,9 @@ impl Node {
             _ => return,
         };
         if device.id == me_id || expected.as_ref().is_some_and(|e| *e != device.id) || self.store.is_blocked(&device.id) {
+            return;
+        }
+        if !self.link_ctx_ok(&ctx, &device) {
             return;
         }
         if !dialer && out_tx.send(hello).is_err() {
@@ -380,6 +399,8 @@ impl Node {
     pub(crate) fn link_file_start(self: &Arc<Self>, peer_id: &str, manifest: FileManifest, out: &mpsc::UnboundedSender<String>, relayed: bool) {
         if relayed {
             log::info!("{peer_id} sends {} through a relay", manifest.name);
+        } else if self.is_remote(peer_id) {
+            log::info!("{peer_id} sends {} over its public link", manifest.name);
         } else {
             // the sender only uses the link when it could not connect to us: say why in our log
             log::warn!(

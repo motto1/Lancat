@@ -135,12 +135,45 @@ impl SettingsCtl {
         w.set_dock_monitor(s.dock_monitor as i32);
         w.set_theme(s.theme.clone().into());
         w.set_auto_update(s.auto_update);
+        w.set_message_sound(s.message_sound);
         let dir = self.node.receive_dir().display().to_string();
         w.set_recv_dir(dir.clone().into());
         w.set_recv_dir_shown(rtl_shown(&dir).into());
         w.set_recv_custom(!s.receive_dir.is_empty());
         let mp: Vec<SharedString> = s.manual_peers.iter().map(|a| a.into()).collect();
         w.set_manual_peers(ModelRc::new(VecModel::from(mp)));
+        w.set_public_access(s.public_access);
+        w.set_pair_code(s.pair_code.clone().into());
+        let pr: Vec<DevItem> = s
+            .paired_remotes
+            .iter()
+            .map(|p| DevItem { id: p.id.clone().into(), name: p.name.clone().into(), sub: "已通过公网配对".into(), online: false, blocked: false })
+            .collect();
+        w.set_paired_remotes(ModelRc::new(VecModel::from(pr)));
+        let rp: Vec<DevItem> = s
+            .remote_peers
+            .iter()
+            .map(|r| {
+                let online = !r.peer_id.is_empty() && self.node.is_online(&r.peer_id);
+                let state = if online {
+                    "已连接"
+                } else if r.token.is_empty() && r.code.is_empty() {
+                    "配对失败：请在主界面重新输入「地址 配对码」"
+                } else if r.token.is_empty() {
+                    "正在配对…"
+                } else {
+                    "未连接（对方离线或地址不通）"
+                };
+                let name = if r.name.is_empty() { r.addr.clone() } else { r.name.clone() };
+                DevItem { id: r.addr.clone().into(), name: name.into(), sub: format!("{} · {state}", r.addr).into(), online, blocked: false }
+            })
+            .collect();
+        w.set_remote_peers(ModelRc::new(VecModel::from(rp)));
+    }
+
+    pub fn remote_alert(&self, detail: &str) {
+        self.win.set_remote_msg(detail.into());
+        self.win.set_remote_msg_bad(true);
     }
 
     pub fn settings_changed(&mut self, s: &Settings) {
@@ -149,6 +182,7 @@ impl SettingsCtl {
     }
 
     pub fn peers_changed(&mut self, peers: &[PeerView]) {
+        self.load(&self.node.settings(), false);
         let v: Vec<DevItem> = peers
             .iter()
             .map(|p| DevItem {
@@ -291,6 +325,30 @@ pub fn update_status_changed() {
 }
 
 /// 滚到「更新」（设置页最底下两节之一）。
+/// 滚到「公网连接」并把焦点放进地址框（主界面「通过公网地址连接」点进来）；`addr` 有值时预填，焦点给配对码
+pub fn goto_public(addr: String) {
+    ctl(move |sc| {
+        let win = &sc.win;
+        if !addr.is_empty() {
+            win.set_remote_addr(addr.clone().into());
+        }
+        let max = (win.get_content_h() - win.get_view_h()).max(0.0);
+        let to = -(win.get_pub_y() - 12.0).clamp(0.0, max);
+        let from = win.get_scroll_y();
+        let w = win.as_weak();
+        crate::smooth_scroll("settings", from, to, move |v| {
+            if let Some(win) = w.upgrade() {
+                win.set_scroll_y(v);
+            }
+        });
+        if addr.is_empty() {
+            win.invoke_focus_remote_addr();
+        } else {
+            win.invoke_focus_remote_code();
+        }
+    });
+}
+
 pub fn goto_update() {
     ctl(|sc| {
         let win = &sc.win;
@@ -392,6 +450,49 @@ fn wire(w: &SettingsWindow) {
         });
     });
     w.on_remove_manual(|a| ctl(|sc| sc.update(|s| s.manual_peers.retain(|x| x != a.as_str()))));
+    w.on_toggle_public(|| {
+        ctl(|sc| {
+            let on = !sc.node.settings().public_access;
+            sc.node.set_public_access(on);
+        })
+    });
+    w.on_regen_code(|| {
+        ctl(|sc| {
+            sc.node.regen_pair_code();
+        })
+    });
+    w.on_unpair(|id| ctl(|sc| sc.node.unpair_remote(id.as_str())));
+    w.on_remove_remote(|a| ctl(|sc| sc.node.remove_remote_peer(a.as_str())));
+    w.on_add_remote(|a, c| {
+        ctl(|sc| {
+            let (a, c) = (a.trim().to_string(), c.trim().to_string());
+            let w = &sc.win;
+            if a.is_empty() {
+                w.set_remote_msg("先填对方给你的地址".into());
+                w.set_remote_msg_bad(true);
+                w.invoke_focus_remote_addr();
+                return;
+            }
+            if lancat_core::remote_ws_url(&a).is_none() {
+                w.set_remote_msg("这是局域网地址，不需要配对：直接在主界面「手动添加」里输入即可".into());
+                w.set_remote_msg_bad(true);
+                return;
+            }
+            match sc.node.add_remote_peer(&a, &c) {
+                Ok(()) => {
+                    w.set_remote_addr("".into());
+                    w.set_remote_code("".into());
+                    w.set_remote_msg(format!("正在连接 {a}…，结果显示在下面的列表里").into());
+                    w.set_remote_msg_bad(false);
+                }
+                Err(e) => {
+                    w.set_remote_msg(e.to_string().into());
+                    w.set_remote_msg_bad(true);
+                    w.invoke_focus_remote_code();
+                }
+            }
+        })
+    });
     w.on_toggle_autostart(|| {
         ctl(|sc| {
             let on = !crate::dock::tray::autostart_enabled();
@@ -425,6 +526,15 @@ fn wire(w: &SettingsWindow) {
     w.on_do_update(crate::update::install_bg);
     w.on_open_release(crate::update::open_release_page);
     w.on_toggle_auto_update(|| ctl(|sc| sc.update(|s| s.auto_update = !s.auto_update)));
+    w.on_toggle_message_sound(|| {
+        ctl(|sc| sc.update(|s| s.message_sound = !s.message_sound));
+        // 打开时试听一下
+        with_app(|app| {
+            if app.node.settings().message_sound {
+                crate::sound::message();
+            }
+        });
+    });
     w.on_run_fix(|id, dry| {
         ctl(move |sc| sc.run_fix(id.to_string(), dry));
     });

@@ -90,6 +90,40 @@ pub struct Settings {
     pub iface_kinds: std::collections::BTreeMap<String, String>,
     /// Check GitHub Releases for a newer version in the background and offer it.
     pub auto_update: bool,
+    /// Play a short chime when a message arrives (not for the conversation already on screen).
+    pub message_sound: bool,
+    /// Accept links that come in through a tunnel / the internet (frp, Cloudflare Tunnel, port
+    /// forwarding). They must present `pair_code` once, then the token they were given.
+    pub public_access: bool,
+    /// The code a new public device must enter (generated when public access is switched on).
+    pub pair_code: String,
+    /// Devices paired over the public path (this side accepts them).
+    pub paired_remotes: Vec<PairedRemote>,
+    /// Public addresses this side dials (another device's tunnel), with what pairing gave us.
+    pub remote_peers: Vec<RemotePeer>,
+}
+
+/// A device that paired with us over the public path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct PairedRemote {
+    pub id: String,
+    pub name: String,
+    pub token: String,
+}
+
+/// A public address we dial ("https://lancat.example.com", "frp.example.com:7000").
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct RemotePeer {
+    /// As the user typed it.
+    pub addr: String,
+    /// Pair code still to present (cleared once a token came back).
+    pub code: String,
+    pub token: String,
+    /// Device behind it, once a link was made.
+    pub peer_id: String,
+    pub name: String,
 }
 
 impl Default for Settings {
@@ -111,6 +145,11 @@ impl Default for Settings {
             panel_keep_alive_s: 60,
             iface_kinds: Default::default(),
             auto_update: true,
+            message_sound: true,
+            public_access: false,
+            pair_code: String::new(),
+            paired_remotes: vec![],
+            remote_peers: vec![],
         }
     }
 }

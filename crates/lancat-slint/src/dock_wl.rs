@@ -475,7 +475,7 @@ pub fn on_incoming(m: &lancat_core::Message) {
         log::info!("message toast: {} from {} ({})", m.kind, peer.name, m.peer_id);
         let dark = crate::theme_is_dark(&d.node.settings().theme);
         let hold_ms = 4000 + (text.chars().count() as u32 * 60).min(3000);
-        Ok(crate::toast_wl::ToastSpec { peer_id: peer.id.clone(), name: peer.name.clone(), text, edge: strip.edge.clone(), strip: rect, output: strip.output, dark, hold_ms })
+        Ok(crate::toast_wl::ToastSpec { peer_id: peer.id.clone(), name: peer.name.clone(), text, edge: strip.edge.clone(), strip: rect, output: strip.output, dark, hold_ms, emoji: crate::toast_emoji::lottie_for(&d.node, m) })
     }) else {
         return;
     };
@@ -504,7 +504,7 @@ pub fn on_diag_alert(title: &str, _detail: &str) {
             _ => (mw as f64 - w, a, w, h),
         };
         let dark = crate::theme_is_dark(&d.node.settings().theme);
-        Ok(crate::toast_wl::ToastSpec { peer_id: DIAG_TOAST.into(), name: "Lancat".into(), text: format!("{title}，点此修复"), edge: strip.edge.clone(), strip: rect, output: strip.output, dark, hold_ms: 9000 })
+        Ok(crate::toast_wl::ToastSpec { peer_id: DIAG_TOAST.into(), name: "Lancat".into(), text: format!("{title}，点此修复"), edge: strip.edge.clone(), strip: rect, output: strip.output, dark, hold_ms: 9000, emoji: None })
     });
     match spec {
         Some(Ok(spec)) => {
@@ -535,7 +535,7 @@ pub fn on_update_alert(title: &str) {
             _ => (mw as f64 - w, a, w, h),
         };
         let dark = crate::theme_is_dark(&d.node.settings().theme);
-        Ok(crate::toast_wl::ToastSpec { peer_id: UPDATE_TOAST.into(), name: "Lancat".into(), text: format!("{title}，点此更新"), edge: strip.edge.clone(), strip: rect, output: strip.output, dark, hold_ms: 9000 })
+        Ok(crate::toast_wl::ToastSpec { peer_id: UPDATE_TOAST.into(), name: "Lancat".into(), text: format!("{title}，点此更新"), edge: strip.edge.clone(), strip: rect, output: strip.output, dark, hold_ms: 9000, emoji: None })
     });
     match spec {
         Some(Ok(spec)) => {

@@ -18,7 +18,7 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, S
 use windows::Win32::Graphics::Direct2D::Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_GRADIENT_STOP, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U};
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1DCRenderTarget, D2D1_BITMAP_PROPERTIES, D2D1_EXTEND_MODE_CLAMP, D2D1_GAMMA_2_2, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, ID2D1Factory, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-    D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
+    D2D1_FEATURE_LEVEL_DEFAULT, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextLayout, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
@@ -67,6 +67,8 @@ pub struct ToastSpec {
     pub scale: f64,
     pub dark: bool,
     pub hold_ms: u32,
+    /// 动态表情 / 贴纸的 Lottie：有就在头像位播大号表情（toast_emoji.rs）
+    pub emoji: Option<String>,
 }
 
 struct Gfx {
@@ -133,6 +135,9 @@ struct State {
     glass: Option<Vec<u8>>,
     /// the backdrop under the card is dark: tint and text follow it rather than the app theme
     glass_dark: Option<bool>,
+    /// 大号动态表情（头像位）与它当前帧（预乘 BGRA）
+    pop: Option<crate::toast_emoji::Pop>,
+    pop_frame: Option<(Vec<u8>, u32, f64)>,
 }
 
 thread_local! {
@@ -195,6 +200,8 @@ fn ensure_window() -> bool {
                 hovering: false,
                 glass: None,
                 glass_dark: None,
+                pop: None,
+                pop_frame: None,
             })
         });
     }
@@ -233,6 +240,8 @@ pub fn show(spec: ToastSpec) {
         }
         let Some(g) = &s.gfx else { return };
         let sc = spec.scale;
+        s.pop = spec.emoji.as_deref().and_then(|j| crate::toast_emoji::Pop::new(j, (crate::toast_emoji::SIZE * sc * 1.15).ceil() as u32));
+        s.pop_frame = None;
         let (name, name_w) = layout(&g.dw, &spec.name, (12.5 * sc) as f32, DWRITE_FONT_WEIGHT_SEMI_BOLD, (NAME_MAX * sc) as f32).unzip();
         let (text, text_w) = layout(&g.dw, &spec.text, (12.0 * sc) as f32, DWRITE_FONT_WEIGHT_NORMAL, (TEXT_MAX * sc) as f32).unzip();
         let init = initials(&spec.name);
@@ -290,8 +299,17 @@ pub fn dismiss() {
     });
 }
 
+/// 头像位宽度：有大号表情时更宽
+fn slot(s: &State) -> f64 {
+    if s.pop.is_some() {
+        crate::toast_emoji::SLOT
+    } else {
+        AVATAR
+    }
+}
+
 fn pill_size(s: &State, sc: f64) -> (f64, f64) {
-    let w = PAD * sc + (AVATAR + GAP) * sc + s.name_w.max(s.text_w) + PAD * sc * 1.7;
+    let w = PAD * sc + (slot(s) + GAP) * sc + s.name_w.max(s.text_w) + PAD * sc * 1.7;
     (w.max(H * sc * 2.4), H * sc)
 }
 
@@ -468,6 +486,15 @@ fn animate(s: &mut State, to: f64) {
 /// used to stay invisible from the first driver reset until the app was restarted (every
 /// EndDraw failed with D2DERR_RECREATE_TARGET and nothing recreated the target).
 fn draw(s: &mut State) {
+    if let Some(p) = s.pop.as_mut() {
+        let px = p.px();
+        let mut f = p.frame_rgba();
+        // ThorVG 是 R,G,B,A → Direct2D 要 B,G,R,A（都是预乘）
+        for c in f.chunks_exact_mut(4) {
+            c.swap(0, 2);
+        }
+        s.pop_frame = Some((f, px, p.scale()));
+    }
     if render(s) {
         return;
     }
@@ -671,15 +698,16 @@ fn render(s: &State) -> bool {
                     rt.DrawRoundedRectangle(&pill, &b, sc as f32 * 0.8, None);
                 }
                 if content > 0.0 {
-                    let cx = x0 + PAD * sc + AVATAR * sc / 2.0;
+                    let cx = x0 + PAD * sc + slot(s) * sc / 2.0;
                     let cy = y0 + ch / 2.0;
-                    if let Ok(b) = rt.CreateSolidColorBrush(&avatar_color(&spec.peer_id), None) {
+                    let emoji = s.pop.is_some();
+                    if let Some(b) = (!emoji).then(|| rt.CreateSolidColorBrush(&avatar_color(&spec.peer_id), None).ok()).flatten() {
                         b.SetOpacity(content);
                         let r = (AVATAR * sc / 2.0) as f32;
                         rt.FillEllipse(&D2D1_ELLIPSE { point: pt(cx as f32, cy as f32), radiusX: r, radiusY: r }, &b);
                     }
                     let opts = D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT | D2D1_DRAW_TEXT_OPTIONS_CLIP;
-                    if let (Some(l), Ok(b)) = (&s.initial, rt.CreateSolidColorBrush(&color(1.0, 1.0, 1.0, 1.0), None)) {
+                    if let (false, Some(l), Ok(b)) = (emoji, &s.initial, rt.CreateSolidColorBrush(&color(1.0, 1.0, 1.0, 1.0), None)) {
                         b.SetOpacity(content);
                         let mut mt = Default::default();
                         let _ = l.GetMetrics(&mut mt);
@@ -689,7 +717,7 @@ fn render(s: &State) -> bool {
                     }
                     let fg = if dark { color(1.0, 1.0, 1.0, 1.0) } else { color(0.07, 0.07, 0.08, 1.0) };
                     let sub = if dark { color(0.92, 0.92, 0.95, 0.82) } else { color(0.2, 0.2, 0.24, 0.85) };
-                    let x = x0 + PAD * sc + AVATAR * sc + GAP * sc;
+                    let x = x0 + PAD * sc + slot(s) * sc + GAP * sc;
                     let lh = |l: &Option<IDWriteTextLayout>| {
                         l.as_ref()
                             .map(|l| {
@@ -708,6 +736,19 @@ fn render(s: &State) -> bool {
                     if let (Some(l), Ok(b)) = (&s.text, rt.CreateSolidColorBrush(&sub, None)) {
                         b.SetOpacity(content);
                         rt.DrawTextLayout(pt(x as f32, (top + nh + LINE_GAP * sc) as f32), l, &b, opts);
+                    }
+                    // 大号动态表情：上下探出胶囊，随弹簧「蹦」出来；收回时随内容一起缩小淡出
+                    if let Some((px, n, pop)) = &s.pop_frame {
+                        let props = D2D1_BITMAP_PROPERTIES {
+                            pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+                            dpiX: 96.0,
+                            dpiY: 96.0,
+                        };
+                        if let Ok(bmp) = rt.CreateBitmap(D2D_SIZE_U { width: *n, height: *n }, Some(px.as_ptr() as *const _), *n * 4, &props) {
+                            let sz = crate::toast_emoji::SIZE * sc * pop * (0.6 + 0.4 * content as f64);
+                            let d = D2D_RECT_F { left: (cx - sz / 2.0) as f32, top: (cy - sz / 2.0) as f32, right: (cx + sz / 2.0) as f32, bottom: (cy + sz / 2.0) as f32 };
+                            rt.DrawBitmap(&bmp, Some(&d), content, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                        }
                     }
                 }
                 if let Err(e) = rt.EndDraw(None, None) {
@@ -777,7 +818,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     with(|s| {
                         let done = step(s);
                         draw(s);
-                        if done {
+                        // 有表情时定时器一直跑（表情循环播放），直到收回
+                        if done && (s.pop.is_none() || s.to <= 0.0) {
                             let _ = KillTimer(Some(hwnd), TIMER_ANIM);
                             if s.to <= 0.0 {
                                 let _ = KillTimer(Some(hwnd), TIMER_HIDE);
@@ -785,6 +827,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 s.spec = None;
                                 s.hovering = false;
                                 s.glass = None; // window-sized backdrop copy: free it
+                                s.pop = None;
+                                s.pop_frame = None;
                                 // Direct2D / DirectWrite（工厂、DC 渲染目标、字体缓存）只在 toast 显示时用：
                                 // 收回后整套释放并修剪工作集，收起空闲时 WS 回到 ~21 MB（不释放时常驻 ~56 MB）。
                                 // 下次 show() 会重新 create_gfx()（与设备丢失后的重建是同一条路径）。

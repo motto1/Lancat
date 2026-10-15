@@ -10,7 +10,7 @@ description = "Lancat core: LAN discovery (mDNS + UDP), transport (axum HTTP/Web
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "fs", "io-util", "io-std", "signal", "process"] }
 axum = { version = "0.8", features = ["ws"] }
 # same major as axum's ws support, so only one tungstenite is linked
-tokio-tungstenite = "0.29"
+tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 futures-util = { version = "0.3", features = ["sink"] }
 reqwest = { version = "0.13", default-features = false, features = ["stream"] }
 mdns-sd = "0.21"

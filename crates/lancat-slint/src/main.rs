@@ -29,6 +29,10 @@ mod fx;
 mod icons;
 mod lottie;
 mod settings_ui;
+mod sound;
+mod morph;
+mod spring;
+mod toast_emoji;
 mod update;
 #[cfg(windows)]
 mod win;
@@ -808,6 +812,14 @@ impl App {
                 }
             }
             CoreEvent::Message { message } => {
+                // 提示音：别人发来的、没拉黑的、而且不是正开着看的那个会话
+                if !message.outgoing && self.node.settings().message_sound {
+                    let blocked = self.peers.iter().find(|p| p.id == message.peer_id).is_none_or(|p| p.blocked);
+                    let viewing = self.visible && self.current == message.peer_id && self.selected.len() <= 1;
+                    if !blocked && !viewing {
+                        sound::message();
+                    }
+                }
                 dock::on_incoming(&message);
                 if !message.outgoing {
                     self.typing.remove(&message.peer_id);
@@ -877,6 +889,16 @@ impl App {
                 dock::apply_layout();
             }
             CoreEvent::Alert { kind, report, detail } => {
+                if kind == "remote_auth" {
+                    self.flash(detail.clone());
+                    if let Some(ui) = self.ui() {
+                        ui.set_add_msg(detail.clone().into());
+                        ui.set_add_msg_bad(true);
+                    }
+                    if let Some(sc) = self.settings.as_ref() {
+                        sc.remote_alert(&detail);
+                    }
+                }
                 diag::on_core_alert(&kind, report.as_ref(), &detail);
             }
         }
@@ -1330,6 +1352,12 @@ pub(crate) fn open_settings_update() {
     slint::Timer::single_shot(Duration::from_millis(80), settings_ui::goto_update);
 }
 
+/// 打开设置并滚到「公网连接」（`addr`：主界面输入的公网地址，预填进去）
+pub(crate) fn open_settings_public(addr: String) {
+    open_settings(false);
+    slint::Timer::single_shot(Duration::from_millis(80), move || settings_ui::goto_public(addr));
+}
+
 pub(crate) fn open_settings(goto_diag: bool) {
     with_app(|app| {
         if app.settings.is_none() {
@@ -1501,6 +1529,7 @@ fn wire_ui(ui: &PanelWindow) {
         dock::hide_panel();
     });
     ui.on_open_settings(|| open_settings(false));
+    ui.on_open_public(|| open_settings_public(String::new()));
     ui.on_open_diag(|| open_settings(true));
     ui.on_dismiss_banner(|| {
         diag::dismiss_alert();
@@ -1535,6 +1564,32 @@ fn wire_ui(ui: &PanelWindow) {
         if addr.is_empty() {
             return;
         }
+        // 公网地址（域名 / https / 非默认端口）：「地址 配对码」，交给 remote 拨号器
+        let mut parts = addr.split_whitespace();
+        let first = parts.next().unwrap_or("").to_string();
+        if lancat_core::remote_ws_url(&first).is_some() {
+            let code: String = parts.collect::<Vec<_>>().join("");
+            if code.is_empty() {
+                // 只填了地址：去设置里补配对码
+                with_app(|app| {
+                    if let Some(ui) = app.ui() {
+                        ui.set_manual_addr("".into());
+                    }
+                });
+                open_settings_public(first);
+                return;
+            }
+            with_app(|app| match app.node.add_remote_peer(&first, &code) {
+                Ok(()) => {
+                    if let Some(ui) = app.ui() {
+                        ui.set_manual_addr("".into());
+                    }
+                    app.flash(format!("正在连接 {first}…"));
+                }
+                Err(e) => app.flash(e.to_string()),
+            });
+            return;
+        }
         with_app(|app| {
             if let Some(ui) = app.ui() {
                 ui.set_adding(true);
@@ -1554,6 +1609,75 @@ fn wire_ui(ui: &PanelWindow) {
                             app.flash(format!("已添加 {}", p.name));
                         }
                         Err(e) => app.flash(format!("连接失败：{e}")),
+                    }
+                });
+            });
+        });
+    });
+    ui.on_is_public(|a| {
+        let a = a.trim();
+        !a.is_empty() && lancat_core::remote_ws_url(a.split_whitespace().next().unwrap_or("")).is_some()
+    });
+    ui.on_add_msg_reset(|| {
+        with_app(|app| {
+            if let Some(ui) = app.ui() {
+                ui.set_add_msg("".into());
+                ui.set_add_msg_bad(false);
+            }
+        });
+    });
+    ui.on_add_submit(|| {
+        with_app(|app| {
+            let Some(ui) = app.ui() else { return };
+            if ui.get_adding() {
+                return;
+            }
+            let addr = ui.get_add_addr().trim().to_string();
+            let code: String = ui.get_add_code().split_whitespace().collect();
+            let msg = |t: &str, bad: bool| {
+                ui.set_add_msg(t.into());
+                ui.set_add_msg_bad(bad);
+            };
+            if addr.is_empty() {
+                return msg("先填 IP 或公网地址", true);
+            }
+            let first = addr.split_whitespace().next().unwrap_or("").to_string();
+            if lancat_core::remote_ws_url(&first).is_some() {
+                // 地址后面直接带了配对码也认
+                let code = if code.is_empty() { addr.split_whitespace().skip(1).collect::<String>() } else { code };
+                if code.is_empty() {
+                    return msg("公网地址需要填配对码", true);
+                }
+                match app.node.add_remote_peer(&first, &code) {
+                    Ok(()) => {
+                        ui.set_add_addr("".into());
+                        ui.set_add_code("".into());
+                        ui.set_add_open(false);
+                        app.flash(format!("正在连接 {first}…"));
+                    }
+                    Err(e) => msg(&e.to_string(), true),
+                }
+                return;
+            }
+            ui.set_adding(true);
+            msg("正在连接…", false);
+            let node = app.node.clone();
+            app.rt.spawn(async move {
+                let r = node.add_peer_addr(&addr).await;
+                post(move |app| {
+                    let Some(ui) = app.ui() else { return };
+                    ui.set_adding(false);
+                    match r {
+                        Ok(p) => {
+                            ui.set_add_addr("".into());
+                            ui.set_add_msg("".into());
+                            ui.set_add_open(false);
+                            app.flash(format!("已添加 {}", p.name));
+                        }
+                        Err(e) => {
+                            ui.set_add_msg(format!("连接失败：{e}").into());
+                            ui.set_add_msg_bad(true);
+                        }
                     }
                 });
             });
@@ -1765,7 +1889,9 @@ fn main() {
                     if dialog {
                         return (true, true);
                     }
-                    w1.upgrade().map(|u| (u.get_composer_focused(), !u.get_draft().trim().is_empty())).unwrap_or((false, false))
+                    w1.upgrade()
+                        .map(|u| if u.get_add_open() { (true, true) } else { (u.get_composer_focused(), !u.get_draft().trim().is_empty()) })
+                        .unwrap_or((false, false))
                 }),
                 on_open: Box::new(|reason| {
                     let r = reason.to_string();
@@ -1819,6 +1945,13 @@ fn run_script(parts: &[String]) {
     match cmd {
         "settings" => return open_settings(false),
         "diag" => return open_settings(true),
+        "public" => return open_settings_public(arg),
+        "pubon" => {
+            with_app(|app| {
+                app.node.set_public_access(true);
+            });
+            return;
+        }
         "open" => {
             dock::open_panel("probe");
             return;

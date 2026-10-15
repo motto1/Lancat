@@ -14,6 +14,10 @@ export component ToastWindow inherits Window {
     in property <string> initials;
     in property <color> avatar;
     in property <bool> dark;
+    // 动态表情 / 贴纸消息：头像位换成大号表情，pop 是它蹦出来的弹簧缩放（toast_emoji.rs）
+    in property <bool> has-emoji;
+    in property <image> emoji;
+    in property <float> pop;
     // 旧版用 GTK 的界面字体（gtk-font-name），pango 绝对字号
     in property <string> family: "Sans";
     default-font-family: root.family;
@@ -22,12 +26,14 @@ export component ToastWindow inherits Window {
     property <length> H: 48px;
     property <length> PAD: 8px;
     property <length> AVATAR: 32px;
+    property <length> EMOJI: 56px;
+    property <length> SLOT: has-emoji ? 44px : AVATAR;
     property <length> GAP: 9px;
     property <length> RADIUS: 17px;
     property <length> INSET: 4px;
     property <length> name-w: min(nm.preferred-width, 196px);
     property <length> text-w: min(tx.preferred-width, 196px);
-    out property <length> pill-w: max(PAD + AVATAR + GAP + max(name-w, text-w) + PAD * 1.7, H * 2.4);
+    out property <length> pill-w: max(PAD + SLOT + GAP + max(name-w, text-w) + PAD * 1.7, H * 2.4);
     out property <length> pill-h: H;
 
     property <float> tt: max(0, t);
@@ -100,7 +106,7 @@ export component ToastWindow inherits Window {
     // ---- 内容（content > 0 才画）----
     property <length> cy: y0 + ch / 2;
     Rectangle {
-        visible: root.content > 0;
+        visible: root.content > 0 && !root.has-emoji;
         x: root.x0 + root.PAD;
         y: root.cy - root.AVATAR / 2;
         width: root.AVATAR;
@@ -126,7 +132,7 @@ export component ToastWindow inherits Window {
         clip: true;
         property <length> top: root.cy - root.y0 - (nm.preferred-height + tx.preferred-height + 1px) / 2;
         nm := Text {
-            x: root.PAD + root.AVATAR + root.GAP;
+            x: root.PAD + root.SLOT + root.GAP;
             y: parent.top;
             width: root.name-w;
             text: root.name;
@@ -137,7 +143,7 @@ export component ToastWindow inherits Window {
             color: root.dark ? rgba(255, 255, 255, root.content) : rgba(0.07 * 255, 0.07 * 255, 0.08 * 255, root.content);
         }
         tx := Text {
-            x: root.PAD + root.AVATAR + root.GAP;
+            x: root.PAD + root.SLOT + root.GAP;
             y: parent.top + nm.preferred-height + 1px;
             width: root.text-w;
             text: root.text;
@@ -146,5 +152,17 @@ export component ToastWindow inherits Window {
             wrap: no-wrap;
             color: root.dark ? rgba(0.92 * 255, 0.92 * 255, 0.95 * 255, 0.82 * root.content) : rgba(0.2 * 255, 0.2 * 255, 0.24 * 255, 0.85 * root.content);
         }
+    }
+
+    // 大号动态表情：画在卡片外面（不裁），上下探出胶囊；收回时随内容一起缩小淡出
+    if root.has-emoji && root.content > 0: Image {
+        property <length> sz: root.EMOJI * root.pop * (0.6 + 0.4 * root.content);
+        x: root.x0 + root.PAD + root.SLOT / 2 - self.sz / 2;
+        y: root.cy - self.sz / 2;
+        width: self.sz;
+        height: self.sz;
+        source: root.emoji;
+        opacity: root.content;
+        image-fit: contain;
     }
 }

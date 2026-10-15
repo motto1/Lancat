@@ -22,6 +22,10 @@ pub const LINKLESS_GRACE_SECS: u64 = 20;
 /// After an unexpected link close the peer is re-probed and marked offline if it does not answer in this time.
 pub const LINK_LOST_GRACE_SECS: u64 = 3;
 pub const HEADER_DEVICE_ID: &str = "x-lancat-id";
+/// Public (tunnelled) links: "code:<pair code>" the first time, then "token:<token>".
+pub const HEADER_AUTH: &str = "x-lancat-auth";
+/// Answer to a successful "code:" handshake: the token to use from now on.
+pub const HEADER_TOKEN: &str = "x-lancat-token";
 pub const HEADER_CHUNK_HASH: &str = "x-lancat-chunk-hash";
 
 /// What a device says about itself (mDNS TXT, UDP probe/reply, WS hello, GET /info).

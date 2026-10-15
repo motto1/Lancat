@@ -69,6 +69,13 @@ pub(crate) fn spawn(node: Arc<Node>, listener: tokio::net::TcpListener) {
 /// Rejects non-LAN sources and blacklisted devices / addresses.
 async fn guard(State(node): St, ConnectInfo(addr): ConnectInfo<SocketAddr>, req: Request, next: Next) -> Response {
     let ip = addr.ip();
+    // through a tunnel / from outside: only the link, and only paired (remote.rs; checked in `ws`)
+    if node.is_public_request(&ip, req.headers()) {
+        if req.uri().path() != "/ws" || !node.store.settings().public_access {
+            return (StatusCode::FORBIDDEN, "lan only").into_response();
+        }
+        return next.run(req).await;
+    }
     if !node.is_trusted_source(&ip) {
         return (StatusCode::FORBIDDEN, "lan only").into_response();
     }
@@ -99,8 +106,27 @@ async fn info(State(node): St) -> Json<DeviceInfo> {
     Json(node.me())
 }
 
-async fn ws(State(node): St, ConnectInfo(addr): ConnectInfo<SocketAddr>, up: WebSocketUpgrade) -> Response {
-    up.max_message_size(4 << 20).on_upgrade(move |socket| node.accept_ws(socket, addr.ip()))
+async fn ws(State(node): St, ConnectInfo(addr): ConnectInfo<SocketAddr>, h: HeaderMap, up: WebSocketUpgrade) -> Response {
+    let up = up.max_message_size(4 << 20);
+    if !node.is_public_request(&addr.ip(), &h) {
+        return up.on_upgrade(move |socket| node.accept_ws(socket, addr.ip(), crate::remote::LinkCtx::Lan));
+    }
+    let ctx = match node.check_public_auth(&h) {
+        Ok(c) => c,
+        Err(why) => {
+            log::info!("public link from {} refused: {why}", addr.ip());
+            return (StatusCode::UNAUTHORIZED, why).into_response();
+        }
+    };
+    let tok = match &ctx {
+        crate::remote::LinkCtx::RemoteAccept { new_token: Some(t), .. } => Some(t.clone()),
+        _ => None,
+    };
+    let mut resp = up.on_upgrade(move |socket| node.accept_ws(socket, crate::remote::REMOTE_IP, ctx));
+    if let Some(t) = tok.and_then(|t| t.parse().ok()) {
+        resp.headers_mut().insert(HEADER_TOKEN, t);
+    }
+    resp
 }
 
 async fn msg(State(node): St, ConnectInfo(addr): ConnectInfo<SocketAddr>, h: HeaderMap, body: Bytes) -> Result<Response, (StatusCode, String)> {

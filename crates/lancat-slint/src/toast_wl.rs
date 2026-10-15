@@ -26,6 +26,8 @@ pub struct ToastSpec {
     pub output: usize,
     pub dark: bool,
     pub hold_ms: u32,
+    /// 动态表情 / 贴纸的 Lottie（有就在头像位播大号表情）
+    pub emoji: Option<String>,
 }
 
 struct State {
@@ -39,6 +41,7 @@ struct State {
     anim: slint::Timer,
     hide: slint::Timer,
     hovering: bool,
+    pop: Option<crate::toast_emoji::Pop>,
 }
 
 thread_local! {
@@ -80,6 +83,7 @@ fn ensure() -> bool {
             anim: slint::Timer::default(),
             hide: slint::Timer::default(),
             hovering: false,
+            pop: None,
         })
     });
     true
@@ -91,12 +95,18 @@ pub fn show(spec: ToastSpec) {
     }
     let hold = spec.hold_ms;
     with(|s| {
+        // 表情：逻辑 56 px × 缩放（输出缩放未知时按 2 渲染，回弹放大也不糊）
+        s.pop = spec.emoji.as_deref().and_then(|j| crate::toast_emoji::Pop::new(j, (crate::toast_emoji::SIZE * 2.0 * 1.15) as u32));
+        let has_emoji = s.pop.is_some();
+        push_emoji_frame(s);
         let ui = &s.ui;
         ui.set_name(spec.name.clone().into());
         ui.set_text(spec.text.clone().into());
         ui.set_initials(crate::initials(&spec.name).into());
         ui.set_avatar(crate::avatar_colors(&spec.peer_id, false).1);
         ui.set_dark(spec.dark);
+        ui.set_has_emoji(has_emoji);
+        ui.set_pop(0.0);
         ui.set_edge(spec.edge.clone().into());
         let (sx, sy, sw, sh) = spec.strip;
         ui.set_strip_w(sw as f32);
@@ -139,6 +149,17 @@ pub fn show(spec: ToastSpec) {
     });
 }
 
+/// 表情的当前帧和弹出缩放 → ToastWindow
+fn push_emoji_frame(s: &mut State) {
+    let Some(p) = s.pop.as_mut() else { return };
+    let px = p.px();
+    let rgba = p.frame_rgba();
+    let mut buf = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(px, px);
+    buf.make_mut_bytes().copy_from_slice(&rgba);
+    s.ui.set_emoji(slint::Image::from_rgba8_premultiplied(buf));
+    s.ui.set_pop(p.scale() as f32);
+}
+
 fn arm_hide(s: &mut State, ms: u32) {
     s.hide.start(slint::TimerMode::SingleShot, Duration::from_millis(ms as u64), || {
         with(|s| animate(s, 0.0));
@@ -166,11 +187,14 @@ fn animate(s: &mut State, to: f64) {
             with(|s| {
                 let done = step(s);
                 s.ui.set_t(s.t as f32);
-                if done {
+                push_emoji_frame(s);
+                // 有表情时动画定时器一直跑（表情在循环播放），直到收回
+                if done && (s.pop.is_none() || s.to <= 0.0) {
                     s.anim.stop();
                     if s.to <= 0.0 {
                         s.spec = None;
                         s.hovering = false;
+                        s.pop = None;
                         wl::push(Cmd::Toast(None));
                     }
                 }

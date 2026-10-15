@@ -186,6 +186,12 @@ pub struct Win32Window {
     /// 变换后的帧（settle 期间 WM_PAINT 从这里拷）
     xbuf: RefCell<Vec<Bgra>>,
     xformed: Cell<bool>,
+    /// 液态玻璃底（面板打开时）：背后屏幕的模糊图 + 边缘透镜 + 色调 + 高光，已按窗口尺寸合好；
+    /// WM_PAINT 把 Slint 的帧叠在它上面。空 = 用窗口自己的 Acrylic。
+    lq_base: RefCell<Vec<Bgra>>,
+    /// 合成 lq_base 用的那张模糊背景（收起动画直接拿它当玻璃，不用再截屏）
+    lq_glass: RefCell<Vec<Bgra>>,
+    lq_dark: Cell<bool>,
 }
 
 const CLASS: PCWSTR = w!("LancatSlintPanel");
@@ -210,6 +216,9 @@ impl Win32Window {
             settle: Cell::new(None),
             xbuf: RefCell::new(Vec::new()),
             xformed: Cell::new(false),
+            lq_base: RefCell::new(Vec::new()),
+            lq_glass: RefCell::new(Vec::new()),
+            lq_dark: Cell::new(false),
             normal: NEXT_NORMAL.with(|n| n.replace(false)),
             shown_once: Cell::new(false),
         });
@@ -367,7 +376,25 @@ impl Win32Window {
                         },
                         ..Default::default()
                     };
-                    let p = buf[y0 as usize * w..].as_ptr();
+                    let lq = self.lq_base.borrow();
+                    let mut tmp: Vec<Bgra> = Vec::new();
+                    let p = if lq.len() == buf.len() {
+                        // 帧叠在液态玻璃底上（预乘 over）
+                        tmp.extend_from_slice(&buf[y0 as usize * w..y1 as usize * w]);
+                        let base = &lq[y0 as usize * w..y1 as usize * w];
+                        for (o, b) in tmp.iter_mut().zip(base) {
+                            let inv = 255 - o.a as u32;
+                            if inv > 0 {
+                                o.b = (o.b as u32 + (b.b as u32 * inv + 127) / 255).min(255) as u8;
+                                o.g = (o.g as u32 + (b.g as u32 * inv + 127) / 255).min(255) as u8;
+                                o.r = (o.r as u32 + (b.r as u32 * inv + 127) / 255).min(255) as u8;
+                                o.a = (o.a as u32 + (b.a as u32 * inv + 127) / 255).min(255) as u8;
+                            }
+                        }
+                        tmp.as_ptr()
+                    } else {
+                        buf[y0 as usize * w..].as_ptr()
+                    };
                     SetDIBitsToDevice(dc, x0, y0, (x1 - x0) as u32, rows, x0, 0, 0, rows, p as *const _, &bi, DIB_RGB_COLORS);
                 }
             }
@@ -951,10 +978,8 @@ pub fn panel_show(r: crate::dock::Rect) {
     fade_to(&w, 255, fade_ms(true));
 }
 
-/// 淡出并停放。面板拿着前台时把前台交还给打开前的窗口（`prev`），否则交给 Z 序里下一个可见窗口。
-pub fn panel_hide(prev: Option<isize>) {
-    let Some(w) = panel() else { return };
-    let h = w.hwnd.get();
+/// 面板拿着前台时把前台交还给打开前的窗口（`prev`），否则交给 Z 序里下一个可见窗口。
+fn give_back_foreground(h: HWND, prev: Option<isize>) {
     unsafe {
         if GetForegroundWindow() == h {
             let back = prev.map(|p| HWND(p as _)).filter(|p| IsWindow(Some(*p)).as_bool() && IsWindowVisible(*p).as_bool());
@@ -973,7 +998,190 @@ pub fn panel_hide(prev: Option<isize>) {
             }
         }
     }
+}
+
+/// 淡出并停放。
+pub fn panel_hide(prev: Option<isize>) {
+    let Some(w) = panel() else { return };
+    give_back_foreground(w.hwnd.get(), prev);
     fade_to(&w, 0, fade_ms(false));
+}
+
+/// 面板最后一帧（先把还没画的变化画进缓冲）：(预乘 BGRA, 宽, 高)
+fn panel_snapshot() -> Option<(Vec<Bgra>, usize, usize)> {
+    let w = panel()?;
+    let size = w.size.get();
+    let n = (size.width * size.height) as usize;
+    if w.needs_redraw.get() || w.buf.borrow().len() != n {
+        let _ = w.render();
+    }
+    let b = w.buf.borrow();
+    (n > 0 && b.len() == n).then(|| (b.clone(), size.width as usize, size.height as usize))
+}
+
+/// 用一张背后屏幕的模糊图（窗口尺寸）重建面板的液态玻璃底，整窗重画
+fn set_liquid(w: &Win32Window, glass: Option<Vec<Bgra>>, dark: bool) {
+    let size = w.size.get();
+    let (pw, ph) = (size.width as usize, size.height as usize);
+    let Some(glass) = glass.filter(|g| g.len() == pw * ph && pw > 0) else {
+        w.lq_base.borrow_mut().clear();
+        w.lq_glass.borrow_mut().clear();
+        return;
+    };
+    let sc = w.scale.get() as f64;
+    let mut base = vec![Bgra::default(); pw * ph];
+    let none = [Bgra::default()];
+    let content = crate::morph::Content { px: &none, w: 1, h: 1, at: (0.0, 0.0) };
+    // 和变形最后一帧一样的参数（content = 1 只影响顶部高光强度）
+    let f = crate::morph::Frame { rect: [0.0, 0.0, pw as f64, ph as f64], radius: 8.0 * sc, content: 1.0, grow: 1.0, done: true };
+    crate::morph::render(&mut base, pw, ph, &f, Some(&glass), &content, &crate::morph::Look { dark, scale: sc, accent: crate::dock::ACCENT });
+    *w.lq_base.borrow_mut() = base;
+    *w.lq_glass.borrow_mut() = glass;
+    w.lq_dark.set(dark);
+    unsafe {
+        let _ = InvalidateRect(Some(w.hwnd.get()), None, false);
+    }
+}
+
+thread_local! {
+    static LQ_TIMER: slint::Timer = slint::Timer::default();
+}
+static LQ_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 面板开着时每秒重截一次背后的屏幕（截的那一瞬间把面板排除出截图），玻璃里的背景跟着变
+thread_local! {
+    static LQ_SIG: Cell<u64> = const { Cell::new(0) };
+}
+
+/// 面板背后、与面板相交的可见顶层窗口（句柄 + 位置 + 标题长度）的指纹；不截屏，几微秒
+fn behind_signature(panel: HWND) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hs = std::collections::hash_map::DefaultHasher::new();
+    let mut pr = RECT::default();
+    unsafe {
+        let _ = GetWindowRect(panel, &mut pr);
+        let mut h = GetWindow(panel, GW_HWNDNEXT).unwrap_or_default();
+        let mut n = 0;
+        while !h.0.is_null() && n < 400 {
+            n += 1;
+            if IsWindowVisible(h).as_bool() && !IsIconic(h).as_bool() {
+                let mut r = RECT::default();
+                let _ = GetWindowRect(h, &mut r);
+                if r.left < pr.right && r.right > pr.left && r.top < pr.bottom && r.bottom > pr.top {
+                    (h.0 as usize, r.left, r.top, r.right, r.bottom, GetWindowTextLengthW(h)).hash(&mut hs);
+                }
+            }
+            h = GetWindow(h, GW_HWNDNEXT).unwrap_or_default();
+        }
+    }
+    hs.finish() | 1
+}
+
+fn start_liquid_refresh() {
+    LQ_TIMER.with(|t| {
+        // 不再定时截屏（每截一次面板要从录屏/截图里消失一帧）：只在面板背后的窗口变了（切换、挪动、开关）时才重截
+        t.start(slint::TimerMode::Repeated, Duration::from_millis(350), || {
+            let Some(w) = panel() else { return };
+            if w.alpha.get() != 255 || !crate::dock::is_visible() || crate::dock::morph::running() || w.lq_base.borrow().is_empty() {
+                LQ_SIG.with(|s| s.set(0));
+                return;
+            }
+            let sig = behind_signature(w.hwnd.get());
+            let old = LQ_SIG.with(|s| s.replace(sig));
+            if old == 0 || old == sig {
+                return;
+            }
+            if LQ_BUSY.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                return;
+            }
+            let h = w.hwnd.get().0 as isize;
+            let mut r = RECT::default();
+            unsafe {
+                let _ = GetWindowRect(w.hwnd.get(), &mut r);
+            }
+            let rect = (r.left, r.top, r.right - r.left, r.bottom - r.top);
+            let sc = w.scale.get() as f64;
+            let dark = w.lq_dark.get();
+            std::thread::spawn(move || {
+                let g = crate::dock::morph::capture_excluding(HWND(h as _), rect, sc);
+                let _ = slint::invoke_from_event_loop(move || {
+                    LQ_BUSY.store(false, std::sync::atomic::Ordering::Release);
+                    let Some(w) = panel() else { return };
+                    if w.alpha.get() == 255 && !w.lq_base.borrow().is_empty() && g.is_some() {
+                        set_liquid(&w, g, dark);
+                    }
+                });
+            });
+        })
+    });
+}
+
+/// 立刻停放（alpha 0、点击穿透），取消正在进行的淡入淡出
+fn park_now(w: &Win32Window) {
+    let h = w.hwnd.get();
+    w.lq_base.borrow_mut().clear();
+    w.lq_glass.borrow_mut().clear();
+    w.fade_gen.set(w.fade_gen.get() + 1);
+    set_layered(h, true);
+    set_alpha(h, 0, w);
+}
+
+/// 打开：面板先停在原位（不可见），变形窗口从停靠条长出面板的样子，停稳后真面板接手。
+pub fn panel_show_morph(g: crate::dock::Geo, edge: String, dark: bool, accent: (f64, f64, f64)) {
+    if !crate::dock::morph::enabled() {
+        return panel_show(g.panel);
+    }
+    let Some(w) = panel() else { return };
+    panel_place(g.panel);
+    park_now(&w);
+    unsafe {
+        let _ = ShowWindow(w.hwnd.get(), SW_SHOWNOACTIVATE);
+    }
+    // 等打开的钩子（切会话等）跑完、界面变化进了下一帧再截面板
+    slint::Timer::single_shot(Duration::ZERO, move || {
+        if !crate::dock::is_visible() {
+            return;
+        }
+        let Some((px, cw, ch)) = panel_snapshot() else { return panel_show(g.panel) };
+        let p = crate::dock::morph::Params { strip: g.dock, panel: g.panel, edge, scale: g.scale, dark, accent, content: px, cw, ch };
+        crate::dock::morph::open(p, move || {
+            if !crate::dock::is_visible() {
+                return;
+            }
+            let Some(w) = panel() else { return };
+            let h = w.hwnd.get();
+            // 变形用的那张背景图接着给真面板当玻璃底，玻璃效果不会在停稳后消失
+            if std::env::var("LANCAT_WIN_LIQUID").as_deref() != Ok("0") {
+                set_liquid(&w, crate::dock::morph::crop_glass(g.panel), dark);
+                start_liquid_refresh();
+            }
+            w.fade_gen.set(w.fade_gen.get() + 1);
+            set_alpha(h, 255, &w);
+            set_layered(h, false);
+            w.needs_redraw.set(true);
+            unsafe {
+                let _ = InvalidateRect(Some(h), None, false);
+            }
+            log::info!("panel shown after morph, {} ms after start", crate::t0().elapsed().as_millis());
+        });
+    });
+}
+
+/// 收起：变形窗口以面板的样子盖上，面板立刻停放，形状缩回停靠条。
+pub fn panel_hide_morph(prev: Option<isize>, g: crate::dock::Geo, edge: String, dark: bool, accent: (f64, f64, f64)) {
+    let Some(w) = panel() else { return };
+    let shown = w.alpha.get() == 255;
+    if !crate::dock::morph::enabled() || !(shown || crate::dock::morph::running()) {
+        return panel_hide(prev);
+    }
+    let h = w.hwnd.get();
+    give_back_foreground(h, prev);
+    let Some((px, cw, ch)) = panel_snapshot() else { return panel_hide(None) };
+    let p = crate::dock::morph::Params { strip: g.dock, panel: g.panel, edge, scale: g.scale, dark, accent, content: px, cw, ch };
+    // 面板现成的玻璃背景（≤1 s 前截的）：收起不用再截屏，动画立刻开始
+    let glass = std::mem::take(&mut *w.lq_glass.borrow_mut());
+    let glass = (glass.len() == cw * ch).then_some(glass);
+    crate::dock::morph::close(p, glass, shown.then_some(h), || park_now(&w), || {});
 }
 
 /// 主动打开（点 toast、托盘、第二次启动）：拿键盘焦点；返回之前的前台窗口。

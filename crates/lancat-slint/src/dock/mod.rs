@@ -13,6 +13,7 @@
 //! 全部函数只在 UI 线程调用（Win32 窗口过程和 Slint 定时器都在同一个消息循环里）。
 
 pub mod drop;
+pub mod morph;
 pub mod strip;
 pub mod toast;
 pub mod tray;
@@ -33,6 +34,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const STRIP: f64 = 6.0;
+/// 停靠条的 accent 色（与 DockVisual 默认相同），变形刚从条里出来时的颜色
+pub const ACCENT: (f64, f64, f64) = (10.0 / 255.0, 132.0 / 255.0, 1.0);
 pub const PANEL_W: f64 = 360.0;
 pub const PANEL_H: f64 = 520.0;
 /// 光标在停靠条这个范围内（逻辑 px）算“接近”，轮询提到 80 ms。
@@ -386,12 +389,12 @@ pub fn open_panel(reason: &str) {
                 d.geo = Some(g);
             }
         }
-        (!was, d.geo)
+        (!was, d.geo, current_edge(d), crate::theme_is_dark(&d.node.settings().theme))
     });
-    let Some((first, geo)) = first else { return };
+    let Some((first, geo, edge, dark)) = first else { return };
     if first {
         if let Some(g) = geo {
-            crate::win::panel_show(g.panel);
+            crate::win::panel_show_morph(g, edge, dark, ACCENT);
         }
         refresh_visual();
         schedule_poll(POLL_NEAR_MS);
@@ -420,13 +423,17 @@ pub fn hide_panel() {
         d.leave_since = None;
         d.hover_since = None;
         d.hover_disarmed = d.geo.zip(cursor()).is_some_and(|(g, (x, y))| g.dock.contains(x, y, 1.0));
-        Some(d.prev_fg.take())
+        Some((d.prev_fg.take(), d.geo, current_edge(d), crate::theme_is_dark(&d.node.settings().theme)))
     })
     .flatten() else {
         return;
     };
+    let (prev, geo, edge, dark) = prev;
     log::debug!("hide_panel");
-    crate::win::panel_hide(prev);
+    match geo {
+        Some(g) => crate::win::panel_hide_morph(prev, g, edge, dark, ACCENT),
+        None => crate::win::panel_hide(prev),
+    }
     DOCK.with(|x| {
         if let Ok(b) = x.try_borrow() {
             if let Some(d) = b.as_ref() {
@@ -486,7 +493,8 @@ pub fn on_incoming(m: &lancat_core::Message) {
         log::info!("message toast: {} from {} ({})", m.kind, peer.name, m.peer_id);
         let dark = crate::theme_is_dark(&d.node.settings().theme);
         let hold_ms = 4000 + (text.chars().count() as u32 * 60).min(3000);
-        Ok(toast::ToastSpec { peer_id: peer.id.clone(), name: peer.name.clone(), text, edge: current_edge(d), strip: geo.dock, scale: geo.scale, dark, hold_ms })
+        let emoji = crate::toast_emoji::lottie_for(&d.node, m);
+        Ok(toast::ToastSpec { peer_id: peer.id.clone(), name: peer.name.clone(), text, edge: current_edge(d), strip: geo.dock, scale: geo.scale, dark, hold_ms, emoji })
     }) else {
         return;
     };
@@ -510,7 +518,7 @@ pub fn on_diag_alert(title: &str, detail: &str) {
         }
         let geo = d.geo.ok_or("no dock geometry yet")?;
         let dark = crate::theme_is_dark(&d.node.settings().theme);
-        Ok(toast::ToastSpec { peer_id: DIAG_TOAST.into(), name: "Lancat".into(), text: format!("{title}，点此修复"), edge: current_edge(d), strip: geo.dock, scale: geo.scale, dark, hold_ms: 9000 })
+        Ok(toast::ToastSpec { peer_id: DIAG_TOAST.into(), name: "Lancat".into(), text: format!("{title}，点此修复"), edge: current_edge(d), strip: geo.dock, scale: geo.scale, dark, hold_ms: 9000, emoji: None })
     });
     match spec {
         Some(Ok(spec)) => {
@@ -537,7 +545,7 @@ pub fn on_update_alert(title: &str) {
         }
         let geo = d.geo.ok_or("no dock geometry yet")?;
         let dark = crate::theme_is_dark(&d.node.settings().theme);
-        Ok(toast::ToastSpec { peer_id: UPDATE_TOAST.into(), name: "Lancat".into(), text: format!("{title}，点此更新"), edge: current_edge(d), strip: geo.dock, scale: geo.scale, dark, hold_ms: 9000 })
+        Ok(toast::ToastSpec { peer_id: UPDATE_TOAST.into(), name: "Lancat".into(), text: format!("{title}，点此更新"), edge: current_edge(d), strip: geo.dock, scale: geo.scale, dark, hold_ms: 9000, emoji: None })
     });
     match spec {
         Some(Ok(spec)) => {

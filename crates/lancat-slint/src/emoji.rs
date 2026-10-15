@@ -122,7 +122,7 @@ fn delete_sticker(node: &Node, id: &str) -> Result<(), String> {
 }
 
 /// 贴纸 / 表情 → Lottie JSON（贴纸消息自带 data；本机导入的从目录读）
-fn lottie_data(node: &Node, e: &EmojiPayload) -> Option<String> {
+pub(crate) fn lottie_data(node: &Node, e: &EmojiPayload) -> Option<String> {
     if e.kind == "sticker" {
         if let Some(d) = &e.data {
             return Some(d.clone());

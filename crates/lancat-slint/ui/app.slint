@@ -995,6 +995,15 @@ export component PanelWindow inherits Window {
     in property <bool> can-send: true;
     in-out property <string> draft;
     in-out property <string> manual-addr;
+    in-out property <bool> add-open;
+    in-out property <string> add-addr;
+    in-out property <string> add-code;
+    in property <string> add-msg;
+    in property <bool> add-msg-bad;
+    in-out property <length> add-anchor-y;
+    pure callback is-public(string) -> bool;
+    callback add-submit();
+    callback add-msg-reset();
     in property <bool> adding;
     // 拖拽
     in property <bool> dragging;
@@ -1036,6 +1045,7 @@ export component PanelWindow inherits Window {
     callback refresh();
     callback toggle-pin();
     callback open-settings();
+    callback open-public();
     callback escape();
     callback header-pressed();
     callback peer-menu(string, length, length);
@@ -1318,6 +1328,34 @@ export component PanelWindow inherits Window {
                                         clicked(shift) => { input.clear-focus(); root.select-peer(p.id, shift); }
                                         menu(x, y) => { root.peer-menu(p.id, self.absolute-position.x + x, self.absolute-position.y + y); }
                                     }
+                                    // 列表最后：添加设备
+                                    addi := Rectangle {
+                                        height: 5px + 38px + 3px + 13px + 5px;
+                                        property <float> k: addt.pressed ? 0.94 : (addt.has-hover ? 1.05 : 1);
+                                        animate k { duration: 160ms; easing: cubic-bezier(0.2, 0.9, 0.3, 1.4); }
+                                        Rectangle {
+                                            x: (parent.width - self.width) / 2;
+                                            y: 5px + 19px - self.height / 2;
+                                            width: 38px * parent.k;
+                                            height: self.width;
+                                            border-radius: self.width / 2;
+                                            background: root.add-open ? Theme.accent.with-alpha(0.15) : (addt.has-hover ? Theme.hover : transparent);
+                                            border-width: 1.5px;
+                                            border-color: root.add-open || addt.has-hover ? Theme.accent : Theme.text-3;
+                                            Icon { d: Icons.plus; size: 16px; color: root.add-open || addt.has-hover ? Theme.accent : Theme.text-2; }
+                                        }
+                                        Text { y: 5px + 38px + 3px; x: 4px; width: parent.width - 8px; height: 13px; vertical-alignment: center; horizontal-alignment: center; text: "添加"; font-size: 10px; color: Theme.text-2; }
+                                        addt := TipArea {
+                                            tip: "添加设备：局域网 IP 或公网地址";
+                                            pointer-event(e) => {
+                                                if e.kind == PointerEventKind.up && e.button == PointerEventButton.left && self.has-hover {
+                                                    root.add-anchor-y = addi.absolute-position.y;
+                                                    root.add-msg-reset();
+                                                    root.add-open = !root.add-open;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1405,6 +1443,16 @@ export component PanelWindow inherits Window {
                                     opacity: root.adding ? 0.5 : 1;
                                     Icon { d: Icons.plus; size: 14px; color: Theme.accent-contrast; }
                                     TouchArea { clicked => { if !root.adding { root.add-manual(root.manual-addr); } } }
+                                }
+                            }
+                            HorizontalLayout {
+                                alignment: center;
+                                padding-top: 8px;
+                                pl := Text {
+                                    text: "不在同一个网络？添加公网地址 ›";
+                                    font-size: 11.5px;
+                                    color: plt.has-hover ? Theme.accent : Theme.text-2;
+                                    plt := TouchArea { mouse-cursor: pointer; clicked => { root.add-anchor-y = 0px; root.add-msg-reset(); root.add-open = true; } }
                                 }
                             }
                         }
@@ -1664,6 +1712,89 @@ export component PanelWindow inherits Window {
                                 stroke: Theme.accent;
                                 stroke-width: 2px;
                                 stroke-line-cap: butt;
+                            }
+                        }
+                        // ---- 添加设备（侧栏最后的 +）：局域网 IP 或 公网地址 + 配对码 ----
+                        if root.add-open: Rectangle {
+                            TouchArea { clicked => { root.add-open = false; } }
+                            property <bool> is-pub: root.is-public(root.add-addr);
+                            ap := Rectangle {
+                                x: 8px;
+                                width: min(parent.width - 16px, 290px);
+                                height: apl.preferred-height;
+                                y: max(8px, min(root.add-anchor-y - main.absolute-position.y - 10px, parent.height - self.height - 8px));
+                                border-radius: 11px;
+                                background: Theme.glass-strong-solid;
+                                border-width: 1phx;
+                                border-color: Theme.glass-border;
+                                drop-shadow-blur: 18px;
+                                drop-shadow-offset-y: 4px;
+                                drop-shadow-color: #00000038;
+                                TouchArea { }
+                                apl := VerticalLayout {
+                                    padding: 12px;
+                                    spacing: 8px;
+                                    HorizontalLayout {
+                                        Text { text: "添加设备"; font-size: 13px; font-weight: 600; color: Theme.text; vertical-alignment: center; }
+                                        IconButton { width: 20px; height: 20px; d: Icons.x; icon-size: 12px; tip: "关闭"; clicked => { root.add-open = false; } }
+                                    }
+                                    Text { text: "填局域网 IP，或对方开放的公网地址"; font-size: 11px; color: Theme.text-2; wrap: word-wrap; }
+                                    Rectangle {
+                                        height: 28px;
+                                        border-radius: 7px;
+                                        background: Theme.field;
+                                        border-width: 1phx;
+                                        border-color: aa.has-focus ? Theme.accent : Theme.glass-border;
+                                        aa := TextInput {
+                                            x: 9px;
+                                            width: parent.width - 18px;
+                                            height: parent.height;
+                                            vertical-alignment: center;
+                                            single-line: true;
+                                            font-size: 12px;
+                                            color: Theme.text;
+                                            text <=> root.add-addr;
+                                            selection-background-color: Theme.accent.with-alpha(0.35);
+                                            init => { self.focus(); }
+                                            accepted => { root.add-submit(); }
+                                        }
+                                        if root.add-addr == "": Text { x: 9px; text: "192.168.1.20 或 https://域名"; font-size: 12px; color: Theme.text-3; }
+                                    }
+                                    if is-pub: Rectangle {
+                                        height: 28px;
+                                        border-radius: 7px;
+                                        background: Theme.field;
+                                        border-width: 1phx;
+                                        border-color: ac.has-focus ? Theme.accent : Theme.glass-border;
+                                        ac := TextInput {
+                                            x: 9px;
+                                            width: parent.width - 18px;
+                                            height: parent.height;
+                                            vertical-alignment: center;
+                                            single-line: true;
+                                            font-size: 12px;
+                                            color: Theme.text;
+                                            text <=> root.add-code;
+                                            selection-background-color: Theme.accent.with-alpha(0.35);
+                                            accepted => { root.add-submit(); }
+                                        }
+                                        if root.add-code == "": Text { x: 9px; text: "配对码"; font-size: 12px; color: Theme.text-3; }
+                                    }
+                                    if is-pub: Text { text: "公网地址需要配对码：对方在 Lancat「设置 → 公网连接」里打开开关就能看到。只需配对一次。"; font-size: 11px; color: Theme.text-2; wrap: word-wrap; }
+                                    if root.add-msg != "": Text { text: root.add-msg; font-size: 11px; color: root.add-msg-bad ? Theme.danger : Theme.text-2; wrap: word-wrap; }
+                                    HorizontalLayout {
+                                        alignment: end;
+                                        Rectangle {
+                                            width: abt.preferred-width + 28px;
+                                            height: 28px;
+                                            border-radius: 7px;
+                                            background: Theme.accent;
+                                            opacity: root.adding ? 0.5 : (abta.has-hover ? 0.9 : 1);
+                                            abt := Text { text: root.adding ? "连接中…" : (is-pub ? "配对并连接" : "添加"); font-size: 12px; color: Theme.accent-contrast; }
+                                            abta := TouchArea { mouse-cursor: pointer; clicked => { root.add-submit(); } }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
