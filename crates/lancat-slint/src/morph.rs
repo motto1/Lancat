@@ -158,6 +158,26 @@ fn sample(c: &Content, x: f64, y: f64) -> [f32; 4] {
 
 /// 把一帧画进 `out`（w × h，预乘 BGRA，整幅覆盖）。`glass`：同尺寸的模糊背景（不透明），None = 没有背景，只用色调。
 pub fn render(out: &mut [Bgra], w: usize, h: usize, f: &Frame, glass: Option<&[Bgra]>, content: &Content, look: &Look) {
+    render_impl(out, w, h, f, glass, content, look, None);
+}
+
+/// Linux（没有原生材质）：静止面板就是 Slint 画的整幅帧（半透明的 Theme.glass 外壳 + 外框里的阴影），
+/// 合成器直接叠在桌面上。变形要收敛到它：
+/// - 形状的色调用静止面板同一个颜色和透明度（`tint` / `alpha`，即 Theme.glass），不再额外叠一层不透明色调；
+/// - 面板内容不是「盖」在形状上，而是和形状交叉淡入淡出（内容自己带着外壳背景），内容 = 1 时输出就是那一帧本身；
+/// - 内容按形状的矩形拉伸（不是等比缩放），外壳边框和形状边缘重合，不会出现一大一小两圈轮廓；
+/// - `content` 是整幅帧（含外框），`content.at` 是卡片在帧里的左上角（卡片四周外框等宽）。
+pub struct Rest {
+    pub tint: (f64, f64, f64),
+    pub alpha: f64,
+}
+
+pub fn render_rest(out: &mut [Bgra], w: usize, h: usize, f: &Frame, glass: Option<&[Bgra]>, content: &Content, look: &Look, rest: &Rest) {
+    render_impl(out, w, h, f, glass, content, look, Some(rest));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_impl(out: &mut [Bgra], w: usize, h: usize, f: &Frame, glass: Option<&[Bgra]>, content: &Content, look: &Look, rest: Option<&Rest>) {
     let sc = look.scale;
     let r = f.rect;
     let rad = f.radius;
@@ -169,11 +189,12 @@ pub fn render(out: &mut [Bgra], w: usize, h: usize, f: &Frame, glass: Option<&[B
     let g = f.grow.clamp(0.0, 1.0);
     // 形状的颜色：一开始是停靠条的 accent，长出来后变成玻璃色调
     let k_acc = (1.0 - g * 2.2).clamp(0.0, 1.0);
-    let (tint, ta) = match (look.dark, glass.is_some()) {
-        (true, true) => ((0.10, 0.10, 0.12), 0.40),
-        (false, true) => ((0.98, 0.98, 0.99), 0.46),
-        (true, false) => ((0.13, 0.13, 0.15), 0.90),
-        (false, false) => ((0.97, 0.97, 0.98), 0.92),
+    let (tint, ta) = match (rest, look.dark, glass.is_some()) {
+        (Some(rs), _, _) => (rs.tint, rs.alpha),
+        (None, true, true) => ((0.10, 0.10, 0.12), 0.40),
+        (None, false, true) => ((0.98, 0.98, 0.99), 0.46),
+        (None, true, false) => ((0.13, 0.13, 0.15), 0.90),
+        (None, false, false) => ((0.97, 0.97, 0.98), 0.92),
     };
     let mix = |a: f64, b: f64| a * (1.0 - k_acc) + b * k_acc;
     let body = (mix(tint.0, look.accent.0), mix(tint.1, look.accent.1), mix(tint.2, look.accent.2));
@@ -186,6 +207,11 @@ pub fn render(out: &mut [Bgra], w: usize, h: usize, f: &Frame, glass: Option<&[B
     let k = ((r[2] - r[0]) / pw).min((r[3] - r[1]) / ph).max(1e-3);
     let (ccx, ccy) = ((r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0);
     let c_op = f.content as f32;
+    // rest 模式：形状矩形 → 内容帧里卡片矩形的拉伸映射（形状外也照样外推，取到外框里的阴影）
+    let xf = rest.is_some();
+    let (card_w, card_h) = ((pw - 2.0 * content.at.0).max(1.0), (ph - 2.0 * content.at.1).max(1.0));
+    let (kx, ky) = (card_w / (r[2] - r[0]).max(1e-3), card_h / (r[3] - r[1]).max(1e-3));
+    let (cax, cay) = content.at;
     // 只算形状 + 阴影的包围盒，其余清空
     let x_lo = ((r[0] - shadow).floor().max(0.0)) as usize;
     let x_hi = ((r[2] + shadow).ceil().min(w as f64)) as usize;
@@ -213,7 +239,14 @@ pub fn render(out: &mut [Bgra], w: usize, h: usize, f: &Frame, glass: Option<&[B
                         let sh = if ds > -shadow { (shadow_a * (-(ds.max(0.0) / (shadow * 0.42)).powi(2)).exp()) as f32 } else { shadow_a as f32 };
                         let cov = (0.5 - d).clamp(0.0, 1.0) as f32;
                         if cov <= 0.0 {
-                            row[x] = Bgra { b: 0, g: 0, r: 0, a: (sh * 255.0) as u8 };
+                            if xf && c_op > 0.0 {
+                                let c = sample(content, cax + (fx - r[0]) * kx, cay + (fy - r[1]) * ky);
+                                let k0 = 1.0 - c_op;
+                                let a0 = sh * 255.0;
+                                row[x] = Bgra { b: (c[0] * c_op).min(255.0) as u8, g: (c[1] * c_op).min(255.0) as u8, r: (c[2] * c_op).min(255.0) as u8, a: (a0 * k0 + c[3] * c_op).min(255.0) as u8 };
+                            } else {
+                                row[x] = Bgra { b: 0, g: 0, r: 0, a: (sh * 255.0) as u8 };
+                            }
                             continue;
                         }
                         let depth = -d;
@@ -263,7 +296,7 @@ pub fn render(out: &mut [Bgra], w: usize, h: usize, f: &Frame, glass: Option<&[B
                             a += (255.0 - a) * sheen;
                         }
                         // 面板内容
-                        if c_op > 0.0 {
+                        if c_op > 0.0 && !xf {
                             let cx = (fx - ccx) / k + pw / 2.0;
                             let cy = (fy - ccy) / k + ph / 2.0;
                             let c = sample(content, cx, cy);
@@ -289,6 +322,19 @@ pub fn render(out: &mut [Bgra], w: usize, h: usize, f: &Frame, glass: Option<&[B
                         // 覆盖率 + 下面的阴影
                         let (b, gg, rr, a) = (b * cov, gg * cov, rr * cov, a * cov);
                         let sa = sh * 255.0 * (1.0 - a / 255.0);
+                        if xf && c_op > 0.0 {
+                            // 和内容帧交叉淡化（预乘空间线性混合 = 合成后的观感线性混合）
+                            let c = sample(content, cax + (fx - r[0]) * kx, cay + (fy - r[1]) * ky);
+                            let k0 = 1.0 - c_op;
+                            let a = a + sa;
+                            row[x] = Bgra {
+                                b: (b * k0 + c[0] * c_op).min(255.0) as u8,
+                                g: (gg * k0 + c[1] * c_op).min(255.0) as u8,
+                                r: (rr * k0 + c[2] * c_op).min(255.0) as u8,
+                                a: (a * k0 + c[3] * c_op).min(255.0) as u8,
+                            };
+                            continue;
+                        }
                         row[x] = Bgra { b: b.min(255.0) as u8, g: gg.min(255.0) as u8, r: rr.min(255.0) as u8, a: (a + sa).min(255.0) as u8 };
                     }
                 }
@@ -410,5 +456,25 @@ mod tests {
         assert_eq!(out[300 * 400 + 200].a, 255);
         // 远处透明
         assert_eq!(out[5 * 400 + 5].a, 0);
+    }
+
+    #[test]
+    fn rest_mode_converges_to_panel_frame() {
+        // 内容 = 整幅帧（外框 8 px）；形状 = 卡片、内容 = 1 时，输出必须就是那一帧
+        let (w, h, fr) = (60usize, 80usize, 8.0);
+        let mut c = vec![Bgra::default(); w * h];
+        for (i, p) in c.iter_mut().enumerate() {
+            let a = (i % 7 * 30) as u8;
+            *p = Bgra { b: a / 2, g: a / 3, r: a / 4, a };
+        }
+        let content = Content { px: &c, w, h, at: (fr, fr) };
+        let f = Frame { rect: [fr, fr, w as f64 - fr, h as f64 - fr], radius: 6.0, content: 1.0, grow: 1.0, done: false };
+        let mut out = vec![Bgra::default(); w * h];
+        let rest = Rest { tint: (0.96, 0.96, 0.97), alpha: 0.86 };
+        render_rest(&mut out, w, h, &f, None, &content, &Look { dark: false, scale: 1.0, accent: (0.04, 0.52, 1.0) }, &rest);
+        for i in 0..w * h {
+            let (o, e) = (out[i], c[i]);
+            assert!((o.a as i32 - e.a as i32).abs() <= 1 && (o.b as i32 - e.b as i32).abs() <= 1, "px {i}: {} {} vs {} {}", o.a, o.b, e.a, e.b);
+        }
     }
 }

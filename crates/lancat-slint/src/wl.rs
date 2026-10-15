@@ -337,6 +337,8 @@ struct PanelSurf {
     glass: Option<Vec<Bgra>>,
     /// Some(开始时间) = 打开变形在等背景截图（最多等 CAP_WAIT，拿不到就只用色调）
     cap_wait: Option<Instant>,
+    /// 收起变形开始时冻结的整幅面板帧（之后不再重画 Slint，免得收起时界面里的变化叠进变形里成重影）
+    snap: Option<Vec<Bgra>>,
     closing: bool,
     focus_req: bool,
 }
@@ -434,6 +436,7 @@ struct Cap {
     y_invert: bool,
     /// 要的尺寸（面板 surface 物理 px）
     out: (usize, usize),
+    t0: Instant,
 }
 
 /// 打开变形最多等背景截图这么久
@@ -567,7 +570,10 @@ impl WlPlatform {
         let ti_manager = bind_ti(&globals, &qh);
         let xdg = XdgShell::bind(&globals, &qh).map_err(|e| log::warn!("xdg-shell unavailable ({e}): settings window disabled")).ok();
         let ddm = DataDeviceManagerState::bind(&globals, &qh).map_err(|e| log::warn!("wl_data_device_manager unavailable ({e}): no drag & drop")).ok();
-        let screencopy = globals.bind::<ZwlrScreencopyManagerV1, _, _>(&qh, 1..=3, ScData).map_err(|e| log::info!("wlr-screencopy unavailable ({e}): panel morph without glass backdrop")).ok();
+        let screencopy = globals.bind::<ZwlrScreencopyManagerV1, _, _>(&qh, 1..=3, ScData).map_err(|e| log::warn!("wlr-screencopy unavailable ({e}): panel morph without glass backdrop")).ok();
+        if let Some(m) = screencopy.as_ref() {
+            log::info!("wlr-screencopy bound (v{})", wayland_client::Proxy::version(m));
+        }
         let mut state = State {
             registry_state: RegistryState::new(&globals),
             seat_state: SeatState::new(&globals, &qh),
@@ -913,6 +919,7 @@ impl State {
                     Some(ps) => {
                         // 正在收起又被打开：旧版 anim.cancel() 后重新 springTo（从固定起点），surface 不重建
                         ps.closing = false;
+                        ps.snap = None;
                         ps.layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
                         ps.layer.commit();
                         if use_morph() {
@@ -942,6 +949,7 @@ impl State {
                             mlast: None,
                             glass: None,
                             cap_wait: None,
+                            snap: None,
                             closing: false,
                             focus_req: false,
                         });
@@ -955,6 +963,8 @@ impl State {
                                 if let Some(ps) = self.panel.as_mut() {
                                     ps.cap_wait = Some(Instant::now());
                                 }
+                            } else {
+                                log::info!("panel morph open: no screencopy request (manager {}), tint only", if self.screencopy.is_some() { "bound" } else { "missing" });
                             }
                         }
                     }
@@ -970,7 +980,10 @@ impl State {
                         if use_morph() {
                             let configured = ps.configured;
                             let (strip, card, rs, rc) = self.morph_rects();
+                            // 冻结收起起点那一帧（dock 的 on_close 已经改了界面状态，但还没重画进 buf）
+                            let snap = if configured && !self.buf.is_empty() { Some(self.buf.clone()) } else { None };
                             if let Some(ps) = self.panel.as_mut() {
+                                ps.snap = snap;
                                 if configured {
                                     let (from, fr, fc, fg) = match ps.mlast {
                                         Some(f) if ps.morph.as_ref().is_some_and(|a| a.opening) => (f.rect, f.radius, f.content, f.grow),
@@ -1106,8 +1119,14 @@ impl State {
         let Some(ps) = self.panel.as_ref() else { return false };
         let p = ps.place.clone();
         let outs = OUTPUTS.with(|o| o.borrow().clone());
-        let Some(&(ow, oh, _)) = outs.get(p.output).or(outs.first()) else { return false };
-        let Some(out) = self.output(p.output) else { return false };
+        let Some(&(ow, oh, _)) = outs.get(p.output).or(outs.first()) else {
+            log::info!("screencopy: no output size known");
+            return false;
+        };
+        let Some(out) = self.output(p.output) else {
+            log::info!("screencopy: no wl_output");
+            return false;
+        };
         let (w, h) = (p.w as i32, p.h as i32);
         // 与 anchor_of / margins 一致：输出内的逻辑坐标
         let (x, y) = match p.edge.as_str() {
@@ -1123,7 +1142,8 @@ impl State {
         let gen = self.cap_gen;
         let sc = self.scale.max(1) as usize;
         let frame = mgr.capture_output_region(0, &out, x, y, w, h, &self.qh, ScFrame(gen));
-        self.cap = Some(Cap { gen, frame, fmt: None, buf: None, y_invert: false, out: (p.w as usize * sc, p.h as usize * sc) });
+        log::info!("screencopy: request region {x},{y} {w}x{h} (output {ow}x{oh}, scale {sc})");
+        self.cap = Some(Cap { gen, frame, fmt: None, buf: None, y_invert: false, out: (p.w as usize * sc, p.h as usize * sc), t0: Instant::now() });
         true
     }
 
@@ -1138,7 +1158,10 @@ impl State {
         if self.cap_pool.is_none() {
             self.cap_pool = SlotPool::new((stride * h) as usize, &self.shm).ok();
         }
-        let Some(pool) = self.cap_pool.as_mut() else { return self.cap_end(gen, false) };
+        let Some(pool) = self.cap_pool.as_mut() else {
+            log::info!("screencopy: shm pool failed");
+            return self.cap_end(gen, false);
+        };
         let r = pool.create_buffer(w as i32, h as i32, stride as i32, fmt).map(|(b, _)| b);
         match r {
             Ok(b) => {
@@ -1181,6 +1204,11 @@ impl State {
                     glass = Some(crate::morph::blur_half(&px, ow, oh, (11.0 * sc).max(2.0)));
                 }
             }
+        }
+        let ms = cap.t0.elapsed().as_millis();
+        match (&glass, cap.fmt) {
+            (Some(_), Some((f, w, h, _))) => log::info!("screencopy ok: {w}x{h} {f:?} -> {}x{} in {ms} ms (y_invert {})", cap.out.0, cap.out.1, cap.y_invert),
+            _ => log::info!("screencopy unusable after {ms} ms (ok {ok}, fmt {:?}, buf {})", cap.fmt.map(|f| (f.0, f.1, f.2)), cap.buf.is_some()),
         }
         drop(cap);
         if let Some(ps) = self.panel.as_mut() {
@@ -1232,6 +1260,7 @@ impl State {
             if ps.morph.is_some() && ps.glass.is_none() && t0.elapsed() < CAP_WAIT {
                 return;
             }
+            log::info!("panel morph open: glass {} after {} ms", if ps.glass.is_some() { "ready" } else { "not ready (tint only)" }, t0.elapsed().as_millis());
             ps.cap_wait = None;
             if let Some(a) = ps.morph.as_mut() {
                 a.restart();
@@ -1241,18 +1270,22 @@ impl State {
         let (width, height) = (ps.width * sc, ps.height * sc);
         let n = (width * height) as usize;
         // 缓冲是我们自己的、常驻：ReusedBuffer 局部重画（每帧再整幅拷进 shm）；新分配（尺寸变了 / 收起后释放）时整幅画一次
-        let fresh = self.buf.len() != n;
-        if fresh {
-            self.buf = vec![Bgra::default(); n];
-            w.renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
-        }
-        w.needs_redraw.set(false);
-        let out = crate::compose::render(&w.renderer, &mut self.buf, width as usize, height as usize, sc as f32, true);
-        if fresh {
-            w.renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
-        }
-        if out.composed() {
+        // 收起变形用冻结的那一帧，不再重画（重画会把收起时界面里的变化叠进变形，成重影）
+        let frozen = ps.closing && ps.morph.is_some() && ps.snap.as_ref().is_some_and(|b| b.len() == n);
+        if !frozen {
+            let fresh = self.buf.len() != n;
+            if fresh {
+                self.buf = vec![Bgra::default(); n];
+                w.renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
+            }
             w.needs_redraw.set(false);
+            let out = crate::compose::render(&w.renderer, &mut self.buf, width as usize, height as usize, sc as f32, true);
+            if fresh {
+                w.renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
+            }
+            if out.composed() {
+                w.needs_redraw.set(false);
+            }
         }
         // 液态玻璃变形：从停靠条长出来 / 缩回去
         if let Some(a) = ps.morph.as_ref() {
@@ -1262,23 +1295,29 @@ impl State {
             if f.done && opening {
                 ps.morph = None;
             } else {
-                let fr = (FRAME * sc) as usize;
+                let fr = (FRAME * sc) as f64;
                 let (wu, hu) = (width as usize, height as usize);
-                let (cw, ch) = (wu.saturating_sub(2 * fr), hu.saturating_sub(2 * fr));
-                let mut content = Vec::with_capacity(cw * ch);
-                for y in 0..ch {
-                    let o = (y + fr) * wu + fr;
-                    content.extend_from_slice(&self.buf[o..o + cw]);
-                }
                 if self.xbuf.len() != n {
                     self.xbuf = vec![Bgra::default(); n];
                 }
-                let look = crate::morph::Look { dark: MORPH_DARK.load(std::sync::atomic::Ordering::Relaxed), scale: sc as f64, accent: self.strip_look.accent };
-                let c = crate::morph::Content { px: &content, w: cw, h: ch, at: (fr as f64, fr as f64) };
+                let dark = MORPH_DARK.load(std::sync::atomic::Ordering::Relaxed);
+                let look = crate::morph::Look { dark, scale: sc as f64, accent: self.strip_look.accent };
+                // 内容 = 整幅面板帧（含外框阴影）；收起时是冻结的那一帧
+                let src: &[Bgra] = match ps.snap.as_deref() {
+                    Some(b) if !opening && b.len() == n => b,
+                    _ => &self.buf,
+                };
+                let c = crate::morph::Content { px: src, w: wu, h: hu, at: (fr, fr) };
+                // 静止面板的外壳色 = ui/common.slint 的 Theme.glass（native-glass = false）
+                let rest = if dark {
+                    crate::morph::Rest { tint: (36.0 / 255.0, 36.0 / 255.0, 40.0 / 255.0), alpha: 0.82 }
+                } else {
+                    crate::morph::Rest { tint: (246.0 / 255.0, 246.0 / 255.0, 248.0 / 255.0), alpha: 0.86 }
+                };
                 if f.done {
                     self.xbuf.iter_mut().for_each(|p| *p = Bgra::default());
                 } else {
-                    crate::morph::render(&mut self.xbuf, wu, hu, &f, ps.glass.as_deref().filter(|g| g.len() == n), &c, &look);
+                    crate::morph::render_rest(&mut self.xbuf, wu, hu, &f, ps.glass.as_deref().filter(|g| g.len() == n), &c, &look, &rest);
                 }
                 let Ok((buffer, canvas)) = self.pool.create_buffer(width as i32, height as i32, width as i32 * 4, wl_shm::Format::Argb8888) else { return };
                 // SAFETY: Bgra is repr(C) 4 bytes
