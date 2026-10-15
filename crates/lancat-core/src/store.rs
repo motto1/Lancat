@@ -136,7 +136,7 @@ impl Default for Settings {
             dock_length: 160.0,
             dock_monitor: 0,
             hover_delay_ms: 150,
-            collapse_delay_ms: 800,
+            collapse_delay_ms: 150,
             max_file_mb: 0,
             blocked_ips: vec![],
             manual_peers: vec![],
