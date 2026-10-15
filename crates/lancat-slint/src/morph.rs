@@ -158,7 +158,18 @@ fn sample(c: &Content, x: f64, y: f64) -> [f32; 4] {
 
 /// 把一帧画进 `out`（w × h，预乘 BGRA，整幅覆盖）。`glass`：同尺寸的模糊背景（不透明），None = 没有背景，只用色调。
 pub fn render(out: &mut [Bgra], w: usize, h: usize, f: &Frame, glass: Option<&[Bgra]>, content: &Content, look: &Look) {
-    render_impl(out, w, h, f, glass, content, look, None);
+    render_impl(out, w, h, f, glass, content, look, None, false);
+}
+
+/// Windows（有原生材质）：静止面板 = Slint 帧（Theme.glass 的淡外壳 + 内容 + winglass 高光）叠在
+/// 液态玻璃底（`render` 以面板矩形画的玻璃 + 色调，见 win.rs set_liquid）上。变形收敛到它：
+/// - 形状就是那层玻璃底（同一张模糊截图、同一色调 / 透明度 / 高光），内容 = 1、形状 = 面板时与之逐像素一致；
+/// - 面板内容叠在形状上（这正是静止面板的合成方式），按形状矩形拉伸（不是等比缩放），
+///   内容自己的外壳和高光描边与形状边缘重合，不会出现一大一小两圈轮廓；
+/// - `content.at` 是卡片在内容图里的左上角（Windows 面板窗口就是卡片，传 (0, 0)）。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn render_stretch(out: &mut [Bgra], w: usize, h: usize, f: &Frame, glass: Option<&[Bgra]>, content: &Content, look: &Look) {
+    render_impl(out, w, h, f, glass, content, look, None, true);
 }
 
 /// Linux（没有原生材质）：静止面板就是 Slint 画的整幅帧（半透明的 Theme.glass 外壳 + 外框里的阴影），
@@ -172,12 +183,13 @@ pub struct Rest {
     pub alpha: f64,
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 pub fn render_rest(out: &mut [Bgra], w: usize, h: usize, f: &Frame, glass: Option<&[Bgra]>, content: &Content, look: &Look, rest: &Rest) {
-    render_impl(out, w, h, f, glass, content, look, Some(rest));
+    render_impl(out, w, h, f, glass, content, look, Some(rest), false);
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_impl(out: &mut [Bgra], w: usize, h: usize, f: &Frame, glass: Option<&[Bgra]>, content: &Content, look: &Look, rest: Option<&Rest>) {
+fn render_impl(out: &mut [Bgra], w: usize, h: usize, f: &Frame, glass: Option<&[Bgra]>, content: &Content, look: &Look, rest: Option<&Rest>, stretch: bool) {
     let sc = look.scale;
     let r = f.rect;
     let rad = f.radius;
@@ -207,7 +219,7 @@ fn render_impl(out: &mut [Bgra], w: usize, h: usize, f: &Frame, glass: Option<&[
     let k = ((r[2] - r[0]) / pw).min((r[3] - r[1]) / ph).max(1e-3);
     let (ccx, ccy) = ((r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0);
     let c_op = f.content as f32;
-    // rest 模式：形状矩形 → 内容帧里卡片矩形的拉伸映射（形状外也照样外推，取到外框里的阴影）
+    // rest / stretch 模式：形状矩形 → 内容帧里卡片矩形的拉伸映射（rest 在形状外也照样外推，取到外框里的阴影）
     let xf = rest.is_some();
     let (card_w, card_h) = ((pw - 2.0 * content.at.0).max(1.0), (ph - 2.0 * content.at.1).max(1.0));
     let (kx, ky) = (card_w / (r[2] - r[0]).max(1e-3), card_h / (r[3] - r[1]).max(1e-3));
@@ -296,10 +308,8 @@ fn render_impl(out: &mut [Bgra], w: usize, h: usize, f: &Frame, glass: Option<&[
                             a += (255.0 - a) * sheen;
                         }
                         // 面板内容
-                        if c_op > 0.0 && !xf {
-                            let cx = (fx - ccx) / k + pw / 2.0;
-                            let cy = (fy - ccy) / k + ph / 2.0;
-                            let c = sample(content, cx, cy);
+                        if c_op > 0.0 && !xf && !stretch {
+                            let c = sample(content, (fx - ccx) / k + pw / 2.0, (fy - ccy) / k + ph / 2.0);
                             let ca = c[3] / 255.0 * c_op;
                             if ca > 0.0 {
                                 let inv = 1.0 - ca;
@@ -318,6 +328,15 @@ fn render_impl(out: &mut [Bgra], w: usize, h: usize, f: &Frame, glass: Option<&[
                             gg += (255.0 - gg) * ra;
                             rr += (255.0 - rr) * ra;
                             a += (255.0 - a) * ra;
+                        }
+                        // stretch：内容叠在整个玻璃底（含描边）之上，和静止面板（帧叠 lq_base）的合成顺序一致
+                        if c_op > 0.0 && stretch {
+                            let c = sample(content, cax + (fx - r[0]) * kx, cay + (fy - r[1]) * ky);
+                            let inv = 1.0 - c[3] / 255.0 * c_op;
+                            b = c[0] * c_op + b * inv;
+                            gg = c[1] * c_op + gg * inv;
+                            rr = c[2] * c_op + rr * inv;
+                            a = c[3] * c_op + a * inv;
                         }
                         // 覆盖率 + 下面的阴影
                         let (b, gg, rr, a) = (b * cov, gg * cov, rr * cov, a * cov);
@@ -456,6 +475,30 @@ mod tests {
         assert_eq!(out[300 * 400 + 200].a, 255);
         // 远处透明
         assert_eq!(out[5 * 400 + 5].a, 0);
+    }
+
+    #[test]
+    fn stretch_mode_converges_to_rest_composite() {
+        // Windows：形状 = 面板、内容 = 1 时，输出 = 内容叠在 render(内容空) 的玻璃底上（= set_liquid + WM_PAINT）
+        let (w, h) = (40usize, 50usize);
+        let glass: Vec<Bgra> = (0..w * h).map(|i| Bgra { b: (i % 13 * 9) as u8, g: (i % 7 * 20) as u8, r: (i % 5 * 40) as u8, a: 255 }).collect();
+        let c: Vec<Bgra> = (0..w * h).map(|i| { let a = (i % 9 * 25) as u8; Bgra { b: a / 2, g: a / 3, r: a, a } }).collect();
+        let look = Look { dark: true, scale: 1.0, accent: (0.04, 0.52, 1.0) };
+        let f = Frame { rect: [0.0, 0.0, w as f64, h as f64], radius: 8.0, content: 1.0, grow: 1.0, done: true };
+        let none = [Bgra::default()];
+        let mut base = vec![Bgra::default(); w * h];
+        render(&mut base, w, h, &f, Some(&glass), &Content { px: &none, w: 1, h: 1, at: (0.0, 0.0) }, &look);
+        let mut out = vec![Bgra::default(); w * h];
+        render_stretch(&mut out, w, h, &f, Some(&glass), &Content { px: &c, w, h, at: (0.0, 0.0) }, &look);
+        for i in 0..w * h {
+            let (o, b, cc) = (out[i], base[i], c[i]);
+            if b.a < 255 {
+                continue; // 圆角外缘：真面板由 DWM 裁角
+            }
+            let inv = 255 - cc.a as i32;
+            let e = cc.b as i32 + (b.b as i32 * inv + 127) / 255;
+            assert!((o.b as i32 - e).abs() <= 2, "px {i}: {} vs {}", o.b, e);
+        }
     }
 
     #[test]

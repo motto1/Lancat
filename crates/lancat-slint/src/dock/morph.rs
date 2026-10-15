@@ -255,8 +255,9 @@ fn present(s: &mut State, f: &Frame, alpha: u8) {
     let Some(dib) = &s.dib else { return };
     // SAFETY: DIB 的像素区是 w*h*4 字节，只在这个线程上写
     let out = unsafe { std::slice::from_raw_parts_mut(dib.bits, dib.len) };
-    let content = Content { px: &s.content, w: s.cw, h: s.ch, at: s.at };
-    morph::render(out, w as usize, h as usize, f, s.glass.as_deref(), &content, &s.look);
+    // 内容 = 面板窗口本身（就是卡片，没有外框），按形状矩形拉伸叠在玻璃底上；停稳时 = 真面板（帧叠 lq_base）
+    let content = Content { px: &s.content, w: s.cw, h: s.ch, at: (0.0, 0.0) };
+    morph::render_stretch(out, w as usize, h as usize, f, s.glass.as_deref(), &content, &s.look);
     unsafe {
         let screen = GetDC(None);
         let size = SIZE { cx: w, cy: h };
