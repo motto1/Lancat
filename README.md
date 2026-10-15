@@ -367,7 +367,7 @@ Slint 版内置更新（设置 →「更新」）：
 
 ## 许可与致谢
 
-- 代码：MIT。
+- 代码：[GPL-3.0](LICENSE)。可以自由使用、修改、分发，但基于本项目的修改版或衍生作品发布时也必须以 GPL-3.0 开源。
 - 内置动态表情：Google **Noto Animated Emoji**，以 **CC BY 4.0** 许可使用（https://creativecommons.org/licenses/by/4.0/），仅做了数值精度压缩，详见 `src/assets/emoji/LICENSE.md`。
 - Telegram 贴纸不内置，只能由用户自行导入。
 - UI 框架 [Slint](https://slint.dev)，Lottie 渲染 [ThorVG](https://www.thorvg.org)。

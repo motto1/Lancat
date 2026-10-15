@@ -6,7 +6,7 @@ members = ["crates/lancat-core", "src-tauri"]
 version = "0.2.1"
 edition = "2021"
 authors = ["Motto"]
-license = "MIT"
+license = "GPL-3.0-only"
 
 [profile.release]
 # size first (installer < 15 MB, binary <= 8 MB, see docs/postmortem-memory.md): "z" + fat LTO +

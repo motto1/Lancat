@@ -3,7 +3,7 @@ name = "lancat-slint"
 version = "0.2.1"
 edition = "2021"
 authors = ["Motto"]
-license = "MIT"
+license = "GPL-3.0-only"
 description = "Lancat 面板的 Slint 版（直接调用 lancat-core，软件渲染）"
 
 # 独立 workspace：不改根 Cargo.toml / Cargo.lock，不影响 tauri dev。
