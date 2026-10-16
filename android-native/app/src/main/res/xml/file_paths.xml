@@ -2,6 +2,8 @@
 <paths>
     <!-- 分享进来的小文件先复制到这里再发送（ShareStaging），content:// 授权失效也能重试 -->
     <cache-path name="share" path="share/" />
+    <!-- 应用内更新下载的安装包（Updater），交给系统安装器 -->
+    <cache-path name="updates" path="updates/" />
     <!-- 收到的文件落在 Android 8–9 的公共 Download/Lancat 时，用 FileProvider 交给其他应用打开 -->
     <external-path name="downloads" path="Download/" />
 </paths>

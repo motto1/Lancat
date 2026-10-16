@@ -27,6 +27,15 @@ import fan.lancat.ui.util.Clock
 import fan.lancat.ui.util.LocalClock
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import androidx.compose.ui.test.getBoundsInRoot
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.assertIsDisplayed
+import fan.lancat.model.UpdateState
+import fan.lancat.ui.fake.FakeAppUpdater
+import fan.lancat.ui.update.LocalUpdater
+import fan.lancat.ui.update.UpdateCard
 import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
@@ -122,6 +131,36 @@ class ScreenshotTest {
 
     // ---------------------------------------------------------------- 整体入口
     @Test fun app_light() = shot("12_app", dark = false) { LancatApp(repo()) }
+
+    // ---------------------------------------------------------------- 少量消息从顶部排、空会话、应用内更新
+    @Test fun chatOne_light() {
+        shot("13_chat_one", dark = false) { ChatScreen(repo(), "pix-55c2", {}) }
+        // 只有一条消息：应贴在标题栏下方，而不是沉在输入框上方
+        val list = compose.onNodeWithTag("chat-list").getBoundsInRoot()
+        val msg = compose.onNodeWithText("测试").getBoundsInRoot()
+        assertTrue("message top ${msg.top} should be near list top ${list.top}", msg.top - list.top < (list.bottom - list.top) / 4)
+    }
+    @Test fun chatOne_dark() = shot("13_chat_one", dark = true) { ChatScreen(repo(), "pix-55c2", {}) }
+    @Test fun chatEmpty_light() {
+        shot("14_chat_empty", dark = false) { ChatScreen(repo(), "ipad-9e0d", {}) }
+        compose.onNodeWithText("还没有消息").assertExists()
+    }
+    @Test fun chatEmpty_dark() = shot("14_chat_empty", dark = true) { ChatScreen(repo(), "ipad-9e0d", {}) }
+    @Test fun updateDialog_light() = shot("15_update", dark = false) {
+        Box(Modifier.fillMaxSize(), contentAlignment = androidx.compose.ui.Alignment.Center) {
+            UpdateCard(UpdateState.Available(FakeAppUpdater.SAMPLE), FakeAppUpdater.SAMPLE, "0.2.8-android.1", null)
+        }
+    }
+    @Test fun updateDialog_dark() = shot("15_update", dark = true) {
+        Box(Modifier.fillMaxSize(), contentAlignment = androidx.compose.ui.Alignment.Center) {
+            val r = FakeAppUpdater.SAMPLE
+            UpdateCard(UpdateState.Downloading(r, 12_582_912, r.apkSize), r, "0.2.8-android.1", null)
+        }
+    }
+    @Config(qualifiers = "w400dp-h1900dp-xhdpi")
+    @Test fun settingsUpdate_light() = shot("16_settings_update", dark = false) {
+        CompositionLocalProvider(LocalUpdater provides FakeAppUpdater(UpdateState.Available(FakeAppUpdater.SAMPLE))) { SettingsScreen(repo(), {}) }
+    }
 }
 
 /** 头像算法与桌面 api.ts 一致性（JS 结果手算核对）。 */

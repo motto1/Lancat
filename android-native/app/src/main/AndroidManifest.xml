@@ -25,6 +25,9 @@
     <!-- Android 16 Live Updates（升级为常驻推广通知）；非运行时权限 -->
     <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
 
+    <!-- 应用内更新：下载 GitHub 发布的 APK 后交给系统安装器（用户在系统界面确认） -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
     <!-- Android 8–9 写 Download/Lancat 需要；10 起用 MediaStore，不需要存储权限 -->
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"

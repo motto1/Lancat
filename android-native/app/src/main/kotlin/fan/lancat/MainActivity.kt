@@ -8,6 +8,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.runtime.mutableStateOf
 import fan.lancat.perm.Permissions
 import fan.lancat.service.NetPresence
+import fan.lancat.update.Updater
 
 /**
  * 唯一的 Activity。edge-to-edge，整个界面交给 :ui 的 LancatApp(repo, startPeerId)。
@@ -22,6 +23,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         permissions = Permissions(this)
         startPeerId.value = peerIdFrom(intent)
+        if (intent?.getBooleanExtra(Updater.EXTRA_INSTALL, false) == true) Updater.onInstallIntent()
         val repo = ServiceLocator.repo
         setContent {
             Bridge.AppRoot(repo, startPeerId.value)
@@ -32,12 +34,14 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         peerIdFrom(intent)?.let { startPeerId.value = it }
+        if (intent.getBooleanExtra(Updater.EXTRA_INSTALL, false)) Updater.onInstallIntent()
     }
 
     override fun onStart() {
         super.onStart()
         NetPresence.acquire("ui")
         permissions.requestStartupPermissions()
+        Updater.onForeground()   // 到点自动检查更新；从「安装未知应用」授权页回来时继续安装
     }
 
     override fun onStop() {

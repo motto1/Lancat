@@ -13,6 +13,9 @@
     <string name="ch_svc">后台常驻</string>
     <string name="ch_svc_desc">常驻接收或传输时保持运行的提示</string>
 
+    <string name="ch_upd">应用更新</string>
+    <string name="ch_upd_desc">下载新版本的进度</string>
+
     <string name="svc_keepalive_title">Lancat 正在后台接收</string>
     <string name="svc_keepalive_text">局域网里的设备能发现本机，随时可以接收文件</string>
     <string name="svc_transfer_title">Lancat 正在传输文件</string>

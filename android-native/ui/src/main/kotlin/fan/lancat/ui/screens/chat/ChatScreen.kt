@@ -64,6 +64,8 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
@@ -280,10 +282,14 @@ fun ChatScreen(
                 if (messages.isEmpty()) {
                     EmptyChat(peer, isAll)
                 }
+                // 反向布局：index 0 = 最新，贴着底部，键盘 / 表情面板顶起时最新消息跟着上移、不跳动；
+                // verticalArrangement = Top：消息不满一屏时从顶部（标题栏下方）往下排，而不是沉在底部（桌面 / Telegram 一致），
+                // 满一屏后与普通反向列表完全一样（新消息在底部、打开即在最新处）
                 LazyColumn(
                     state = listState,
                     reverseLayout = true,
-                    modifier = Modifier.fillMaxSize(),
+                    verticalArrangement = Arrangement.Top,
+                    modifier = Modifier.fillMaxSize().testTag("chat-list"),
                     contentPadding = PaddingValues(start = 8.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
                 ) {
                     items(items, key = { it.key }, contentType = ::contentTypeOf) { item ->
@@ -624,19 +630,19 @@ private fun ScrollToBottom(state: androidx.compose.foundation.lazy.LazyListState
 
 @Composable
 private fun EmptyChat(peer: Peer?, isAll: Boolean) {
+    // 同桌面空会话：直接写在聊天背景上的两行淡色居中文字，不套卡片 / 气泡容器
     val c = LancatTheme.colors
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Column(
-            Modifier.background(if (c.isDark) c.bubbleIn else Color(0x14000000), RoundedCornerShape(18.dp)).padding(horizontal = 22.dp, vertical = 16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            Text("还没有消息", style = LancatTheme.type.name, color = c.text)
-            Spacer(Modifier.height(4.dp))
-            Text(
-                if (isAll) "这里会汇总所有设备的消息" else "发一句话、一个表情或任意文件给 ${peer?.name ?: "对方"}",
-                style = LancatTheme.type.bodySmall, color = c.text2,
-            )
-        }
+    Column(
+        Modifier.fillMaxSize().padding(horizontal = 32.dp).testTag("chat-empty"),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text("还没有消息", style = LancatTheme.type.bodySmall, fontWeight = FontWeight.SemiBold, color = c.text2, textAlign = TextAlign.Center)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            if (isAll) "这里会汇总所有设备的消息" else "发一句话、一个表情或任意文件给 ${peer?.name ?: "对方"}",
+            style = LancatTheme.type.caption, color = c.text3, textAlign = TextAlign.Center,
+        )
     }
 }
 

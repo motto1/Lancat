@@ -20,7 +20,10 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import fan.lancat.model.AppUpdater
 import fan.lancat.model.LancatRepository
+import fan.lancat.ui.update.LocalUpdater
+import fan.lancat.ui.update.UpdateDialogHost
 import fan.lancat.ui.components.Flash
 import fan.lancat.ui.components.FlashHost
 import fan.lancat.ui.components.LocalFlash
@@ -43,9 +46,10 @@ import kotlinx.coroutines.launch
  *  - AndroidManifest 里 android:enableOnBackInvokedCallback="true"（Android 13+ 预测性返回）
  *
  * @param startPeerId 从通知 / 快捷方式进来时直接打开的会话；"*" 表示全部设备。变化时会重新导航。
+ * @param updater 应用内更新（:app 的 Updater）；null 时设置页只显示版本号、不弹更新对话框。
  */
 @Composable
-fun LancatApp(repo: LancatRepository, startPeerId: String? = null) {
+fun LancatApp(repo: LancatRepository, startPeerId: String? = null, updater: AppUpdater? = null) {
     val settings by repo.settings.collectAsStateWithLifecycle()
     LancatTheme(settings.theme) {
         val nav = rememberNavigator(*(if (startPeerId != null) arrayOf(Screen.Peers, Screen.Chat(startPeerId)) else arrayOf(Screen.Peers)))
@@ -53,7 +57,7 @@ fun LancatApp(repo: LancatRepository, startPeerId: String? = null) {
             if (startPeerId != null && nav.top != Screen.Chat(startPeerId)) nav.resetTo(Screen.Peers, Screen.Chat(startPeerId))
         }
         val flash = remember { Flash() }
-        CompositionLocalProvider(LocalNavigator provides nav, LocalFlash provides flash) {
+        CompositionLocalProvider(LocalNavigator provides nav, LocalFlash provides flash, LocalUpdater provides updater) {
             Box(Modifier.fillMaxSize().background(LancatTheme.colors.background)) {
                 LancatNavHost(nav) { screen ->
                     when (screen) {
@@ -67,6 +71,7 @@ fun LancatApp(repo: LancatRepository, startPeerId: String? = null) {
                     }
                 }
                 FlashHost(flash)
+                if (updater != null) UpdateDialogHost(updater)
             }
         }
     }

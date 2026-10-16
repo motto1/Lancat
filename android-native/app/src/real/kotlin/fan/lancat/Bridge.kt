@@ -16,7 +16,7 @@ internal object Bridge {
     }
 
     @Composable
-    fun AppRoot(repo: LancatRepository, startPeerId: String?) = LancatApp(repo, startPeerId)
+    fun AppRoot(repo: LancatRepository, startPeerId: String?) = LancatApp(repo, startPeerId, fan.lancat.update.Updater)
 
     @Composable
     fun ShareSheet(repo: LancatRepository, uris: List<String>, onDone: () -> Unit) =

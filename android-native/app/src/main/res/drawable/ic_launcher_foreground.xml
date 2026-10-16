@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 由 app/tools/gen_icons.py 从 docs/assets/logo.svg 生成，勿手改 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path android:fillColor="#FFD16F4E" android:pathData="M34.75,34.75h2.75v2.75h-2.75zM70.5,34.75h2.75v2.75h-2.75zM34.75,37.5h5.5v2.75h-5.5zM67.75,37.5h5.5v2.75h-5.5zM34.75,40.25h8.25v2.75h-8.25zM65,40.25h8.25v2.75h-8.25zM34.75,43h11v2.75h-11zM62.25,43h11v2.75h-11zM34.75,45.75h38.5v2.75h-38.5zM34.75,48.5h38.5v2.75h-38.5zM34.75,51.25h38.5v2.75h-38.5zM32,54h44v2.75h-44zM32,56.75h44v2.75h-44zM34.75,59.5h38.5v2.75h-38.5zM34.75,62.25h38.5v2.75h-38.5zM34.75,65h38.5v2.75h-38.5zM37.5,67.75h33v2.75h-33zM43,70.5h22v2.75h-22z" />
+    <path android:fillColor="#FFC15F3C" android:pathData="M37.5,67.75h33.02v2.77h-33.02zM43,70.5h22.02v2.77h-22.02z" />
+    <path android:fillColor="#FFC96745" android:pathData="M34.75,62.25h11.02v2.77h-11.02zM51.25,62.25h5.52v2.77h-5.52zM65,62.25h8.27v2.77h-8.27zM34.75,65h11.02v2.77h-11.02zM51.25,65h5.52v2.77h-5.52zM62.25,65h11.02v2.77h-11.02z" />
+    <path android:fillColor="#FFD16F4E" android:pathData="M37.5,45.75h5.52v2.77h-5.52zM65,45.75h5.52v2.77h-5.52zM32,56.75h13.77v2.77h-13.77zM51.25,56.75h5.52v2.77h-5.52zM62.25,56.75h13.77v2.77h-13.77zM34.75,59.5h11.02v2.77h-11.02zM51.25,59.5h5.52v2.77h-5.52zM67.75,59.5h5.52v2.77h-5.52z" />
+    <path android:fillColor="#FFD4886D" android:pathData="M45.75,62.25h5.52v2.77h-5.52zM56.75,62.25h8.27v2.77h-8.27zM45.75,65h5.52v2.77h-5.52zM56.75,65h5.52v2.77h-5.52z" />
+    <path android:fillColor="#FFD97757" android:pathData="M37.5,43h2.77v2.77h-2.77zM67.75,43h2.77v2.77h-2.77zM34.75,51.25h8.27v2.77h-8.27zM51.25,51.25h5.52v2.77h-5.52zM62.25,51.25h11.02v2.77h-11.02zM32,54h8.27v2.77h-8.27zM51.25,54h5.52v2.77h-5.52zM62.25,54h13.77v2.77h-13.77z" />
+    <path android:fillColor="#FFDB8E74" android:pathData="M45.75,56.75h5.52v2.77h-5.52zM56.75,56.75h5.52v2.77h-5.52zM45.75,59.5h5.52v2.77h-5.52zM56.75,59.5h11.02v2.77h-11.02z" />
+    <path android:fillColor="#FFDF8A69" android:pathData="M34.75,45.75h2.77v2.77h-2.77zM43,45.75h22.02v2.77h-22.02zM70.5,45.75h2.77v2.77h-2.77zM34.75,48.5h11.02v2.77h-11.02zM51.25,48.5h5.52v2.77h-5.52zM62.25,48.5h11.02v2.77h-11.02z" />
+    <path android:fillColor="#FFE1947B" android:pathData="M43,51.25h8.27v2.77h-8.27zM56.75,51.25h5.52v2.77h-5.52zM40.25,54h11.02v2.77h-11.02zM56.75,54h5.52v2.77h-5.52z" />
+    <path android:fillColor="#FFE69D7C" android:pathData="M34.75,40.25h8.27v2.77h-8.27zM65,40.25h8.27v2.77h-8.27zM34.75,43h2.77v2.77h-2.77zM40.25,43h5.52v2.77h-5.52zM62.25,43h5.52v2.77h-5.52zM70.5,43h2.77v2.77h-2.77z" />
+    <path android:fillColor="#FFE6A38A" android:pathData="M45.75,48.5h5.52v2.77h-5.52zM56.75,48.5h5.52v2.77h-5.52z" />
+    <path android:fillColor="#FFEDB08F" android:pathData="M34.75,34.75h2.77v2.77h-2.77zM70.5,34.75h2.77v2.77h-2.77zM34.75,37.5h5.52v2.77h-5.52zM67.75,37.5h5.52v2.77h-5.52z" />
+</vector>

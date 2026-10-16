@@ -57,6 +57,9 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import fan.lancat.model.LancatRepository
 import fan.lancat.model.Settings
+import fan.lancat.model.UpdateState
+import fan.lancat.ui.update.LocalUpdater
+import fan.lancat.ui.update.updateStatusText
 import fan.lancat.ui.components.LancatIcons
 import fan.lancat.ui.components.LcIconButton
 import fan.lancat.ui.components.LcTopBar
@@ -186,7 +189,35 @@ fun SettingsScreen(repo: LancatRepository, onBack: () -> Unit) {
             }
             // ---- 关于
             Section("关于") {
-                val ver = remember { runCatching { ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName }.getOrNull() ?: "dev" }
+                val updater = LocalUpdater.current
+                val ver = updater?.currentVersion
+                    ?: remember { runCatching { ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName }.getOrNull() ?: "dev" }
+                InfoRow("当前版本", ver)
+                Sep()
+                if (updater != null) {
+                    val us by updater.state.collectAsStateWithLifecycle()
+                    val auto by updater.autoCheck.collectAsStateWithLifecycle()
+                    Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("检查更新", style = LancatTheme.type.body, color = c.text)
+                            Text(
+                                updateStatusText(us, ver), style = LancatTheme.type.caption,
+                                color = if (us is UpdateState.Failed) c.danger else if (us is UpdateState.Available || us is UpdateState.ReadyToInstall) c.accent else c.text2,
+                                maxLines = 2, overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        when (us) {
+                            is UpdateState.Available, is UpdateState.Downloading, is UpdateState.Verifying, is UpdateState.ReadyToInstall ->
+                                SmallButton("查看") { updater.check(manual = true) }
+                            UpdateState.Checking -> SmallButton("检查中…") {}
+                            else -> SmallButton("检查更新") { updater.check(manual = true) }
+                        }
+                    }
+                    Sep()
+                    SwitchRow("自动检查更新", "启动时和每 6 小时从 GitHub 检查一次", auto) { updater.setAutoCheck(it) }
+                    Sep()
+                }
                 Column(Modifier.padding(vertical = 14.dp)) {
                     Text("Lancat $ver · Android · 局域网零配置快传", style = LancatTheme.type.body, color = c.text)
                     Spacer(Modifier.height(6.dp))

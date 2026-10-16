@@ -11,9 +11,17 @@ plugins {
 
 val useStubs: Boolean = (findProperty("lancat.useStubs") as String?)?.toBoolean() ?: true
 
-// 旧版 Slint 安卓包 0.2.7 = versionCode 207；新版必须更大才能覆盖安装
-val lancatVersion = System.getenv("LANCAT_VERSION") ?: "0.2.8"
-val lancatCode = (System.getenv("LANCAT_VERSION_CODE") ?: "208").toInt()
+// 版本号：云端按标签注入（v0.2.9 → LANCAT_VERSION=0.2.9），本地用默认值。
+// versionCode = (x·10000 + y·100 + z)·100 + 安卓修订号（-android.N），与 :model 的 AppVersion.versionCode 同一公式，
+// 随版本单调递增（旧 Slint 版 0.2.7 = 207、Compose 首版 0.2.8 = 208，都比新公式小，可直接覆盖安装）。
+val lancatVersion = System.getenv("LANCAT_VERSION")?.takeIf { it.isNotBlank() } ?: "0.2.8-android.1"
+fun versionCodeOf(v: String): Int {
+    val m = Regex("""^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-android\.?(\d+))?$""").find(v.trim())
+        ?: error("LANCAT_VERSION '$v' 不是 x.y.z 或 x.y.z-android.N")
+    val (a, b, c, r) = m.destructured
+    return ((a.toInt() * 10000 + (b.toIntOrNull() ?: 0) * 100 + (c.toIntOrNull() ?: 0)) * 100) + (r.toIntOrNull() ?: 0)
+}
+val lancatCode = System.getenv("LANCAT_VERSION_CODE")?.takeIf { it.isNotBlank() }?.toInt() ?: versionCodeOf(lancatVersion)
 
 android {
     // 命名空间按契约用 fan.lancat；applicationId 沿用旧工程（Slint 版与 Tauri mobile 都是 app.lancat），

@@ -10,6 +10,7 @@ import fan.lancat.service.ServiceController
 import fan.lancat.share.ShareStaging
 import fan.lancat.shortcut.ShortcutPublisher
 import fan.lancat.tile.ReceiveTileService
+import fan.lancat.update.Updater
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
@@ -24,6 +25,7 @@ class LancatApplication : Application() {
         ServiceLocator.init(this)
         AppForeground.install(this)
         Channels.ensure(this)
+        Updater.init(this)
         NetPresence.init(this)
         startRuntime()
     }

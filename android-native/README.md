@@ -39,6 +39,22 @@ cargo build --lib && cargo run --features bindgen --bin uniffi-bindgen -- genera
   `./gradlew :core:testDebugUnitTest -Plancat.ffiHostDir=<含 lancat_ffi.dll/.so 的目录> -Plancat.cli=<lancat-cli>`
 - Rust 侧：`crates/lancat-ffi/tests/smoke_cli.rs`（对 lancat-cli）、`tests/desktop_interop.rs`（对正在运行的桌面版，见文件头）
 
+## 图标
+
+启动图标 / 主题图标 / 通知小图标 / Tile 图标全部由 `app/tools/gen_icons.py` 从项目图标 `docs/assets/logo.svg`
+（桌面 exe、托盘、窗口用的像素猫 + 双向半箭头）生成：自适应图标前景和单色层是矢量，背景色 #F3EEE3，
+另有各密度的旧式 `ic_launcher.png` / `ic_launcher_round.png`。改了 logo.svg 后重新运行 `python3 app/tools/gen_icons.py ..`。
+
+## 发布与应用内更新
+
+- 推送版本标签（`v0.2.9`，或只发安卓修订版 `v0.2.8-android.2`）时，`.github/workflows/android-native.yml`
+  按标签设置 versionName，versionCode = (x·10000 + y·100 + z)·100 + 安卓修订号（0.2.8-android.1 = 20801），
+  把 `Lancat-android.apk` 和 `Lancat-android.apk.sha256` 附加到同名 Release。
+- App 启动 / 回到前台时（距上次超过 6 小时，设置里可关）和设置页「检查更新」查询 GitHub Releases，
+  选带安卓包的最新正式发布，下载后核对 SHA-256、包名、versionCode、签名证书，再交给系统安装器（需要「安装未知应用」授权）。
+- 签名：`app/lancat-test.p12`（仓库内的测试密钥，口令公开，与旧 Slint / Tauri 安卓包同一把），保证新版能覆盖安装。
+  换正式密钥会导致已安装用户无法直接覆盖升级。
+
 ## 许可
 
 整个 App 链接 GPL-3.0 的 lancat-core，按 GPL-3.0 分发。第三方：ThorVG（MIT）、Noto Animated Emoji（CC BY 4.0）、
