@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 点通知 / 消息里的文件打开：收到的文件在 Download/Lancat（外部存储）或应用目录 -->
+<paths>
+    <external-path name="ext" path="." />
+    <external-files-path name="extfiles" path="." />
+    <files-path name="files" path="." />
+    <cache-path name="cache" path="." />
+</paths>

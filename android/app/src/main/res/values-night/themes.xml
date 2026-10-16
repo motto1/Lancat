@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 内容铺满全屏（edge-to-edge，MainActivity 里设置）：Slint 按 safe-area-insets 让出状态栏 / 导航栏 -->
+    <style name="Lancat" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowBackground">@android:color/black</item>
+    </style>
+</resources>

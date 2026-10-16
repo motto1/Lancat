@@ -1,0 +1,63 @@
+// Java 外壳很薄：NativeActivity（Slint android-activity 后端）+ 分享入口 + 前台服务 + 通知。
+// 原生库 liblancat.so 由 cargo-ndk 预先编进 src/main/jniLibs/<abi>/（见 .github/workflows/android.yml）。
+plugins {
+    id "com.android.application"
+}
+
+def lancatVersion = (System.getenv("LANCAT_VERSION") ?: "0.2.7")
+def lancatCode = (System.getenv("LANCAT_VERSION_CODE") ?: "207").toInteger()
+
+android {
+    namespace "app.lancat"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "app.lancat"
+        minSdk 26
+        targetSdk 34
+        versionCode lancatCode
+        versionName lancatVersion
+    }
+
+    // 自签名（固定的测试密钥，口令公开）：每次 CI 出的包签名相同，可以覆盖安装升级
+    signingConfigs {
+        lancat {
+            storeFile file("lancat-test.p12")
+            storeType "pkcs12"
+            storePassword "lancat-android"
+            keyAlias "lancat"
+            keyPassword "lancat-android"
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.lancat
+        }
+        debug {
+            signingConfig signingConfigs.lancat
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // 外壳代码很少，release 构建不跑 lint（避免 lint 的 MissingPermission 一类误报挡住打包）
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
+    }
+
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging false
+        }
+    }
+}
+
+dependencies {
+    implementation "androidx.core:core:1.13.1"
+}
