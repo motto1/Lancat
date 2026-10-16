@@ -56,6 +56,9 @@ jobs:
         working-directory: crates/lancat-android
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018
+          # Slint 的构建脚本要用 android.jar 编它的 Java 辅助类；cargo-ndk 设了 ANDROID_PLATFORM=26，
+          # 不显式给的话会去找没装的 platforms/android-26
+          ANDROID_JAR: ${{ env.ANDROID_SDK_ROOT }}/platforms/android-35/android.jar
         run: cargo ndk -t arm64-v8a -t x86_64 --platform 26 -o ../../android/app/src/main/jniLibs build --release --locked
 
       - name: 打包 APK
