@@ -11,6 +11,9 @@ env:
   CARGO_TERM_COLOR: always
   # thorvg（C++）和 Skia 都静态链接 libc++，APK 里不用再带 libc++_shared.so
   CXXSTDLIB: c++_static
+  # 16 KB 页对齐（Android 15 起的新设备）；NDK 27 默认还是 4 KB
+  CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384"
+  CARGO_TARGET_X86_64_LINUX_ANDROID_RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384"
 
 jobs:
   apk:

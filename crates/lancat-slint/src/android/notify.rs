@@ -56,7 +56,9 @@ fn peer_name(node: &Node, id: &str) -> String {
 fn run(node: Arc<Node>, rt: tokio::runtime::Handle, rx: mpsc::Receiver<CoreEvent>) {
     let mut xf: HashMap<String, Xfer> = HashMap::new();
     loop {
-        match rx.recv_timeout(Duration::from_millis(350)) {
+        // 有传输时 0.35 s 一轮（通知按钮要及时响应），空闲时 1 s
+        let wait = if xf.is_empty() { 1000 } else { 350 };
+        match rx.recv_timeout(Duration::from_millis(wait)) {
             Ok(ev) => on_event(&node, &mut xf, ev),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,

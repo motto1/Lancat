@@ -31,6 +31,7 @@ thread_local! {
     static PENDING: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static POLL: slint::Timer = slint::Timer::default();
     static LIGHT_BARS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static TICK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 #[no_mangle]
@@ -244,6 +245,16 @@ pub fn settings_shown() -> bool {
 // ------------------------------------------------------------------ Java 事件
 
 fn poll_java() {
+    // 在后台时（Activity 暂停）每 ~1 s 才去 Java 取一次事件
+    let n = TICK.with(|t| {
+        let v = t.get().wrapping_add(1);
+        t.set(v);
+        v
+    });
+    let visible = with_app(|app| app.visible).unwrap_or(true);
+    if !visible && n % 7 != 0 {
+        return;
+    }
     // 状态栏图标颜色跟主题
     if let Some(dark) = with_app(|app| app.ui().map(|u| u.global::<Theme>().get_dark())).flatten() {
         if LIGHT_BARS.with(|l| l.replace(Some(!dark))) != Some(!dark) {
