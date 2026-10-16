@@ -1,19 +1,18 @@
 # 原生安卓版（android-native/：Kotlin + Jetpack Compose，Rust 核心经 UniFFI）。
-# - android 分支推送 / 手动运行：编译 + 单元测试，APK 上传为 Actions artifact，不发布。
-# - 推送版本标签 v*（例如 v0.2.9、v0.2.8-android.2）：按标签注入版本号编译，把签名的 APK 和校验值
-#   （Lancat-android.apk、Lancat-android.apk.sha256）附加到同名 GitHub Release，供 App 内「检查更新」下载。
-#   Release 通常由桌面版 release.yml 创建，这里等它出现后追加文件；等不到就自己创建。
-#   注意：只有标签所指的提交里包含本文件（及 android-native/）时这个工作流才会运行。
+# - main / android 分支推送、手动运行：编译 + 单元测试，APK 上传为 Actions artifact，不发布。
+# - 发布：由 release.yml 在 v* 标签时调用（workflow_call），产出 Lancat-android.apk + .sha256 的 artifact，
+#   统一由 release.yml 的 release 任务创建 Release，这里不再自己发布。
 name: android-native
 
 on:
+  workflow_call:
   push:
-    tags: ["v*"]
-    branches: [android]
+    branches: [main, android]
     paths:
       - "android-native/**"
       - "crates/lancat-core/**"
       - "crates/lancat-ffi/**"
+      - "Cargo.toml"
       - ".github/workflows/android-native.yml"
   workflow_dispatch:
 
@@ -78,9 +77,8 @@ jobs:
           v="${GITHUB_REF_NAME#v}"
           if [[ "$v" =~ ^[0-9]+(\.[0-9]+){0,2}(-android\.?[0-9]+)?$ ]]; then
             echo "LANCAT_VERSION=$v" >> "$GITHUB_ENV"
-            echo "LANCAT_PUBLISH=1" >> "$GITHUB_ENV"
           else
-            echo "标签 $GITHUB_REF_NAME 不是正式版本号（预发布等），只编译不发布"
+            echo "标签 $GITHUB_REF_NAME 不是 x.y.z，用 Cargo.toml 的版本号"
           fi
 
       - name: Gradle (unit tests + release APK)
@@ -90,26 +88,14 @@ jobs:
           chmod +x gradlew
           ./gradlew --console=plain --no-daemon :model:test :sticker:testDebugUnitTest :app:testDebugUnitTest :app:assembleRelease
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Lancat-android-native
-          path: android-native/app/build/outputs/apk/release/*.apk
-
-      - name: 发布到 GitHub Release（Lancat-android.apk + .sha256）
-        if: github.ref_type == 'tag' && env.LANCAT_PUBLISH == '1'
+      - name: 整理 APK（Lancat-android.apk + .sha256）
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
           mkdir -p dist
           cp android-native/app/build/outputs/apk/release/app-release.apk dist/Lancat-android.apk
           (cd dist && sha256sum Lancat-android.apk > Lancat-android.apk.sha256 && cat Lancat-android.apk.sha256)
-          tag="$GITHUB_REF_NAME"
-          # 桌面版 release.yml 编译完会创建 Release（带自动生成的更新说明）；最多等 45 分钟
-          for i in $(seq 1 90); do
-            gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 && break
-            [[ $i == 90 ]] && gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$tag"
-            sleep 30
-          done
-          gh release upload "$tag" dist/Lancat-android.apk dist/Lancat-android.apk.sha256 --repo "$GITHUB_REPOSITORY" --clobber
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: dist/*

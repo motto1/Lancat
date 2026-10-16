@@ -11,10 +11,15 @@ plugins {
 
 val useStubs: Boolean = (findProperty("lancat.useStubs") as String?)?.toBoolean() ?: true
 
-// 版本号：云端按标签注入（v0.2.9 → LANCAT_VERSION=0.2.9），本地用默认值。
+// 版本号：云端按标签注入（v0.2.9 → LANCAT_VERSION=0.2.9，release.yml 已校验与 Cargo.toml 一致）。
 // versionCode = (x·10000 + y·100 + z)·100 + 安卓修订号（-android.N），与 :model 的 AppVersion.versionCode 同一公式，
 // 随版本单调递增（旧 Slint 版 0.2.7 = 207、Compose 首版 0.2.8 = 208，都比新公式小，可直接覆盖安装）。
-val lancatVersion = System.getenv("LANCAT_VERSION")?.takeIf { it.isNotBlank() } ?: "0.2.8-android.1"
+// 本地默认读仓库根 Cargo.toml 的 [workspace.package] version（全项目唯一的版本号来源）。
+val cargoVersion: String = rootProject.file("../Cargo.toml").readLines()
+    .dropWhile { it.trim() != "[workspace.package]" }
+    .firstOrNull { it.trim().startsWith("version") }
+    ?.substringAfter('"')?.substringBefore('"') ?: error("根 Cargo.toml 缺少 [workspace.package] version")
+val lancatVersion = System.getenv("LANCAT_VERSION")?.takeIf { it.isNotBlank() } ?: cargoVersion
 fun versionCodeOf(v: String): Int {
     val m = Regex("""^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-android\.?(\d+))?$""").find(v.trim())
         ?: error("LANCAT_VERSION '$v' 不是 x.y.z 或 x.y.z-android.N")

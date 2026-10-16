@@ -83,6 +83,7 @@
 |---|---|---|
 | Windows 10 / 11 x64 | [lancat-slint-windows-x64.exe](https://github.com/motto1/Lancat/releases/latest/download/lancat-slint-windows-x64.exe) | [Releases](https://github.com/motto1/Lancat/releases/latest) |
 | Linux x64（Wayland） | [lancat-slint-linux-x64](https://github.com/motto1/Lancat/releases/latest/download/lancat-slint-linux-x64) | [Releases](https://github.com/motto1/Lancat/releases/latest) |
+| Android 8+（arm64 / armv7 / x86_64） | [Lancat-android.apk](https://github.com/motto1/Lancat/releases/latest/download/Lancat-android.apk) | [Releases](https://github.com/motto1/Lancat/releases/latest) |
 
 每个版本都附带 `SHA256SUMS`。程序未签名，Windows SmartScreen 可能提示，点「仍要运行」即可。
 

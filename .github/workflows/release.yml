@@ -1,4 +1,6 @@
-# 推送 v* 标签（如 v0.1.0）时，在云上编译 Windows 和 Linux 的 Slint 版并发布到 GitHub Release。
+# 推送 v* 标签（如 v0.2.9）时：校验标签与根 Cargo.toml 版本一致 → 编译 Windows / Linux 桌面版和安卓 APK
+# → 统一发布一个 GitHub Release（桌面单文件 + 压缩包 + SHA256SUMS + Lancat-android.apk + .sha256）。
+# 版本号只在根 Cargo.toml 改：scripts/version.sh set X.Y.Z。
 # 也可以在 Actions 页面手动运行（只编译、上传构建产物，不发布）。
 name: release
 
@@ -14,7 +16,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  version:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: 标签与源码版本一致
+        if: github.ref_type == 'tag'
+        run: bash scripts/version.sh check "$GITHUB_REF_NAME"
+
+  android:
+    needs: version
+    uses: ./.github/workflows/android-native.yml
+
   build:
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -85,7 +100,7 @@ jobs:
           path: dist/*
 
   release:
-    needs: build
+    needs: [build, android]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     steps:
