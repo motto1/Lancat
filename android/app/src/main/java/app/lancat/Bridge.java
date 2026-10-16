@@ -230,11 +230,14 @@ public final class Bridge {
     }
 
     public static void playChime() {
-        try {
-            Ringtone r = RingtoneManager.getRingtone(app, RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION));
-            if (r != null) r.play();
-        } catch (Exception ignored) {
-        }
+        // Ringtone 要有 Looper 的线程：交给主线程（Rust 从任意线程调用）
+        main.post(() -> {
+            try {
+                Ringtone r = RingtoneManager.getRingtone(app, RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION));
+                if (r != null) r.play();
+            } catch (Exception ignored) {
+            }
+        });
     }
 
     @SuppressWarnings("deprecation")
