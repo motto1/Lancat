@@ -78,7 +78,12 @@ fn play(w: &'static [u8]) {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "android")]
+fn play(_w: &'static [u8]) {
+    std::thread::spawn(crate::android::jvm::play_chime);
+}
+
+#[cfg(not(any(windows, target_os = "android")))]
 fn play(w: &'static [u8]) {
     std::thread::spawn(move || {
         let dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);

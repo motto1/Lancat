@@ -1,0 +1,54 @@
+[package]
+name = "lancat-android"
+version = "0.2.7"
+edition = "2021"
+authors = ["Motto"]
+license = "GPL-3.0-only"
+description = "Lancat 的 Android 版：同一份 lancat-slint 源码（src/main.rs 为库根）+ Slint android-activity 后端"
+build = "build.rs"
+
+# 独立 workspace（和 lancat-slint 一样不动根 Cargo.toml）。界面代码不复制：库根就是桌面版的 main.rs，
+# 平台差异全在 #[cfg(target_os = "android")] 和 src/android/ 里。
+[workspace]
+
+[lib]
+name = "lancat"
+path = "../lancat-slint/src/main.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+lancat-core = { path = "../lancat-core", default-features = false }
+# 和桌面同一个 Slint 版本；Android 用官方的 android-activity 后端（NativeActivity，Skia 渲染）。
+# renderer-software 只为让共用的 compose.rs 编译通过（Android 上不走它）
+slint = { version = "=1.18.1", default-features = false, features = ["std", "compat-1-2", "renderer-software", "backend-android-activity-06"] }
+i-slint-core = "=1.18.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+serde_json = "1"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
+dirs = "7"
+thorvg-sys = { version = "=0.3.2", default-features = false, features = ["vendored", "lottie"] }
+flate2 = "1"
+sha2 = { version = "0.10", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk-context = "0.1"
+android_logger = "0.15"
+# lancat-core 的公网连接用 native-tls：Android 上是 OpenSSL，源码编进来（不依赖系统库）
+openssl = { version = "0.10", features = ["vendored"] }
+
+[build-dependencies]
+slint-build = "=1.18.1"
+flate2 = "1"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.release.package.blake3]
+opt-level = 3

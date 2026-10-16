@@ -805,6 +805,9 @@ macro_rules! install_fx {
         g.on_lb(|size, text, win| $crate::metrics::line_box(size, text.as_str(), win));
         g.on_lh(|size, f| $crate::metrics::line_height(size, f));
         g.set_dpr($c.window().scale_factor());
+        // Android：触屏布局（app.slint / settings.slint 的 Fx.touch 分支）
+        #[cfg(target_os = "android")]
+        g.set_touch(true);
         #[cfg(target_os = "linux")]
         {
             g.set_hair(1.0 / $c.window().scale_factor().max(1.0));

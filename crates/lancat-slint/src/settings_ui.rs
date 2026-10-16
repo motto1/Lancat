@@ -33,6 +33,9 @@ impl SettingsCtl {
         let win = crate::win::with_normal_window(SettingsWindow::new).ok()?;
         #[cfg(not(windows))]
         let win = SettingsWindow::new().ok()?;
+        // Android 只有一个窗口：设置页和面板轮流挂上去
+        #[cfg(target_os = "android")]
+        crate::android::settings_created(&win);
         install_fx!(win, true);
         let me = node.me();
         win.set_me_name(me.name.clone().into());
@@ -78,7 +81,10 @@ impl SettingsCtl {
         if let Some(d) = crate::diag::last() {
             self.diag_changed(&d);
         }
+        #[cfg(not(target_os = "android"))]
         let _ = self.win.show();
+        #[cfg(target_os = "android")]
+        crate::android::show_settings();
         self.win.global::<crate::Fx>().set_dpr(self.win.window().scale_factor());
         #[cfg(target_os = "linux")]
         self.win.global::<crate::Fx>().set_hair(1.0 / self.win.window().scale_factor().max(1.0));
@@ -101,12 +107,18 @@ impl SettingsCtl {
     }
 
     pub fn is_open(&self) -> bool {
+        #[cfg(target_os = "android")]
+        return crate::android::settings_shown();
+        #[cfg(not(target_os = "android"))]
         self.win.window().is_visible()
     }
 
     /// 已开着的设置窗口提到前台（show() 对已显示的窗口会激活它）
     pub fn raise(&self) {
+        #[cfg(not(target_os = "android"))]
         let _ = self.win.show();
+        #[cfg(target_os = "android")]
+        crate::android::show_settings();
     }
 
     /// 已经开着时再次被要求跳到诊断（lancat://goto-diag）：滚过去 + 闪烁 + 重新检查
@@ -422,6 +434,11 @@ fn wire(w: &SettingsWindow) {
                 let _ = sc.win.hide();
             });
         }
+    });
+    // Android：设置页左上角「返回」（桌面没有这个按钮）
+    w.on_back(|| {
+        #[cfg(target_os = "android")]
+        crate::android::show_panel();
     });
     w.on_save(|| {
         ctl(|sc| {

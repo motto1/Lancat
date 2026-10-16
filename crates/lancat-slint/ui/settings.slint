@@ -733,7 +733,7 @@ export component SettingsWindow inherits Window {
     title: "Lancat 设置";
     preferred-width: 480px;
     preferred-height: 620px + root.csd-h;
-    min-width: 420px;
+    min-width: Fx.touch ? 0px : 420px;
     min-height: 480px + root.csd-h;
     background: Theme.glass-strong-solid;
     default-font-size: 13px;
@@ -834,6 +834,8 @@ export component SettingsWindow inherits Window {
     callback clear-all();
     callback recheck();
     callback run-fix(string, bool);
+    /// Android：返回主界面（设置和面板共用一个窗口）
+    callback back();
 
     property <bool> mon-open;
     // Wayland 下 compositor 要客户端自己画装饰：旧版是 GTK 的标题栏（36 + 底边 1，标题居中加粗，右侧三个圆钮）
@@ -842,9 +844,11 @@ export component SettingsWindow inherits Window {
     callback csd-act(int, length, length);
     property <length> csd-h: root.csd ? 37px : 0px;
 
+    // Android：让出状态栏 / 导航栏（safe-area-insets 桌面恒为 0）
+    property <length> top-in: root.csd-h + root.safe-area-insets.top;
     hov := TouchArea {
-    y: root.csd-h;
-    height: parent.height - root.csd-h;
+    y: root.top-in;
+    height: parent.height - root.top-in - root.safe-area-insets.bottom;
     fl := Flickable {
         width: parent.width;
         height: parent.height;
@@ -866,6 +870,7 @@ export component SettingsWindow inherits Window {
             HorizontalLayout {
                 spacing: 10px;
                 alignment: start;
+                if Fx.touch: VerticalLayout { alignment: center; Btn { text: "‹ 返回"; clicked => { root.back(); } } }
                 Text { text: "Lancat 设置"; font-size: 17px; font-weight: 700; color: Theme.text; vertical-alignment: center; height: Fx.lb(17px, self.text, self.preferred-height); }
                 // 已保存：1.2 s，70% 之前不透明，之后淡出
                 if root.saved-flash: Text {
@@ -935,7 +940,8 @@ export component SettingsWindow inherits Window {
                     }
                 }
             }
-            Section {
+            // 停靠 / 开机自启 / 一键更新只在桌面有
+            if !Fx.touch: Section {
                 title: "停靠";
                 Row {
                     label: "屏幕边缘";
@@ -1044,7 +1050,7 @@ export component SettingsWindow inherits Window {
                         }
                     }
                 }
-                Rectangle {
+                if !Fx.touch: Rectangle {
                     height: 34px;
                     HorizontalLayout {
                         alignment: end;
@@ -1168,7 +1174,7 @@ export component SettingsWindow inherits Window {
             }
             Section {
                 title: "通用";
-                Row {
+                if !Fx.touch: Row {
                     label: "开机自动启动";
                     VerticalLayout { alignment: center; Switch { on: root.autostart; enabled: root.autostart-enabled; toggled => { root.toggle-autostart(); } } }
                 }
@@ -1197,7 +1203,7 @@ export component SettingsWindow inherits Window {
                     VerticalLayout { alignment: center; Btn { text: root.confirm-clear ? "再点一次确认清空" : "清空全部聊天记录"; danger: true; clicked => { root.clear-all(); } } }
                 }
             }
-            Section {
+            if !Fx.touch: Section {
                 title: "更新";
                 Row {
                     label: root.upd-text;
@@ -1245,8 +1251,8 @@ export component SettingsWindow inherits Window {
     }
     sb := ScrollBar {
         x: parent.width - self.width;
-        y: root.csd-h;
-        height: parent.height - root.csd-h;
+        y: root.top-in;
+        height: parent.height - root.top-in - root.safe-area-insets.bottom;
         view-h: fl.height;
         content-h: fl.content-height;
         pos <=> fl.content-y;

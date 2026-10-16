@@ -11,7 +11,14 @@ use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 #[cfg(windows)]
 use windows::Win32::UI::Shell::*;
 
-#[cfg(not(windows))]
+/// Android：系统文件选择器（Storage Access Framework）；选中的内容先复制进应用缓存，返回本地路径
+#[cfg(target_os = "android")]
+fn run(directory: bool, _title: &str, filters: &[(String, String)]) -> Vec<String> {
+    let mode = if directory { 1 } else if filters.is_empty() { 0 } else { 2 };
+    crate::android::jvm::pick_blocking(mode)
+}
+
+#[cfg(not(any(windows, target_os = "android")))]
 fn run(directory: bool, title: &str, filters: &[(String, String)]) -> Vec<String> {
     use std::process::Command;
     let lines = |o: std::process::Output| -> Option<Vec<String>> {

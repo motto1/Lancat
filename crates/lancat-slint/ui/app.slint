@@ -254,10 +254,22 @@ component SidebarItem inherits Rectangle {
     property <float> k-to: root.drop-hot ? 1.18 : (ta.pressed ? 0.94 : (ta.has-hover ? 1.05 : 1));
     property <float> k: self.k-to;
     animate k { duration: 160ms; easing: cubic-bezier(0.2, 0.9, 0.3, 1.4); }
+    // Android：长按 = 右键菜单（抬起时不再当作点击）
+    property <bool> long-fired;
+    if Fx.touch && !root.all && ta.pressed && !root.long-fired: Timer {
+        interval: 550ms;
+        triggered => {
+            root.long-fired = true;
+            root.menu(ta.mouse-x, ta.mouse-y);
+        }
+    }
     ta := TipArea {
         tip: root.all ? "全部在线设备（群发）" : root.peer.name + (root.peer.online ? "" : "（离线）") + "\nShift+点击可多选";
         pointer-event(e) => {
-            if e.kind == PointerEventKind.up && e.button == PointerEventButton.left && self.has-hover {
+            if e.kind == PointerEventKind.down {
+                root.long-fired = false;
+            }
+            if e.kind == PointerEventKind.up && e.button == PointerEventButton.left && self.has-hover && !root.long-fired {
                 root.clicked(e.modifiers.shift || e.modifiers.control || e.modifiers.meta);
             }
             if e.kind == PointerEventKind.down && e.button == PointerEventButton.right && !root.all {
@@ -966,11 +978,18 @@ export component PanelWindow inherits Window {
     title: "Lancat";
     no-frame: true;
     always-on-top: true;
-    background: transparent;
+    // Android（Fx.touch）：整窗不透明底，内容铺满竖屏
+    background: Fx.touch ? Theme.glass-strong-solid : transparent;
     // Linux（无原生材质）：外框 8px 留给圆角 14 的外壳和阴影（旧版 .frame padding 8）
     in property <length> frame: 0px;
     width: 360px + 2 * frame;
     height: 520px + 2 * frame;
+    // Android（Fx.touch）：面板铺满窗口，扣掉状态栏 / 导航栏和软键盘；桌面恒为 360×520、偏移 = frame
+    property <length> kb-top: root.virtual-keyboard-size.height > 0 ? root.virtual-keyboard-position.y : root.height;
+    out property <length> pw: Fx.touch ? root.width - root.safe-area-insets.left - root.safe-area-insets.right : 360px;
+    out property <length> ph: Fx.touch ? min(root.height - root.safe-area-insets.bottom, root.kb-top) - root.safe-area-insets.top : 520px;
+    property <length> ox: Fx.touch ? root.safe-area-insets.left : root.frame;
+    property <length> oy: Fx.touch ? root.safe-area-insets.top : root.frame;
     default-font-size: 13px;
     default-font-family: Fx.font;
 
@@ -1033,7 +1052,7 @@ export component PanelWindow inherits Window {
     out property <length> list-content-h: list.content-height;
     in-out property <length> list-scroll <=> list.content-y;
     // 拖放选择器几何（Rust 的 drop_hit 用同一套数）
-    out property <int> pick-cols: max(1, floor((360px - 28px + 6px) / 90px));
+    out property <int> pick-cols: max(1, floor((root.pw - 28px + 6px) / 90px));
     out property <length> pick-y0: pick-top + pick-hint-h + 22px;
     out property <length> pick-x-frame: frame;
 
@@ -1068,18 +1087,20 @@ export component PanelWindow inherits Window {
     callback sticker-hover(string, bool);
     callback sticker-visible(string, bool);
     callback scrolled(length, length, length);
+    /// Android 分享选择器：外壳坐标，up = 手指抬起
+    callback pick-touch(length, length, bool);
 
     // ---------------- 合成层（src/compose.rs）：窗口逻辑坐标，按合成顺序 ----------------
     // Linux：外壳边框占布局（shell-bw），弹层按内容区（外壳的 padding box）定位
     property <length> ep-x: root.shell-bw + 66px + 6px;
     // bottom: calc(100% + 6px) 相对输入栏的 padding box（不含 0.5px 上边框；Linux 上它占 1 设备像素）
-    property <length> ep-y: 520px - root.shell-bw - composer-h + root.composer-bt - 6px - 288px;
-    property <length> ep-w: 360px - 2 * root.shell-bw - 66px - 12px;
+    property <length> ep-y: root.ph - root.shell-bw - composer-h + root.composer-bt - 6px - 288px;
+    property <length> ep-w: root.pw - 2 * root.shell-bw - 66px - 12px;
     property <length> am-x: root.shell-bw + 66px + 6px + 30px + 2px;
     // 菜单条目：padding 6 + 12.5px 中文行框（Windows 量得 16.67；Linux 按 Noto CJK 算）
     property <length> mi-h: 12px + Fx.lb(12.5px, "文件", 16.67px);
     property <length> am-h: 4px * 2 + root.mi-h * 2;
-    property <length> am-y: 520px - root.shell-bw - 9px - 36px - am-h;
+    property <length> am-y: root.ph - root.shell-bw - 9px - 36px - am-h;
     // 旧版右键菜单是 position:fixed，left/top = clientX/Y（钳到 220/420）；Linux 外壳有 backdrop-filter，
     // fixed 元素以外壳为包含块，所以菜单比光标偏右下一个外框 + 边框（Windows 没有外框，等于光标处）
     property <length> mn-x: min(menu-x - (root.frame > 0 ? 0px : frame), 220px) + root.shell-bw;
@@ -1091,20 +1112,20 @@ export component PanelWindow inherits Window {
         || (root.attach-open && ax >= frame + am-x && ax < frame + am-x + 120px && ay >= frame + am-y && ay < frame + am-y + am-h)
         || (root.menu-peer != "" && ax >= frame + mn-x && ax < frame + mn-x + 150px && ay >= frame + mn-y && ay < frame + mn-y + mn-h)
     }
-    property <length> toast-w: min(toast-t.preferred-width + 24px, 360px * 0.8);
+    property <length> toast-w: min(toast-t.preferred-width + 24px, root.pw * 0.8);
     property <length> toast-h: Fx.lb(12px, root.toast, toast-t.preferred-height) + 14px;
     // .glass 弹层（表情面板 / 附件菜单 / 右键菜单）：无原生材质时 backdrop-filter: blur(30px) saturate(180%)；
     // Windows（native-glass）旧版关掉了 backdrop-filter，靠窗口的 Acrylic
     property <length> pop-blur: Theme.native-glass ? 0px : 30px;
     property <float> pop-sat: Theme.native-glass ? 1 : 1.8;
     out property <[FxLayer]> fx-layers: [
-        { id: 10, shown: shell.dk < 0.9995, x: frame + (360px - content.width) / 2, y: frame + (520px - content.height) / 2, w: content.width, h: content.height, r: 0px, blur: 0px, sat: 1, lq: 0px, parent: 0, shrink: 1 - shell.dk },
+        { id: 10, shown: shell.dk < 0.9995, x: frame + (root.pw - content.width) / 2, y: frame + (root.ph - content.height) / 2, w: content.width, h: content.height, r: 0px, blur: 0px, sat: 1, lq: 0px, parent: 0, shrink: 1 - shell.dk },
         { id: 2, shown: emoji-open, x: frame + ep-x, y: frame + ep-y, w: ep-w, h: 288px, r: 14px, blur: pop-blur, sat: pop-sat, lq: 0px, parent: 0 },
         { id: 3, shown: attach-open, x: frame + am-x, y: frame + am-y, w: 120px, h: am-h, r: 9px, blur: pop-blur, sat: pop-sat, lq: 0px, parent: 0 },
-        { id: 5, shown: dragging, x: frame, y: frame, w: 360px, h: 520px, r: 14px, blur: 14px, sat: 1.6, lq: 0px, parent: 0 },
-        { id: 6, shown: dragging, x: frame + (360px - pick-hint-w) / 2, y: frame + pick-top, w: pick-hint-w, h: pick-hint-h, r: 15px, blur: 4px, sat: 1.7, lq: 14px, parent: 5 },
-        { id: 7, shown: toast != "", x: frame + (360px - toast-w) / 2, y: frame + 520px - root.shell-bw - 64px - toast-h, w: toast-w, h: toast-h, r: 10px, blur: 5px, sat: 1.7, lq: 12px, parent: 0 },
-        { id: 8, shown: Theme.native-glass && frame == 0, x: 0, y: 0, w: 360px, h: 520px, r: 0px, blur: 0px, sat: 1, lq: 0px, parent: 0 },
+        { id: 5, shown: dragging, x: frame, y: frame, w: root.pw, h: root.ph, r: 14px, blur: 14px, sat: 1.6, lq: 0px, parent: 0 },
+        { id: 6, shown: dragging, x: frame + (root.pw - pick-hint-w) / 2, y: frame + pick-top, w: pick-hint-w, h: pick-hint-h, r: 15px, blur: 4px, sat: 1.7, lq: 14px, parent: 5 },
+        { id: 7, shown: toast != "", x: frame + (root.pw - toast-w) / 2, y: frame + root.ph - root.shell-bw - 64px - toast-h, w: toast-w, h: toast-h, r: 10px, blur: 5px, sat: 1.7, lq: 12px, parent: 0 },
+        { id: 8, shown: Theme.native-glass && frame == 0, x: 0, y: 0, w: root.pw, h: root.ph, r: 0px, blur: 0px, sat: 1, lq: 0px, parent: 0 },
         { id: 4, shown: menu-peer != "", x: frame + mn-x, y: frame + mn-y, w: 150px, h: mn-h, r: 10px, blur: pop-blur, sat: pop-sat, lq: 0px, parent: 0 },
         { id: 9, shown: Tip.shown, x: 0, y: 0, w: root.width, h: root.height, r: 0px, blur: 0px, sat: 1, lq: 0px, parent: 0 },
     ];
@@ -1121,30 +1142,30 @@ export component PanelWindow inherits Window {
         visible: Fx.base();
         // Linux 外壳：圆角 14、.5px glass-border、--shadow + inset 顶部高光
         if root.frame > 0: Rectangle {
-            x: root.frame;
-            y: root.frame;
-            width: 360px;
-            height: 520px;
+            x: root.ox;
+            y: root.oy;
+            width: root.pw;
+            height: root.ph;
             Shadow { kind: "glass"; ew: parent.width; eh: parent.height; r: 14px; }
         }
         Rectangle {
-            x: root.frame;
-            y: root.frame;
-            width: 360px;
-            height: 520px;
+            x: root.ox;
+            y: root.oy;
+            width: root.pw;
+            height: root.ph;
             background: Theme.glass;
-            // .shell border-radius: var(--radius)=14（Windows 也是：DWM 窗口角 8px，外壳着色裁成 14px）
-            border-radius: 14px;
+            // .shell border-radius: var(--radius)=14（Windows 也是：DWM 窗口角 8px，外壳着色裁成 14px）；Android 铺满不留圆角
+            border-radius: Fx.touch ? 0px : 14px;
             border-width: root.frame > 0 ? 1phx : 0px;
             border-color: Theme.glass-border;
             if root.frame > 0: Shadow { kind: "glass-inset"; ew: parent.width; eh: parent.height; r: 14px; }
         }
     }
     shell := Rectangle {
-        x: root.frame;
-        y: root.frame;
-        width: 360px;
-        height: 520px;
+        x: root.ox;
+        y: root.oy;
+        width: root.pw;
+        height: root.ph;
         // 拖拽时：header + body scale(.97)，320 ms cubic-bezier(.2,.9,.3,1)
         property <float> dk: root.dragging ? 0.97 : 1;
         animate dk { duration: 320ms; easing: cubic-bezier(0.2, 0.9, 0.3, 1); }
@@ -1152,10 +1173,10 @@ export component PanelWindow inherits Window {
             // 拖拽时的 scale(.97) 交给合成层 10（位图缩放，和浏览器的 transform 一样不重新排版）
             visible: Fx.layer(10);
             // Linux 外壳 .5px 边框（画成 1 设备像素）占布局：内容缩进一圈（border-box）
-            x: (360px - self.width) / 2;
-            y: (520px - self.height) / 2;
-            width: 360px - 2 * root.shell-bw;
-            height: 520px - 2 * root.shell-bw;
+            x: (root.pw - self.width) / 2;
+            y: (root.ph - self.height) / 2;
+            width: root.pw - 2 * root.shell-bw;
+            height: root.ph - 2 * root.shell-bw;
             VerticalLayout {
                 // ---- header ----
                 Rectangle {
@@ -1190,7 +1211,8 @@ export component PanelWindow inherits Window {
                                 clicked => { root.refresh(); }
                             }
                         }
-                        VerticalLayout {
+                        // 钉住只对停靠面板有意义（Android 没有）
+                        if !Fx.touch: VerticalLayout {
                             alignment: center;
                             IconButton {
                                 d: Icons.pin;
@@ -1298,7 +1320,7 @@ export component PanelWindow inherits Window {
                     Rectangle {
                         width: 66px;
                         background: Theme.sidebar;
-                        border-bottom-left-radius: 14px;
+                        border-bottom-left-radius: Fx.touch ? 0px : 14px;
                         Rectangle { x: parent.width - Fx.hair; width: Fx.hair; background: Theme.sep; }
                         VerticalLayout {
                             padding-top: 8px;
@@ -1803,6 +1825,18 @@ export component PanelWindow inherits Window {
         }
         // ---------------- 弹出层（顺序 = 合成顺序；Fx.layer(id)：普通渲染 / 基底遍 / 本层遍） ----------------
         // 表情面板：left/right 6，输入栏上方 6，高 288
+        // Android：点弹层外面关闭弹层（桌面由平台层的 pointer-down 处理）；表情面板 / 附件菜单开着时不盖住输入栏
+        if Fx.touch && (root.emoji-open || root.attach-open || root.menu-peer != ""): TouchArea {
+            x: 0;
+            y: 0;
+            width: root.pw;
+            height: root.ph - (root.menu-peer != "" ? 0px : root.composer-h);
+            clicked => {
+                if root.emoji-open { root.emoji-open = false; root.emoji-toggled(false); }
+                root.attach-open = false;
+                root.menu-peer = "";
+            }
+        }
         ep := EmojiPanel {
             visible: root.emoji-open && Fx.layer(2);
             x: root.ep-x;
@@ -1862,17 +1896,24 @@ export component PanelWindow inherits Window {
             visible: Fx.layer(5);
             x: 0;
             y: 0;
-            width: 360px;
-            height: 520px;
+            width: root.pw;
+            height: root.ph;
             Rectangle {
                 background: #f5f5f7.with-alpha(0.55);
                 border-radius: 14px;
+            }
+            // Android（系统分享 → Lancat）：点头像发送，点空白处取消
+            if Fx.touch: TouchArea {
+                pointer-event(e) => {
+                    if e.kind == PointerEventKind.down || e.kind == PointerEventKind.move { root.pick-touch(self.mouse-x, self.mouse-y, false); }
+                    if e.kind == PointerEventKind.up { root.pick-touch(self.mouse-x, self.mouse-y, true); }
+                }
             }
             for s[i] in root.drop-slots: DropSlotView {
                 property <int> rw: floor(i / root.pick-cols);
                 property <int> j: mod(i, root.pick-cols);
                 property <int> in-row: min(root.pick-cols, root.drop-slots.length - self.rw * root.pick-cols);
-                x: (360px - (self.in-row * 84px + (self.in-row - 1) * 6px)) / 2 + self.j * 90px;
+                x: (root.pw - (self.in-row * 84px + (self.in-row - 1) * 6px)) / 2 + self.j * 90px;
                 y: root.pick-y0 + self.rw * (132px + 6px);
                 s: s;
                 idx: i;
@@ -1883,7 +1924,7 @@ export component PanelWindow inherits Window {
         }
         if root.dragging: Rectangle {
             visible: Fx.layer(6);
-            x: (360px - root.pick-hint-w) / 2;
+            x: (root.pw - root.pick-hint-w) / 2;
             y: root.pick-top;
             width: root.pick-hint-w;
             height: root.pick-hint-h;
@@ -1897,7 +1938,7 @@ export component PanelWindow inherits Window {
             HorizontalLayout {
                 alignment: center;
                 Text {
-                    text: root.drop-focus-name != "" ? "松开发送给 " : (root.drop-slots.length > 0 ? "拖到头像上发送" + (root.drag-count > 0 ? " " + root.drag-count + " 项" : "") : "没有在线设备");
+                    text: root.drop-focus-name != "" ? "松开发送给 " : (root.drop-slots.length > 0 ? (Fx.touch ? "点头像发送" : "拖到头像上发送") + (root.drag-count > 0 ? " " + root.drag-count + " 项" : "") : (Fx.touch ? "没有在线设备，点空白处取消" : "没有在线设备"));
                     font-size: 13px;
                     color: Theme.text-2;
                     vertical-alignment: center;
@@ -1914,8 +1955,8 @@ export component PanelWindow inherits Window {
         // toast：bottom 64，padding 7 12，r10，rgba(0,0,0,.42)
         if root.toast != "": Rectangle {
             visible: Fx.layer(7);
-            x: (360px - root.toast-w) / 2;
-            y: 520px - root.shell-bw - 64px - root.toast-h;
+            x: (root.pw - root.toast-w) / 2;
+            y: root.ph - root.shell-bw - 64px - root.toast-h;
             width: root.toast-w;
             height: root.toast-h;
             Shadow { kind: "toast"; ew: parent.width; eh: parent.height; r: 10px; }
@@ -1937,9 +1978,9 @@ export component PanelWindow inherits Window {
             visible: Fx.layer(8);
             x: 0;
             y: 0;
-            width: 360px;
-            height: 520px;
-            source: Fx.paint("winglass", 360px, 520px, transparent, Theme.dark, Fx.dpr);
+            width: root.pw;
+            height: root.ph;
+            source: Fx.paint("winglass", root.pw, root.ph, transparent, Theme.dark, Fx.dpr);
             image-fit: fill;
         }
         // 右键菜单：fixed，x=min(clientX,220) y=min(clientY,420)，min-w 150 padding 5 r10
@@ -1989,11 +2030,11 @@ export component PanelWindow inherits Window {
     // 气泡文字的行高度量（见 MessageRow.lines）
     lh1 := SelText { visible: false; width: 200px; text: "国"; font-size: 13px; }
     lh2 := SelText { visible: false; width: 200px; text: "国\n国"; font-size: 13px; }
-    pick-t1 := Text { visible: false; text: root.drop-focus-name != "" ? "松开发送给 " : (root.drop-slots.length > 0 ? "拖到头像上发送" + (root.drag-count > 0 ? " " + root.drag-count + " 项" : "") : "没有在线设备"); font-size: 13px; }
+    pick-t1 := Text { visible: false; text: root.drop-focus-name != "" ? "松开发送给 " : (root.drop-slots.length > 0 ? (Fx.touch ? "点头像发送" : "拖到头像上发送") + (root.drag-count > 0 ? " " + root.drag-count + " 项" : "") : (Fx.touch ? "没有在线设备，点空白处取消" : "没有在线设备")); font-size: 13px; }
     pick-t2 := Text { visible: false; text: root.drop-focus-name; font-size: 13px; font-weight: 600; }
     property <length> pick-hint-w: pick-t1.preferred-width + (root.drop-focus-name != "" ? pick-t2.preferred-width : 0px) + 32px;
     property <length> pick-hint-h: max(18px, pick-t1.preferred-height) + 14px;
-    property <length> pick-top: max(24px, (520px - (root.pick-hint-h + (root.drop-slots.length > 0 ? 22px + root.pick-ring-h : 0px))) / 2);
+    property <length> pick-top: max(24px, (root.ph - (root.pick-hint-h + (root.drop-slots.length > 0 ? 22px + root.pick-ring-h : 0px))) / 2);
 
     // ---------------- 窗口级：按下关闭弹层（不吞点击）、Esc ----------------
     /// 平台层在分发按下事件之前调用（窗口逻辑坐标）。点在弹层和它的开关按钮之外 → 关闭（旧版 window click）
@@ -2006,7 +2047,7 @@ export component PanelWindow inherits Window {
             }
         }
         // 附件按钮 / 表情按钮自己切换（旧版 stopPropagation）
-        let in-composer-btns = y >= 520px - root.shell-bw - 9px - 30px && y < 520px - root.shell-bw - 9px && x >= root.shell-bw + 66px + 6px && x < root.shell-bw + 66px + 6px + 30px + 2px + 30px;
+        let in-composer-btns = y >= root.ph - root.shell-bw - 9px - 30px && y < root.ph - root.shell-bw - 9px && x >= root.shell-bw + 66px + 6px && x < root.shell-bw + 66px + 6px + 30px + 2px + 30px;
         let on-emoji-btn = in-composer-btns && x < root.shell-bw + 66px + 6px + 30px;
         let on-attach-btn = in-composer-btns && x >= root.shell-bw + 66px + 6px + 32px;
         if root.attach-open && !on-attach-btn {

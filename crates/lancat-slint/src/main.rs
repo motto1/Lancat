@@ -5,6 +5,8 @@
 //! 正式版：与旧版共用数据目录 `<data>/app.lancat.desktop`（设备身份、聊天记录）、端口 47820、mDNS/UDP 发现。
 //! 旧版已归档，不能与旧版同时运行。测试实例用 LANCAT_DATA_DIR / LANCAT_PORT 另开。
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+// Android 构建（crates/lancat-android 把本文件当 cdylib 的根）用不到桌面入口和停靠相关的函数
+#![cfg_attr(target_os = "android", allow(dead_code, unused_imports))]
 
 slint::include_modules!();
 
@@ -36,6 +38,11 @@ mod toast_emoji;
 mod update;
 #[cfg(windows)]
 mod win;
+// Android：android_main、JNI 桥、系统通知；停靠接口是空实现（src/android）
+#[cfg(target_os = "android")]
+mod android;
+#[cfg(target_os = "android")]
+use android::dock;
 #[cfg(target_os = "linux")]
 mod wl;
 
@@ -205,7 +212,8 @@ pub(crate) fn time_fmt(secs: bool) -> &'static str {
     use std::sync::OnceLock;
     static H12: OnceLock<bool> = OnceLock::new();
     let h12 = *H12.get_or_init(|| {
-        if cfg!(windows) {
+        // Android：中文手机默认 24 小时制（没有 LANG 可读）
+        if cfg!(any(windows, target_os = "android")) {
             return false;
         }
         let loc = ["LC_ALL", "LC_TIME", "LANG"].iter().find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty())).unwrap_or_default();
@@ -1232,7 +1240,7 @@ impl App {
                 Some(f) if f != i => if i < f { -1.0 } else { 1.0 },
                 _ => 0.0,
             };
-            let sx = (360.0 - (in_row as f32 * 84.0 + (in_row as f32 - 1.0) * 6.0)) / 2.0 + j as f32 * 90.0 + shift * 22.0;
+            let sx = (ui.get_pw() - (in_row as f32 * 84.0 + (in_row as f32 - 1.0) * 6.0)) / 2.0 + j as f32 * 90.0 + shift * 22.0;
             let sy = y0 + row as f32 * 138.0;
             if x >= sx && x < sx + 84.0 && y >= sy && y < sy + 132.0 {
                 return slots.row_data(i).map(|s| s.key.to_string()).unwrap_or_default();
@@ -1339,7 +1347,9 @@ fn reveal(path: &str) {
         use std::os::windows::process::CommandExt;
         let _ = std::process::Command::new("explorer").raw_arg(format!("/select,\"{path}\"")).spawn();
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "android")]
+    android::jvm::open_file(path);
+    #[cfg(not(any(windows, target_os = "android")))]
     {
         let dir = std::path::Path::new(path).parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
@@ -1407,6 +1417,15 @@ static SYS_DARK: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(
 /// 读不到再看 GNOME 的 gsettings）。WebKitGTK 的 prefers-color-scheme 跟的也是它。
 #[cfg(not(windows))]
 pub(crate) fn system_dark() -> bool {
+    // Android：系统的深色模式（uiMode）
+    #[cfg(target_os = "android")]
+    return android::jvm::night_mode();
+    #[cfg(not(target_os = "android"))]
+    return linux_system_dark();
+}
+
+#[cfg(not(any(windows, target_os = "android")))]
+fn linux_system_dark() -> bool {
     use std::process::Command;
     if let Ok(o) = Command::new("gdbus")
         .args(["call", "--session", "--timeout", "1", "--dest", "org.freedesktop.portal.Desktop", "--object-path", "/org/freedesktop/portal/desktop", "--method", "org.freedesktop.portal.Settings.Read", "org.freedesktop.appearance", "color-scheme"])
@@ -1725,6 +1744,7 @@ fn fatal_dialog(msg: &str) {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn main() {
     let _ = t0();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,zbus=warn,tracing=warn")).init();

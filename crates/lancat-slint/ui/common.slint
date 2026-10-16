@@ -48,6 +48,8 @@ export global Fx {
     in-out property <bool> gtk;
     /// 默认字体族（Linux 由 src/metrics.rs 按旧版 WebKitGTK 的选择改写）
     in-out property <string> font: "Segoe UI Variable Text";
+    /// Android：触屏（铺满竖屏、长按代替右键、点外面关弹层；src/android）
+    in-out property <bool> touch;
     // 合成：0 = 普通单遍渲染；1 = 只画基底（活动层隐藏）；n ≥ 2 = 只画第 n 层（src/compose.rs）
     in-out property <int> pass: 0;
     in-out property <bool> a2;

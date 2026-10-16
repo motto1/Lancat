@@ -145,6 +145,8 @@ fn run_checks(node: &Node, wanted_port: u16) -> Diagnostics {
     checks.extend(windows_checks(port, wanted_port));
     #[cfg(target_os = "linux")]
     checks.extend(linux_checks(port));
+    #[cfg(target_os = "android")]
+    checks.extend(crate::android::diag_checks());
     checks.push(port_check(port, wanted_port));
     checks.push(recv_dir_check(node));
     checks.push(runtime_check(node));
@@ -247,6 +249,12 @@ pub async fn run_fix(id: String, dry_run: bool) -> Result<FixResult, String> {
         n.set_settings(s).map_err(|e| e.to_string())?;
         let d = refresh().await?;
         return Ok(FixResult { ok: true, dry_run: false, cancelled: false, message: "已恢复为默认接收目录".into(), commands, script: None, diagnostics: Some(d) });
+    }
+    #[cfg(target_os = "android")]
+    if let Some(message) = (!dry).then(|| crate::android::run_fix(&id)).flatten() {
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let d = refresh().await?;
+        return Ok(FixResult { ok: true, dry_run: false, cancelled: false, message, commands: vec![], script: None, diagnostics: Some(d) });
     }
     #[cfg(not(windows))]
     {
