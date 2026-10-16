@@ -45,6 +45,17 @@ jobs:
           sudo apt-get install -y clang libclang-dev
           cargo install cargo-ndk --locked --version 4.1.2
 
+      - name: debug-clang
+        shell: bash
+        run: |
+          N=$ANDROID_SDK_ROOT/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64
+          ls $N/lib | head -30
+          ls /usr/lib/llvm-*/lib/libclang* || true
+          printf '#include <stdint.h>\nuint8_t x;\n' > /tmp/t.h
+          clang -fsyntax-only --target=aarch64-none-elf -v /tmp/t.h 2>&1 | tail -15 || true
+          clang -fsyntax-only --target=x86_64-none-elf /tmp/t.h 2>&1 | tail -5 || true
+          clang -fsyntax-only --target=aarch64-none-elf --sysroot=$N/sysroot /tmp/t.h 2>&1 | tail -5 || true
+
       - name: 版本号
         shell: bash
         run: |
