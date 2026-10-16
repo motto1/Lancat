@@ -623,15 +623,14 @@ fn linux_checks(port: u16) -> Vec<Check> {
         "ufw：sudo ufw allow {port}/tcp && sudo ufw allow {port},5353/udp\nfirewalld：sudo firewall-cmd --permanent --add-port={port}/tcp --add-port={port}/udp --add-port=5353/udp && sudo firewall-cmd --reload"
     );
     let mut c = match run("firewall-cmd", &["--state"]) {
-        Some((true, s)) if s.contains("running") && !s.contains("not running") => match run("firewall-cmd", &["--list-ports"]) {
-            Some((true, ports)) if ports.split_whitespace().any(|p| p == format!("{port}/tcp")) => Check::new("firewall", "防火墙", "ok", format!("firewalld 已放行 {port}/tcp")),
-            Some((true, _)) => Check::new("firewall", "防火墙", "warn", format!("firewalld 正在运行，当前区域没有放行 {port}/tcp")),
-            _ => Check::new("firewall", "防火墙", "unknown", "firewalld 正在运行，无法读取放行端口"),
-        },
+        Some((true, s)) if s.contains("running") && !s.contains("not running") => firewalld_check(&run, port),
         _ => match run("ufw", &["status"]) {
             Some((true, s)) if s.contains("inactive") => Check::new("firewall", "防火墙", "ok", "ufw 未启用"),
-            Some((true, s)) if s.contains(&format!("{port}/tcp")) || s.contains(&format!("{port} ")) => Check::new("firewall", "防火墙", "ok", format!("ufw 已放行 {port}")),
-            Some((true, _)) => Check::new("firewall", "防火墙", "warn", format!("ufw 已启用，没有放行 {port}/tcp")),
+            Some((true, s)) => match (ufw_allows(&s, port, "tcp"), ufw_allows(&s, port, "udp")) {
+                (true, true) => Check::new("firewall", "防火墙", "ok", format!("ufw 已放行 {port}")),
+                (true, false) => Check::new("firewall", "防火墙", "warn", format!("ufw 已放行 {port}/tcp，但没有放行 {port}/udp，自动发现可能受影响")),
+                _ => Check::new("firewall", "防火墙", "warn", format!("ufw 已启用，没有放行 {port}/tcp")),
+            },
             // ufw needs root to read its status; nftables / iptables too
             _ => Check::new("firewall", "防火墙", "unknown", "无法读取防火墙状态（需要管理员权限）"),
         },
@@ -641,6 +640,127 @@ fn linux_checks(port: u16) -> Vec<Check> {
     let mut n = Check::new("network", "网络类型", "unknown", "Linux 没有公用/专用网络之分");
     n.help = Some("如果其他设备仍连不进来，检查路由器是否开启了 AP 隔离 / 访客网络".into());
     vec![c, n]
+}
+
+/// firewalld: look at every active zone (not just the default one), honour port ranges,
+/// services and zones whose target accepts everything.
+#[cfg(target_os = "linux")]
+fn firewalld_check(run: &dyn Fn(&str, &[&str]) -> Option<(bool, String)>, port: u16) -> Check {
+    // zone names are case sensitive (Fedora: FedoraWorkstation), so read them unlowercased
+    let raw = |args: &[&str]| -> Option<(bool, String)> {
+        let o = std::process::Command::new("firewall-cmd").args(args).output().ok()?;
+        Some((o.status.success(), String::from_utf8_lossy(&o.stdout).into_owned()))
+    };
+    let mut zones: Vec<String> = match raw(&["--get-active-zones"]) {
+        Some((true, s)) => s.lines().filter(|l| !l.starts_with(char::is_whitespace) && !l.trim().is_empty())
+            .filter_map(|l| l.split_whitespace().next().map(str::to_string)).collect(),
+        _ => vec![],
+    };
+    if zones.is_empty() {
+        if let Some((true, z)) = raw(&["--get-default-zone"]) {
+            zones.push(z.trim().to_string());
+        }
+    }
+    let (mut tcp, mut udp, mut read_any) = (false, false, false);
+    for z in &zones {
+        let zarg = format!("--zone={z}");
+        let Some((true, all)) = run("firewall-cmd", &[zarg.as_str(), "--list-all"]) else { continue };
+        read_any = true;
+        let info = parse_firewalld_zone(&all);
+        if z.eq_ignore_ascii_case("trusted") || info.target == "accept" {
+            return Check::new("firewall", "防火墙", "ok", format!("firewalld 区域 {z} 允许所有连接"));
+        }
+        let mut specs = info.ports.clone();
+        for svc in &info.services {
+            if let Some((true, si)) = run("firewall-cmd", &["--info-service", svc.as_str()]) {
+                specs.extend(parse_firewalld_zone(&si).ports);
+            }
+        }
+        tcp |= specs.iter().any(|p| port_spec_matches(p, port, "tcp"));
+        udp |= specs.iter().any(|p| port_spec_matches(p, port, "udp"));
+    }
+    match (read_any, tcp, udp) {
+        (false, ..) => Check::new("firewall", "防火墙", "unknown", "firewalld 正在运行，无法读取放行端口"),
+        (_, true, true) => Check::new("firewall", "防火墙", "ok", format!("firewalld 已放行 {port}")),
+        (_, true, false) => Check::new("firewall", "防火墙", "warn", format!("firewalld 已放行 {port}/tcp，但没有放行 {port}/udp，自动发现可能受影响")),
+        _ => Check::new("firewall", "防火墙", "warn", format!("firewalld 正在运行，当前区域没有放行 {port}/tcp")),
+    }
+}
+
+#[derive(Default)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct FwZone { target: String, ports: Vec<String>, services: Vec<String> }
+
+/// Parses `firewall-cmd --list-all` / `--info-service` output (already lowercased).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_firewalld_zone(s: &str) -> FwZone {
+    let mut z = FwZone::default();
+    for l in s.lines() {
+        let l = l.trim();
+        let field = |k: &str| l.strip_prefix(k).map(|v| v.split_whitespace().map(str::to_string).collect::<Vec<_>>());
+        if let Some(v) = l.strip_prefix("target:") {
+            z.target = v.trim().trim_matches('%').to_string();
+        } else if let Some(v) = field("ports:") {
+            z.ports = v;
+        } else if let Some(v) = field("services:") {
+            z.services = v;
+        }
+    }
+    z
+}
+
+/// `47820/tcp`, `1025-65535/tcp` (firewalld) or `47820:47829/tcp` (ufw).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn port_spec_matches(spec: &str, port: u16, proto: &str) -> bool {
+    let (range, p) = match spec.split_once('/') {
+        Some((r, p)) => (r, Some(p)),
+        None => (spec, None),
+    };
+    if p.is_some_and(|p| p != proto) {
+        return false;
+    }
+    let (a, b) = range.split_once(['-', ':']).unwrap_or((range, range));
+    matches!((a.trim().parse::<u16>(), b.trim().parse::<u16>()), (Ok(a), Ok(b)) if a <= port && port <= b)
+}
+
+/// ufw `status` output (lowercased): any ALLOW IN rule whose "to" column covers the port.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn ufw_allows(s: &str, port: u16, proto: &str) -> bool {
+    s.lines().filter(|l| l.contains("allow") && !l.contains("allow out")).any(|l| {
+        let to = l.split_whitespace().next().unwrap_or("");
+        to.split(',').any(|seg| {
+            // "47820,5353/udp" puts the protocol on the last segment only
+            let proto_tail = to.rsplit_once('/').map(|(_, p)| p);
+            let spec = match (seg.contains('/'), proto_tail) {
+                (false, Some(p)) => format!("{seg}/{p}"),
+                _ => seg.to_string(),
+            };
+            port_spec_matches(&spec, port, proto)
+        })
+    })
+}
+
+#[cfg(test)]
+mod fw_tests {
+    use super::*;
+    #[test]
+    fn firewalld_ranges() {
+        let z = parse_firewalld_zone("fedoraworkstation (default, active)\n  target: default\n  services: dhcpv6-client samba-client ssh\n  ports: 1025-65535/udp 1025-65535/tcp\n  protocols: \n");
+        assert_eq!(z.target, "default");
+        assert!(z.ports.iter().any(|p| port_spec_matches(p, 47820, "tcp")));
+        assert!(z.ports.iter().any(|p| port_spec_matches(p, 47820, "udp")));
+        assert!(!port_spec_matches("47820/udp", 47820, "tcp"));
+        assert!(!port_spec_matches("1-1024/tcp", 47820, "tcp"));
+        assert_eq!(parse_firewalld_zone("  target: %%reject%%").target, "reject");
+    }
+    #[test]
+    fn ufw_rules() {
+        let s = "status: active\n\nto                         action      from\n--                         ------      ----\n47820:47829/tcp            allow       anywhere\n47820,5353/udp             allow       anywhere\n";
+        assert!(ufw_allows(s, 47821, "tcp"));
+        assert!(ufw_allows(s, 47820, "udp"));
+        assert!(!ufw_allows(s, 47830, "tcp"));
+        assert!(ufw_allows("47820                      allow       anywhere", 47820, "tcp"));
+    }
 }
 
 // ------------------------------------------------------------------ macOS
