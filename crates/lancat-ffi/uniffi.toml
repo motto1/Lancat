@@ -1,0 +1,6 @@
+[bindings.kotlin]
+package_name = "fan.lancat.core.ffi"
+cdylib_name = "lancat_ffi"
+# Android: 用 android.system 的清理线程（API 26–32 没有 java.lang.ref.Cleaner），并加 @Keep 等注解
+android = true
+android_cleaner = true

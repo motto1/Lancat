@@ -1,0 +1,74 @@
+# 原生安卓版（android-native/：Kotlin + Jetpack Compose，Rust 核心经 UniFFI）。
+# 只在 android 分支推送或手动运行时编译，产物上传为 Actions artifact；不发布 Release、不影响桌面版 release.yml。
+name: android-native
+
+on:
+  push:
+    branches: [android]
+    paths:
+      - "android-native/**"
+      - "crates/lancat-core/**"
+      - "crates/lancat-ffi/**"
+      - ".github/workflows/android-native.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  NDK_VERSION: "27.2.12479018"
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Android SDK / NDK
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-37.0" "build-tools;36.0.0" "ndk;${NDK_VERSION}" "cmake;3.22.1"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/lancat-ffi
+
+      - name: cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Rust core (liblancat_ffi.so)
+        working-directory: crates/lancat-ffi
+        env:
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384"
+          CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384"
+          CARGO_TARGET_X86_64_LINUX_ANDROID_RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384"
+        run: cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 --platform 26 -o ../../android-native/core/src/main/jniLibs build --release --lib
+
+      - name: FFI smoke test (host, loopback only)
+        working-directory: crates/lancat-ffi
+        run: |
+          cargo build --release --manifest-path ../lancat-core/Cargo.toml --bin lancat-cli
+          LANCAT_CLI="$(cd ../.. && pwd)/target/release/lancat-cli" cargo test --test smoke_cli -- --nocapture
+
+      - name: Gradle (unit tests + release APK)
+        working-directory: android-native
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          chmod +x gradlew
+          ./gradlew --console=plain --no-daemon :model:test :sticker:testDebugUnitTest :app:testDebugUnitTest :app:assembleRelease
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Lancat-android-native
+          path: android-native/app/build/outputs/apk/release/*.apk

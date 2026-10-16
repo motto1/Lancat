@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Lancat</string>
+    <string name="share_label">用 Lancat 发送</string>
+    <string name="tile_label">Lancat 接收</string>
+    <string name="tile_on">常驻接收中</string>
+    <string name="tile_off">已关闭</string>
+
+    <string name="ch_msg">新消息</string>
+    <string name="ch_msg_desc">其他设备发来的文字和表情</string>
+    <string name="ch_xfer">文件传输</string>
+    <string name="ch_xfer_desc">发送和接收文件的进度与结果</string>
+    <string name="ch_svc">后台常驻</string>
+    <string name="ch_svc_desc">常驻接收或传输时保持运行的提示</string>
+
+    <string name="svc_keepalive_title">Lancat 正在后台接收</string>
+    <string name="svc_keepalive_text">局域网里的设备能发现本机，随时可以接收文件</string>
+    <string name="svc_transfer_title">Lancat 正在传输文件</string>
+    <string name="svc_action_stop_keepalive">关闭常驻</string>
+    <string name="svc_timeout_title">传输已暂停</string>
+    <string name="svc_timeout_text">系统限制后台传输每天最多 6 小时，打开 Lancat 后继续</string>
+
+    <string name="act_reply">回复</string>
+    <string name="act_reply_hint">回复…</string>
+    <string name="act_mark_read">标为已读</string>
+    <string name="act_pause">暂停</string>
+    <string name="act_resume">继续</string>
+    <string name="act_cancel">取消</string>
+    <string name="act_retry">重试</string>
+    <string name="act_open">打开</string>
+    <string name="act_reveal">在文件夹中显示</string>
+
+    <string name="share_nothing">没有可以发送的内容</string>
+    <string name="share_sending_to">正在发送给 %1$s</string>
+    <string name="share_sending">正在发送</string>
+    <string name="open_failed">没有可以打开这个文件的应用</string>
+    <string name="me">我</string>
+</resources>

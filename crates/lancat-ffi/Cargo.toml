@@ -1,0 +1,48 @@
+[package]
+name = "lancat-ffi"
+version = "0.2.8"
+edition = "2021"
+authors = ["Motto"]
+license = "GPL-3.0-only"
+description = "UniFFI bridge over lancat-core for the native Android app (Kotlin): same semantics as the Tauri commands"
+publish = false
+
+# 独立 workspace（和 lancat-slint / lancat-android 一样不动根 Cargo.toml / Cargo.lock）
+[workspace]
+
+[lib]
+name = "lancat_ffi"
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+# 生成 Kotlin 绑定（library 模式，读 .so/.dll 里的元数据）：cargo run --features bindgen --bin uniffi-bindgen -- generate ...
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+lancat-core = { path = "../lancat-core", default-features = false }
+uniffi = "0.32.2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+serde_json = "1"
+thiserror = "2"
+log = "0.4"
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+blake3 = "1"
+
+[profile.release]
+# 和桌面一致：体积优先，热点（blake3）用 O3。panic 保持 unwind：UniFFI 把 Rust panic 转成 Kotlin 异常而不是直接崩进程
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.release.package.blake3]
+opt-level = 3

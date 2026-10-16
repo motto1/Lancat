@@ -1,0 +1,57 @@
+# Lancat Android v2 版本清单（2026-10-16 上网核实的最新稳定版）
+#   AGP 9.4.1      dl.google.com maven-metadata（9.5 仍是 alpha）；AGP 9.4 要求 Gradle >= 9.6、JDK 17、build-tools 36.0.0，最高支持 API 37
+#   Gradle 9.8.1   services.gradle.org/versions/current
+#   Kotlin 2.4.21  Maven Central（2.5.0 还在 Beta）
+#   Compose BOM 2026.09.00（material3 1.4.0）
+#   compileSdk/targetSdk 37（Android 17，platforms;android-37.0 稳定）
+#   NDK：用本机已装的 27.2.12479018（r27 LTS；最新稳定是 30.0.16248370，AGP 9.4 默认 28.2.13676358；C 盘空间紧，暂不另装）
+#   UniFFI 0.32.2（crates.io，Rust 侧）、cargo-ndk 4.1.2
+[versions]
+agp = "9.4.1"
+kotlin = "2.4.21"
+compileSdk = "37"
+targetSdk = "37"
+minSdk = "26"
+ndk = "27.2.12479018"
+composeBom = "2026.09.00"
+coroutines = "1.11.0"
+roborazzi = "1.76.0"
+robolectric = "4.17"
+junit = "4.13.2"
+activityCompose = "1.13.0"
+coreKtx = "1.19.1"
+lifecycle = "2.11.0"
+jna = "5.19.1"
+uniffi = "0.32.2"
+
+[libraries]
+kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
+kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
+kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines" }
+androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }
+androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activityCompose" }
+androidx-lifecycle-runtime-ktx = { module = "androidx.lifecycle:lifecycle-runtime-ktx", version.ref = "lifecycle" }
+androidx-lifecycle-runtime-compose = { module = "androidx.lifecycle:lifecycle-runtime-compose", version.ref = "lifecycle" }
+androidx-lifecycle-viewmodel-compose = { module = "androidx.lifecycle:lifecycle-viewmodel-compose", version.ref = "lifecycle" }
+compose-bom = { module = "androidx.compose:compose-bom", version.ref = "composeBom" }
+compose-ui = { module = "androidx.compose.ui:ui" }
+compose-ui-graphics = { module = "androidx.compose.ui:ui-graphics" }
+compose-ui-tooling = { module = "androidx.compose.ui:ui-tooling" }
+compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling-preview" }
+compose-ui-test-junit4 = { module = "androidx.compose.ui:ui-test-junit4" }
+compose-ui-test-manifest = { module = "androidx.compose.ui:ui-test-manifest" }
+compose-foundation = { module = "androidx.compose.foundation:foundation" }
+compose-material3 = { module = "androidx.compose.material3:material3" }
+jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
+junit = { module = "junit:junit", version.ref = "junit" }
+robolectric = { module = "org.robolectric:robolectric", version.ref = "robolectric" }
+roborazzi = { module = "io.github.takahirom.roborazzi:roborazzi", version.ref = "roborazzi" }
+roborazzi-compose = { module = "io.github.takahirom.roborazzi:roborazzi-compose", version.ref = "roborazzi" }
+roborazzi-junit-rule = { module = "io.github.takahirom.roborazzi:roborazzi-junit-rule", version.ref = "roborazzi" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+android-library = { id = "com.android.library", version.ref = "agp" }
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+roborazzi = { id = "io.github.takahirom.roborazzi", version.ref = "roborazzi" }

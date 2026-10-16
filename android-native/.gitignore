@@ -1,0 +1,10 @@
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+/core/src/main/jniLibs/
+/core/build/
+/logs/
+.cxx/
+.kotlin/

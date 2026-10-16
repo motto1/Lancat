@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 没有静态快捷方式，只声明 share-target：动态快捷方式（最近 4 台设备）带这个 category 时出现在系统分享面板的 Direct Share 行 -->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <share-target android:targetClass="fan.lancat.share.ShareActivity">
+        <data android:mimeType="*/*" />
+        <category android:name="fan.lancat.category.SHARE_TARGET" />
+    </share-target>
+</shortcuts>

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<lint>
+    <!-- 占位源码集只在 :core/:ui 未就绪时参与编译 -->
+    <issue id="UnusedResources" severity="informational" />
+    <!-- 旧工程沿用的 applicationId/签名，不上架 Play，不需要 Play 相关检查卡住 -->
+    <issue id="OldTargetApi" severity="informational" />
+    <issue id="GradleDependency" severity="informational" />
+    <issue id="NewerVersionAvailable" severity="ignore" />
+</lint>
