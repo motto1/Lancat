@@ -10,6 +10,7 @@ def lancatCode = (System.getenv("LANCAT_VERSION_CODE") ?: "207").toInteger()
 android {
     namespace "app.lancat"
     compileSdk 35
+    buildToolsVersion "35.0.0"
 
     defaultConfig {
         applicationId "app.lancat"

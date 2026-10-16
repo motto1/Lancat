@@ -59,10 +59,10 @@ jobs:
           # Slint 的构建脚本要用 android.jar 编它的 Java 辅助类；cargo-ndk 设了 ANDROID_PLATFORM=26，
           # 不显式给的话会去找没装的 platforms/android-26
           ANDROID_JAR: ${{ env.ANDROID_SDK_ROOT }}/platforms/android-35/android.jar
-          # thorvg-sys 交叉编译时给 bindgen 的是 --target=<arch>-none-elf（不认 NDK 的 sysroot），
-          # 要显式把 bionic 的头文件目录加进来，否则找不到 stdint.h
-          BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android: -isystem ${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include -isystem ${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/aarch64-linux-android
-          BINDGEN_EXTRA_CLANG_ARGS_x86_64_linux_android: -isystem ${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include -isystem ${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include/x86_64-linux-android
+          # thorvg-sys 交叉编译时给 bindgen 的是 --target=<arch>-none-elf，系统 libclang 按裸机解析找不到
+          # bionic 的 stdint.h。环境变量里的参数排在最后，用真正的 Android 三元组 + NDK sysroot 盖掉它
+          BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android: --target=aarch64-linux-android26 --sysroot=${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/sysroot
+          BINDGEN_EXTRA_CLANG_ARGS_x86_64_linux_android: --target=x86_64-linux-android26 --sysroot=${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/sysroot
         run: cargo ndk -t arm64-v8a -t x86_64 --platform 26 -o ../../android/app/src/main/jniLibs build --release --locked
 
       - name: 打包 APK
