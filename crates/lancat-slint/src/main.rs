@@ -31,6 +31,10 @@ mod lottie;
 mod settings_ui;
 mod sound;
 mod morph;
+#[cfg(windows)]
+mod clip_win;
+mod paste;
+mod thumbs;
 mod spring;
 mod toast_emoji;
 mod update;
@@ -597,6 +601,16 @@ impl App {
         if m.kind == "file" {
             let p = self.progress.get(&m.id).copied();
             file_item(m, &mut it, p.as_ref());
+            // 收发完成的图片：直接显示（缩略图还没解好时先显示文件卡片，解好后 refresh_image 刷新这一行）
+            let path = s(&m.body, "path");
+            if m.status == "done" && !path.is_empty() && thumbs::is_image_name(&s(&m.body, "name")) {
+                if let Some((img, w, h)) = thumbs::get(&path, self.scale()) {
+                    it.kind = "image".into();
+                    it.img = img;
+                    it.img_w = w;
+                    it.img_h = h;
+                }
+            }
         } else if let Some(e) = self.sticker_of(m) {
             it.kind = "sticker".into();
             it.text = if e.alt.is_empty() { "🙂".into() } else { e.alt.clone().into() };
@@ -1044,6 +1058,16 @@ impl App {
                     reveal(&p);
                 }
             }
+            "open" => {
+                if let Some(m) = self.msgs.iter().find(|m| m.id == id) {
+                    let p = s(&m.body, "path");
+                    if std::path::Path::new(&p).is_file() {
+                        open_file(&p);
+                    } else {
+                        self.flash("文件已被移动或删除");
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1160,6 +1184,7 @@ impl App {
                         if !app.visible {
                             log::info!("panel hidden for keep-alive period: releasing caches");
                             app.emoji.release();
+                            thumbs::release();
                             #[cfg(windows)]
                             win::trim_working_set();
                         }
@@ -1263,6 +1288,27 @@ impl App {
         ui.window().request_redraw();
     }
 
+    /// 图片缩略图解好了（src/thumbs.rs）：刷新用到这个文件的消息行
+    pub(crate) fn refresh_image(&mut self, path: &str) {
+        let mut any = false;
+        for i in 0..self.msgs.len() {
+            if self.msgs[i].kind == "file" && s(&self.msgs[i].body, "path") == path {
+                self.refresh_row(i);
+                any = true;
+            }
+        }
+        // 行变高了：贴着底部时跟到底
+        if any && self.stick {
+            self.scroll_to_end();
+        }
+    }
+
+    /// Ctrl+V 粘贴的文件 / 图片（src/paste.rs）：发给当前会话
+    pub(crate) fn paste_files(&mut self, files: Vec<String>) {
+        let targets = self.targets();
+        self.send_files(targets, files, false);
+    }
+
     fn drop_files(&mut self, files: Vec<String>, pos: Option<(f32, f32)>) {
         let key = match pos {
             Some((x, y)) => self.drop_hit(x, y),
@@ -1328,6 +1374,38 @@ impl App {
             sc.diag_changed(d);
         }
     }
+}
+
+/// 用系统默认程序打开文件（会话里点图片）
+fn open_file(path: &str) {
+    // ShellExecute 而不是 cmd /c start：文件名里的 & ^ % 之类不会被 cmd 解释
+    #[cfg(windows)]
+    {
+        let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        std::thread::spawn(move || unsafe {
+            use windows::core::{w, PCWSTR};
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED | windows::Win32::System::Com::COINIT_DISABLE_OLE1DDE);
+            windows::Win32::UI::Shell::ShellExecuteW(None, w!("open"), PCWSTR(wide.as_ptr()), PCWSTR::null(), PCWSTR::null(), windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL);
+        });
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
+}
+
+/// 自动更新：现在换版本会不会打扰用户（面板开着、有传输、输入框有草稿、开着设置或文件对话框）
+pub(crate) fn update_busy() -> bool {
+    with_app(|app| {
+        app.visible
+            || app.dialog_open
+            || app.settings.as_ref().is_some_and(|s| s.is_open())
+            // 30 s 内还有进度 = 有传输在跑（暂停 / 中断的会留着进度，不能只看有没有）
+            || app.progress.values().any(|p| p.at.elapsed() < Duration::from_secs(30))
+            || app.msgs.iter().chain(app.cache.values().flat_map(|(v, _)| v.iter())).any(|m| m.status == "transferring" || m.status == "receiving")
+            || app.ui().is_some_and(|u| !u.get_draft().trim().is_empty())
+    })
+    .unwrap_or(true)
 }
 
 fn reveal(path: &str) {

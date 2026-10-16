@@ -25,7 +25,7 @@ export struct PeerItem {
 export struct MsgItem {
     id: string,
     outgoing: bool,
-    kind: string,       // text | sticker | file
+    kind: string,       // text | sticker | file | image（收发完成的图片文件，img 是缩略图）
     text: string,
     status: string,
     first: bool,        // 组首条（尾角 5px，上边距 8px）
@@ -46,6 +46,9 @@ export struct MsgItem {
     paused: bool,
     act1: string,       // pause | play | retry | ""
     act2: string,       // cancel | reveal | ""
+    img: image,
+    img-w: length,
+    img-h: length,
 }
 
 export struct EmojiCell {
@@ -488,7 +491,7 @@ component MessageRow inherits Rectangle {
     property <length> sep-lh: Fx.lb(10.5px, root.m.sep, 12.67px);
     property <length> sep-h: 10px + root.sep-lh + 6px;
     property <length> top: (m.sep != "" ? sep-h : 0px) + (m.first ? 8px : 2px);
-    property <length> nat-w: m.kind == "sticker" ? 160px : (m.kind == "file" ? 210px : min(mw.preferred-width + 20px, root.avail * 0.78));
+    property <length> nat-w: m.kind == "sticker" ? 160px : m.kind == "image" ? min(m.img-w, root.avail * 0.78) : (m.kind == "file" ? 210px : min(mw.preferred-width + 20px, root.avail * 0.78));
     // 行高：旧版 line-height 1.38（13px → 17.94px/行）。Slint 的行高取字体自身的度量（首行 l1、之后每行 l2-l1），
     // 按行数换算成 1.38 的总高度，文字在里面居中（单行与旧版逐像素一致，多行每行差 ≤1px）
     in property <length> l1: 18px;
@@ -498,7 +501,8 @@ component MessageRow inherits Rectangle {
     property <float> lhf: root.lhv / max(1px, root.l1);
     property <int> lines: max(1, round(txt.preferred-height / root.k / root.lhv));
     property <length> text-h: root.lines * root.lhv;
-    property <length> nat-h: m.kind == "sticker" ? 160px : (m.kind == "file" ? fc.h : root.text-h + 12px);
+    // 图片很宽时按可用宽度等比缩（缩略图像素按原尺寸做好，略缩一点无妨）
+    property <length> nat-h: m.kind == "sticker" ? 160px : m.kind == "image" ? m.img-h * root.nat-w / max(1px, m.img-w) : (m.kind == "file" ? fc.h : root.text-h + 12px);
     height: top + nat-h;
     // 缩放中心 = 行（不含时间分隔）中心
     property <length> cx: root.width / 2;
@@ -532,7 +536,7 @@ component MessageRow inherits Rectangle {
         vertical-alignment: center;
     }
     // 状态小图标（发出的文字/贴纸）：行右侧，气泡左边 4px，底部 margin 2
-    if m.outgoing && m.kind != "file": StateIcon {
+    if m.outgoing && m.kind != "file" && m.kind != "image": StateIcon {
         k: root.k;
         status: root.m.status;
         x: root.bx - 4px * root.k - self.width;
@@ -586,6 +590,30 @@ component MessageRow inherits Rectangle {
         TipArea {
             tip: root.m.text;
             changed has-hover => { root.sticker-hover(root.m.id, self.has-hover); }
+        }
+    }
+    if m.kind == "image": Rectangle {
+        x: root.bx;
+        y: root.by;
+        width: root.nat-w * root.k;
+        height: root.nat-h * root.k;
+        // 圆角已裁在像素里（软件渲染器的 clip 不带圆角）
+        Image {
+            width: parent.width;
+            height: parent.height;
+            source: root.m.img;
+            image-fit: fill;
+        }
+        Rectangle {
+            border-radius: 12px * root.k;
+            border-width: 1phx;
+            border-color: Theme.glass-border;
+            background: ita.pressed ? #00000014 : (ita.has-hover ? #ffffff0d : transparent);
+        }
+        ita := TipArea {
+            tip: root.m.fname;
+            mouse-cursor: pointer;
+            clicked => { root.action(root.m.id, "open"); }
         }
     }
     fc := FileCard {
@@ -1117,8 +1145,10 @@ export component PanelWindow inherits Window {
 
     property <length> shell-bw: root.frame > 0 ? Fx.hair : 0px;
     // ---------------- 基底 ----------------
+    // 合成遍里隐藏用 opacity 0（整棵子树直接跳过，和 visible:false 一样省），不用 visible：Slint 1.18 的焦点
+    // 可见性跟踪会在渲染时（ensure_tree_instantiated）看到「不可见」而夺走输入框 / 搜索框的焦点（toast 时丢焦点、打断输入法）
     Rectangle {
-        visible: Fx.base();
+        opacity: Fx.base() ? 1 : 0;
         // Linux 外壳：圆角 14、.5px glass-border、--shadow + inset 顶部高光
         if root.frame > 0: Rectangle {
             x: root.frame;
@@ -1150,7 +1180,7 @@ export component PanelWindow inherits Window {
         animate dk { duration: 320ms; easing: cubic-bezier(0.2, 0.9, 0.3, 1); }
         content := Rectangle {
             // 拖拽时的 scale(.97) 交给合成层 10（位图缩放，和浏览器的 transform 一样不重新排版）
-            visible: Fx.layer(10);
+            opacity: Fx.layer(10) ? 1 : 0;
             // Linux 外壳 .5px 边框（画成 1 设备像素）占布局：内容缩进一圈（border-box）
             x: (360px - self.width) / 2;
             y: (520px - self.height) / 2;
@@ -1803,10 +1833,20 @@ export component PanelWindow inherits Window {
         }
         // ---------------- 弹出层（顺序 = 合成顺序；Fx.layer(id)：普通渲染 / 基底遍 / 本层遍） ----------------
         // 表情面板：left/right 6，输入栏上方 6，高 288
+        // 合成遍里用 opacity 0 隐藏（面板里有搜索框，见上面基底的注释）。外面套一层把阴影外扩也框进来：
+        // 子元素画到 opacity 元素矩形外面的部分（阴影）在 Slint 的脏区跟踪里每切一次 pass 都算变了，
+        // 增量探测就永远有脏区 → 合成一直整帧重画（toast 时会闪）
+        Rectangle {
+            property <length> m: Fx.shadow-margin("glass");
+            visible: root.emoji-open;
+            opacity: Fx.layer(2) ? 1 : 0;
+            x: root.ep-x - self.m;
+            y: root.ep-y - self.m;
+            width: root.ep-w + 2 * self.m;
+            height: 288px + 2 * self.m;
         ep := EmojiPanel {
-            visible: root.emoji-open && Fx.layer(2);
-            x: root.ep-x;
-            y: root.ep-y;
+            x: parent.m;
+            y: parent.m;
             width: root.ep-w;
             height: 288px;
             sections: root.emoji-sections;
@@ -1825,6 +1865,7 @@ export component PanelWindow inherits Window {
             import => { root.emoji-import(); }
             close => { root.emoji-open = false; root.emoji-toggled(false); }
             cols-changed(c) => { root.emoji-cols-changed(c); }
+        }
         }
         // 附件菜单：按钮左对齐、底边在按钮上方 6px；min-w 120 padding 4 r9
         if root.attach-open: Rectangle {

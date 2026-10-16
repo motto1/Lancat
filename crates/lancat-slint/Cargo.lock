@@ -2369,6 +2369,9 @@ checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
 dependencies = [
  "bytemuck",
  "byteorder-lite",
+ "color_quant",
+ "gif",
+ "image-webp",
  "moxcms",
  "num-traits",
  "png",
@@ -2633,7 +2636,7 @@ dependencies = [
 
 [[package]]
 name = "lancat-core"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "anyhow",
  "axum",
@@ -2657,16 +2660,18 @@ dependencies = [
 
 [[package]]
 name = "lancat-slint"
-version = "0.2.7"
+version = "0.2.8"
 dependencies = [
  "chrono",
  "dirs",
  "env_logger",
  "flate2",
  "i-slint-core",
+ "image",
  "ksni",
  "lancat-core",
  "log",
+ "png",
  "serde_json",
  "sha2",
  "slint",

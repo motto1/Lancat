@@ -48,8 +48,9 @@ use smithay_client_toolkit::{
     },
     data_device_manager::{
         data_device::{DataDevice, DataDeviceData, DataDeviceHandler},
-        data_offer::{DataOfferHandler, DragOffer},
-        DataDeviceManagerState,
+        data_offer::{DataOfferHandler, DragOffer, SelectionOffer},
+        data_source::{CopyPasteSource, DataSourceHandler},
+        DataDeviceManagerState, WritePipe,
     },
     shell::{
         wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure},
@@ -63,7 +64,7 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     globals::{registry_queue_init, GlobalList},
-    protocol::{wl_data_device::WlDataDevice, wl_data_device_manager::DndAction, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    protocol::{wl_data_device::WlDataDevice, wl_data_device_manager::DndAction, wl_data_source::WlDataSource, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
     Connection, EventQueue, QueueHandle,
 };
 use wayland_protocols::wp::text_input::zv3::client::{
@@ -117,6 +118,8 @@ pub enum Cmd {
     TopAct(TopAct),
     /// 消息 toast 的 layer surface（src/toast_wl.rs）：Some = 显示 / 移动，None = 销毁
     Toast(Option<ToastPlace>),
+    /// 复制：把文字放到剪贴板（wl_data_source + set_selection）
+    SetClip(String),
 }
 
 /// toast 的 layer surface：贴输出左上角、按 margin 定位（与旧版 linux_toast 的 set_layer_shell_margin 相同），
@@ -394,6 +397,10 @@ struct State {
     seat: Option<wl_seat::WlSeat>,
     /// 最近一次在普通窗口上按下：窗口 id + serial（xdg move / 窗口菜单要用）
     top_press: Option<(usize, u32)>,
+    /// 最近一次输入（按键 / 指针按下）的 serial：set_selection 要用
+    last_serial: u32,
+    /// 我们放到剪贴板上的数据源（被别人的复制取代时 cancelled）
+    clip_src: Option<CopyPasteSource>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     kb_on_panel: bool,
     repeat: Option<(u32, u32)>,
@@ -561,6 +568,7 @@ fn bind_ti(globals: &GlobalList, qh: &QueueHandle<State>) -> Option<ZwpTextInput
 impl WlPlatform {
     pub fn new() -> Result<Self, String> {
         let conn = Connection::connect_to_env().map_err(|e| e.to_string())?;
+        CLIP.with(|c| c.borrow_mut().conn = Some(conn.clone()));
         let (globals, mut queue) = registry_queue_init::<State>(&conn).map_err(|e| e.to_string())?;
         let qh = queue.handle();
         let compositor = CompositorState::bind(&globals, &qh).map_err(|e| format!("wl_compositor: {e}"))?;
@@ -608,6 +616,8 @@ impl WlPlatform {
             ti_top: None,
             ddm,
             data_device: None,
+            last_serial: 0,
+            clip_src: None,
             dnd_on: None,
             dnd_gen: 0,
             dnd_drop: None,
@@ -753,6 +763,20 @@ impl slint::platform::Platform for WlPlatform {
         }
         let _ = &self.conn;
         Ok(())
+    }
+
+    fn set_clipboard_text(&self, text: &str, clipboard: slint::platform::Clipboard) {
+        if clipboard == slint::platform::Clipboard::DefaultClipboard {
+            CLIP.with(|c| c.borrow_mut().own = Some(text.to_string()));
+            push(Cmd::SetClip(text.to_string()));
+        }
+    }
+
+    fn clipboard_text(&self, clipboard: slint::platform::Clipboard) -> Option<String> {
+        if clipboard != slint::platform::Clipboard::DefaultClipboard {
+            return None;
+        }
+        clipboard_text()
     }
 
     fn new_event_loop_proxy(&self) -> Option<Box<dyn slint::platform::EventLoopProxy>> {
@@ -1080,6 +1104,13 @@ impl State {
                         t.layer.commit();
                     }
                 }
+            }
+            Cmd::SetClip(text) => {
+                let (Some(m), Some(dd)) = (self.ddm.as_ref(), self.data_device.as_ref()) else { return };
+                let src = m.create_copy_paste_source(&self.qh, TEXT_MIMES);
+                src.set_selection(dd, self.last_serial);
+                CLIP.with(|c| c.borrow_mut().own = Some(text));
+                self.clip_src = Some(src);
             }
             Cmd::Toast(None) => {
                 self.toast = None;
@@ -1677,7 +1708,11 @@ impl DataDeviceHandler for State {
             crate::dock::wl_drag_motion(x as f32, y as f32);
         }
     }
-    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+    fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, dd: &WlDataDevice) {
+        // 剪贴板换了内容（或键盘焦点进来时告知当前内容）：记下来，Ctrl+V 时同步去读
+        let offer = wayland_client::Proxy::data::<DataDeviceData>(dd).and_then(|d| d.selection_offer());
+        CLIP.with(|c| c.borrow_mut().offer = offer);
+    }
     fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, dd: &WlDataDevice) {
         let Some(panel) = self.dnd_on.take() else { return };
         let Some(offer) = wayland_client::Proxy::data::<DataDeviceData>(dd).and_then(|d| d.drag_offer()) else { return };
@@ -1694,6 +1729,122 @@ impl DataDeviceHandler for State {
             }
         }
     }
+}
+
+// ------------------------------------------------------------------ clipboard (wl_data_device selection)
+
+/// 我们提供 / 优先读取的文字类型
+const TEXT_MIMES: [&str; 5] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "TEXT", "STRING"];
+
+#[derive(Default)]
+struct Clip {
+    conn: Option<Connection>,
+    /// 当前剪贴板（别人或我们自己）的 offer
+    offer: Option<SelectionOffer>,
+    /// 我们自己复制的文字（clip_src 还有效时）：粘贴自己复制的不走管道
+    own: Option<String>,
+}
+
+thread_local! {
+    static CLIP: RefCell<Clip> = RefCell::new(Clip::default());
+}
+
+/// 同步读剪贴板的一种类型：发 receive → flush → 后台线程读管道，最多等 `timeout`
+/// （对方卡住时不拖死界面；我们自己的数据走 Clip.own，不会在这里等自己）
+fn clip_read(offer: &SelectionOffer, mime: &str, timeout: Duration) -> Option<Vec<u8>> {
+    let pipe = offer.receive(mime.to_string()).map_err(|e| log::warn!("clipboard: receive {mime}: {e}")).ok()?;
+    CLIP.with(|c| c.borrow().conn.as_ref().map(|c| c.flush()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut pipe = pipe;
+        let mut v = Vec::new();
+        let r = std::io::Read::read_to_end(&mut pipe, &mut v);
+        let _ = tx.send(r.ok().map(|_| v));
+    });
+    rx.recv_timeout(timeout).map_err(|_| log::warn!("clipboard: {mime} timed out")).ok().flatten()
+}
+
+fn clip_offer() -> Option<SelectionOffer> {
+    CLIP.with(|c| c.borrow().offer.clone())
+}
+
+fn clip_mimes(offer: &SelectionOffer) -> Vec<String> {
+    offer.with_mime_types(|m| m.to_vec())
+}
+
+/// 剪贴板里的文字（Slint 的 Ctrl+V）
+fn clipboard_text() -> Option<String> {
+    if let Some(t) = CLIP.with(|c| c.borrow().own.clone()) {
+        return Some(t);
+    }
+    let offer = clip_offer()?;
+    let mimes = clip_mimes(&offer);
+    let mime = TEXT_MIMES.iter().find(|t| mimes.iter().any(|m| m == *t))?;
+    let bytes = clip_read(&offer, mime, Duration::from_millis(1500))?;
+    let s = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
+    Some(s)
+}
+
+/// Ctrl+V 在输入框里：剪贴板是文件 → 发文件；只有图片 → 存 PNG 发送。返回 true = 已处理（不再交给 Slint 粘贴文字）
+fn paste_special() -> bool {
+    if CLIP.with(|c| c.borrow().own.is_some()) {
+        return false;
+    }
+    let Some(offer) = clip_offer() else { return false };
+    let mimes = clip_mimes(&offer);
+    log::debug!("paste: clipboard types {mimes:?}");
+    let has = |t: &str| mimes.iter().any(|m| m == t);
+    // 文件管理器里复制的文件（Nautilus / Dolphin / Thunar 都给 text/uri-list；GNOME 另给 x-special/gnome-copied-files）
+    for t in [URI_LIST, "x-special/gnome-copied-files", "x-special/KDE-copied-files"] {
+        if !has(t) {
+            continue;
+        }
+        if let Some(b) = clip_read(&offer, t, Duration::from_millis(1500)) {
+            let files: Vec<String> = parse_uri_list(&String::from_utf8_lossy(&b)).into_iter().filter(|p| std::path::Path::new(p).exists()).collect();
+            if !files.is_empty() {
+                crate::paste::send_files(files);
+                return true;
+            }
+        }
+    }
+    // 有文字就粘贴文字（Office / LibreOffice 复制文字时也附带一张位图）
+    if TEXT_MIMES.iter().any(|t| has(t)) {
+        return false;
+    }
+    let img = ["image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp", "image/avif"].into_iter().find(|t| has(t)).or_else(|| mimes.iter().map(String::as_str).find(|m| crate::paste::image_ext(m).is_some()));
+    let Some(mime) = img else { return false };
+    let Some(ext) = crate::paste::image_ext(mime) else { return false };
+    let Some(bytes) = clip_read(&offer, mime, Duration::from_secs(5)).filter(|b| !b.is_empty()) else { return true };
+    if let Some(path) = crate::paste::save_image(&bytes, ext) {
+        crate::paste::send_files(vec![path]);
+    }
+    true
+}
+
+impl DataSourceHandler for State {
+    fn accept_mime(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, _: Option<String>) {}
+    fn send_request(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource, _mime: String, fd: WritePipe) {
+        if self.clip_src.as_ref().map(|s| s.inner()) != Some(source) {
+            return;
+        }
+        let Some(text) = CLIP.with(|c| c.borrow().own.clone()) else { return };
+        // 后台写：对方读得慢时不卡界面
+        std::thread::spawn(move || {
+            let mut fd = fd;
+            let _ = std::io::Write::write_all(&mut fd, text.as_bytes());
+        });
+    }
+    fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource) {
+        if self.clip_src.as_ref().map(|s| s.inner()) == Some(source) {
+            self.clip_src = None;
+            CLIP.with(|c| c.borrow_mut().own = None);
+        } else {
+            source.destroy();
+        }
+    }
+    fn dnd_dropped(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
+    fn dnd_finished(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
+    fn action(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource, _: DndAction) {}
 }
 
 impl DataOfferHandler for State {
@@ -1968,7 +2119,8 @@ impl PointerHandler for State {
                     crate::note_pointer(false, -1000.0, -1000.0, false);
                     w.window.dispatch_event(WindowEvent::PointerExited);
                 }
-                PointerEventKind::Press { button: b, .. } => {
+                PointerEventKind::Press { button: b, serial, .. } => {
+                    self.last_serial = serial;
                     crate::dock::wl_panel_press(true);
                     // 点在弹层外：先关弹层（旧版 window click），这次点击照常分发
                     crate::pointer_down(position.x, position.y);
@@ -2009,6 +2161,7 @@ impl State {
             }
             PointerEventKind::Press { button: b, serial, .. } => {
                 self.top_press = Some((id, serial));
+                self.last_serial = serial;
                 w.window.dispatch_event(WindowEvent::PointerPressed { position, button: button(b) })
             }
             PointerEventKind::Release { button: b, .. } => w.window.dispatch_event(WindowEvent::PointerReleased { position, button: button(b) }),
@@ -2156,8 +2309,15 @@ impl KeyboardHandler for State {
         }
         crate::dock::wl_panel_keyboard(false);
     }
-    fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, _: u32, ev: KeyEvent) {
+    fn press_key(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_keyboard::WlKeyboard, serial: u32, ev: KeyEvent) {
+        self.last_serial = serial;
         let Some(w) = self.kb_window() else { return };
+        // Ctrl+V 在输入框里：剪贴板是文件 / 图片就直接发送（文字照常交给输入框）
+        if self.kb_on_panel && self.ctrl_down() && matches!(ev.keysym, Keysym::v | Keysym::V) && crate::paste::composer_focused() && paste_special() {
+            REPEAT.with(|r| *r.borrow_mut() = None);
+            REPEAT_RUN.with(|r| *r.borrow_mut() = None);
+            return;
+        }
         if self.kb_on_panel && ev.keysym == Keysym::Escape {
             // 窗口级 Esc（旧版 Panel.svelte onKey + 表情面板的捕获）
             crate::escape_key();

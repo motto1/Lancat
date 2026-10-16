@@ -525,7 +525,12 @@ fn wire(w: &SettingsWindow) {
     w.on_check_update(|| crate::update::check_bg(true));
     w.on_do_update(crate::update::install_bg);
     w.on_open_release(crate::update::open_release_page);
-    w.on_toggle_auto_update(|| ctl(|sc| sc.update(|s| s.auto_update = !s.auto_update)));
+    w.on_toggle_auto_update(|| {
+        ctl(|sc| sc.update(|s| s.auto_update = !s.auto_update));
+        if let Some(on) = with_app(|app| app.node.settings().auto_update) {
+            crate::update::auto_changed(on);
+        }
+    });
     w.on_toggle_message_sound(|| {
         ctl(|sc| sc.update(|s| s.message_sound = !s.message_sound));
         // 打开时试听一下

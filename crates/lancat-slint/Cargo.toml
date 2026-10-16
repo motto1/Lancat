@@ -1,6 +1,6 @@
 [package]
 name = "lancat-slint"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 authors = ["Motto"]
 license = "GPL-3.0-only"
@@ -24,6 +24,9 @@ thorvg-sys = { version = "=0.3.2", default-features = false, features = ["vendor
 flate2 = "1"
 # 一键更新：校验下载的新版（发布里的 SHA256SUMS）
 sha2 = { version = "0.10", default-features = false }
+png = "0.18"
+# 会话里直接显示图片（缩略图解码，src/thumbs.rs）
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

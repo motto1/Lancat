@@ -100,6 +100,16 @@ fn panel() -> Option<Rc<Win32Window>> {
     PANEL.with(|p| p.borrow().upgrade())
 }
 
+/// 剪贴板的所有者窗口（EmptyClipboard 要一个窗口，NULL 时 SetClipboardData 会失败）
+fn clip_owner() -> isize {
+    WINDOWS.with(|w| w.borrow().iter().find(|(_, w)| w.strong_count() > 0).map(|(k, _)| *k).unwrap_or(0))
+}
+
+thread_local! {
+    /// 上一次 Ctrl+V 是否当作文件 / 图片发送了（按住重复时沿用，不重复发送）
+    static PASTE_SPECIAL: Cell<bool> = const { Cell::new(false) };
+}
+
 fn window_for(h: HWND) -> Option<Rc<Win32Window>> {
     WINDOWS.with(|w| w.borrow().iter().find(|(k, _)| *k == h.0 as isize).and_then(|(_, w)| w.upgrade()))
 }
@@ -160,6 +170,19 @@ impl slint::platform::Platform for Win32Platform {
                 return Ok(());
             }
         }
+    }
+
+    fn set_clipboard_text(&self, text: &str, clipboard: slint::platform::Clipboard) {
+        if clipboard == slint::platform::Clipboard::DefaultClipboard {
+            crate::clip_win::set_text(clip_owner(), text);
+        }
+    }
+
+    fn clipboard_text(&self, clipboard: slint::platform::Clipboard) -> Option<String> {
+        if clipboard != slint::platform::Clipboard::DefaultClipboard {
+            return None;
+        }
+        crate::clip_win::text(clip_owner())
     }
 
     fn new_event_loop_proxy(&self) -> Option<Box<dyn slint::platform::EventLoopProxy>> {
@@ -733,6 +756,14 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             // Ctrl+letter (copy/paste/select-all): WM_CHAR delivers control codes, send the letter
             let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
             if ctrl && (0x41..=0x5a).contains(&vk.0) {
+                // Ctrl+V 在输入框里：剪贴板是文件 / 图片就直接发送（文字照常交给输入框）；按住不放的重复不再发一遍
+                if down && vk.0 == 0x56 && !w.normal && crate::paste::composer_focused() {
+                    let special = if repeat { PASTE_SPECIAL.with(|c| c.get()) } else { crate::clip_win::paste_special(h.0 as isize) };
+                    PASTE_SPECIAL.with(|c| c.set(special));
+                    if special {
+                        return LRESULT(0);
+                    }
+                }
                 let c = char::from_u32(vk.0 as u32 + 32).unwrap_or('a');
                 w.key(c.to_string().into(), down, repeat);
                 return LRESULT(0);

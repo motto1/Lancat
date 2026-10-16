@@ -1201,15 +1201,15 @@ export component SettingsWindow inherits Window {
                 title: "更新";
                 Row {
                     label: root.upd-text;
-                    if root.upd-state == "available": VerticalLayout { alignment: center; Btn { text: "更新说明"; clicked => { root.open-release(); } } }
+                    if root.upd-state == "available" || root.upd-state == "ready": VerticalLayout { alignment: center; Btn { text: "更新说明"; clicked => { root.open-release(); } } }
                     VerticalLayout {
                         alignment: center;
                         Btn {
-                            text: root.upd-state == "available" ? "立即更新" : root.upd-state == "checking" ? "检查中…" : root.upd-state == "downloading" ? "正在更新…" : "检查更新";
-                            primary: root.upd-state == "available";
+                            text: root.upd-state == "available" ? "立即更新" : root.upd-state == "ready" ? "立即安装" : root.upd-state == "checking" ? "检查中…" : root.upd-state == "downloading" ? "正在更新…" : "检查更新";
+                            primary: root.upd-state == "available" || root.upd-state == "ready";
                             enabled: root.upd-state != "checking" && root.upd-state != "downloading";
                             clicked => {
-                                if root.upd-state == "available" {
+                                if root.upd-state == "available" || root.upd-state == "ready" {
                                     root.do-update();
                                 } else {
                                     root.check-update();
@@ -1219,7 +1219,7 @@ export component SettingsWindow inherits Window {
                     }
                 }
                 Row {
-                    label: "自动检查更新（每 6 小时，有新版本时提醒）";
+                    label: "自动更新（启动时和每 6 小时检查，空闲时自动安装）";
                     last: true;
                     VerticalLayout { alignment: center; Switch { on: root.auto-update; toggled => { root.toggle-auto-update(); } } }
                 }
