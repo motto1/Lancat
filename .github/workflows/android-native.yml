@@ -29,6 +29,8 @@ jobs:
           java-version: "21"
 
       - uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools"   # 默认的 "tools" 包已从仓库下架，会让这一步失败
 
       - name: Android SDK / NDK
         run: |
@@ -58,8 +60,8 @@ jobs:
       - name: FFI smoke test (host, loopback only)
         working-directory: crates/lancat-ffi
         run: |
-          cargo build --release --manifest-path ../lancat-core/Cargo.toml --bin lancat-cli
-          LANCAT_CLI="$(cd ../.. && pwd)/target/release/lancat-cli" cargo test --test smoke_cli -- --nocapture
+          cargo build --manifest-path ../lancat-core/Cargo.toml --bin lancat-cli
+          LANCAT_CLI="$(cd ../.. && pwd)/target/debug/lancat-cli" cargo test --test smoke_cli -- --nocapture
 
       - name: Gradle (unit tests + release APK)
         working-directory: android-native
