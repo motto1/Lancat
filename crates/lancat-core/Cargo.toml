@@ -9,8 +9,6 @@ description = "Lancat core: LAN discovery (mDNS + UDP), transport (axum HTTP/Web
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "fs", "io-util", "io-std", "signal", "process"] }
 axum = { version = "0.8", features = ["ws"] }
-# same major as axum's ws support, so only one tungstenite is linked
-tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 futures-util = { version = "0.3", features = ["sink"] }
 reqwest = { version = "0.13", default-features = false, features = ["stream"] }
 mdns-sd = "0.21"
@@ -26,6 +24,16 @@ hostname = "0.4"
 anyhow = "1"
 log = "0.4"
 env_logger = { version = "0.11", default-features = false, features = ["humantime"], optional = true }
+
+# same major as axum's ws support, so only one tungstenite is linked.
+# wss:// (public tunnels): desktop uses the system TLS (native-tls); Android uses rustls + ring with the
+# webpki roots (no OpenSSL to cross-compile, no system TLS API reachable from native code).
+[target.'cfg(not(target_os = "android"))'.dependencies]
+tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }

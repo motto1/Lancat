@@ -36,8 +36,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 jni = "0.21"
 ndk-context = "0.1"
 android_logger = "0.15"
-# lancat-core 的公网连接用 native-tls：Android 上是 OpenSSL，源码编进来（不依赖系统库）
-openssl = { version = "0.10", features = ["vendored"] }
 
 [build-dependencies]
 slint-build = "=1.18.1"
