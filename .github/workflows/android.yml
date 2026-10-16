@@ -45,17 +45,6 @@ jobs:
           sudo apt-get install -y clang libclang-dev
           cargo install cargo-ndk --locked --version 4.1.2
 
-      - name: debug-clang
-        shell: bash
-        run: |
-          N=$ANDROID_SDK_ROOT/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64
-          ls $N/lib | head -30
-          ls /usr/lib/llvm-*/lib/libclang* || true
-          printf '#include <stdint.h>\nuint8_t x;\n' > /tmp/t.h
-          clang -fsyntax-only --target=aarch64-none-elf -v /tmp/t.h 2>&1 | tail -15 || true
-          clang -fsyntax-only --target=x86_64-none-elf /tmp/t.h 2>&1 | tail -5 || true
-          clang -fsyntax-only --target=aarch64-none-elf --sysroot=$N/sysroot /tmp/t.h 2>&1 | tail -5 || true
-
       - name: 版本号
         shell: bash
         run: |
@@ -70,11 +59,13 @@ jobs:
           # Slint 的构建脚本要用 android.jar 编它的 Java 辅助类；cargo-ndk 设了 ANDROID_PLATFORM=26，
           # 不显式给的话会去找没装的 platforms/android-26
           ANDROID_JAR: ${{ env.ANDROID_SDK_ROOT }}/platforms/android-35/android.jar
-          # thorvg-sys 交叉编译时给 bindgen 的是 --target=<arch>-none-elf，系统 libclang 按裸机解析找不到
-          # bionic 的 stdint.h。环境变量里的参数排在最后，用真正的 Android 三元组 + NDK sysroot 盖掉它
-          BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android: --target=aarch64-linux-android26 --sysroot=${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/sysroot
-          BINDGEN_EXTRA_CLANG_ARGS_x86_64_linux_android: --target=x86_64-linux-android26 --sysroot=${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/sysroot
-        run: cargo ndk -t arm64-v8a -t x86_64 --platform 26 -o ../../android/app/src/main/jniLibs build --release --locked
+        # thorvg-sys 交叉编译时给 bindgen 的是 --target=<arch>-none-elf：Ubuntu 的 libclang 会把 clang 自带的
+        # stdint.h 转到 /usr/include（glibc）上而失败。按独立环境（freestanding）解析就只用 clang 自带的 stdint.h，
+        # 和 Windows 上的结果一样。bindgen 先读带连字符的变量名，cargo-ndk 只设下划线那个，所以这里不会被覆盖。
+        run: |
+          env 'BINDGEN_EXTRA_CLANG_ARGS_aarch64-linux-android=-ffreestanding' \
+              'BINDGEN_EXTRA_CLANG_ARGS_x86_64-linux-android=-ffreestanding' \
+            cargo ndk -t arm64-v8a -t x86_64 --platform 26 -o ../../android/app/src/main/jniLibs build --release --locked
 
       - name: 打包 APK
         working-directory: android
