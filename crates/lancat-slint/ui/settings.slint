@@ -819,7 +819,9 @@ export component SettingsWindow inherits Window {
     out property <length> view-h: fl.height;
     out property <length> content-h: fl.content-height;
     // 正在编辑：滑块按着 / 输入框有焦点 —— 这时不拿保存回来的设置覆盖界面（旧值回写会让滑块跳回去）
-    out property <bool> editing: s1.dragging || s2.dragging || s3.dragging || s4.dragging || s5.dragging || f-name.focused || f-mb.focused || f-ips.focused;
+    // 停靠区的滑块在 if !Fx.touch 里（外面拿不到它们的 id）：拖动状态由滑块自己报上来
+    property <bool> sliding;
+    out property <bool> editing: root.sliding || f-name.focused || f-mb.focused || f-ips.focused;
 
     callback save();                  // 文本/滑块类：防抖保存
     callback save-now();
@@ -956,12 +958,12 @@ export component SettingsWindow inherits Window {
                 }
                 Row {
                     label: "位置";
-                    VerticalLayout { alignment: center; s1 := Slider { minimum: 0; maximum: 1; step: 0.01; value <=> root.dock-offset; changed => { root.save(); } } }
+                    VerticalLayout { alignment: center; s1 := Slider { changed dragging => { root.sliding = self.dragging; } minimum: 0; maximum: 1; step: 0.01; value <=> root.dock-offset; changed => { root.save(); } } }
                     Em { text: round(root.dock-offset * 100) + "%"; }
                 }
                 Row {
                     label: "隐藏条长度";
-                    VerticalLayout { alignment: center; s2 := Slider { minimum: 60; maximum: 800; step: 10; value <=> root.dock-length; changed => { root.save(); } } }
+                    VerticalLayout { alignment: center; s2 := Slider { changed dragging => { root.sliding = self.dragging; } minimum: 60; maximum: 800; step: 10; value <=> root.dock-length; changed => { root.save(); } } }
                     Em { text: round(root.dock-length) + "px"; }
                 }
                 if root.monitors.length > 1: Row {
@@ -1004,19 +1006,19 @@ export component SettingsWindow inherits Window {
                 }
                 Row {
                     label: "悬停弹出延迟";
-                    VerticalLayout { alignment: center; s3 := Slider { minimum: 0; maximum: 800; step: 10; value <=> root.hover-delay; changed => { root.save(); } } }
+                    VerticalLayout { alignment: center; s3 := Slider { changed dragging => { root.sliding = self.dragging; } minimum: 0; maximum: 800; step: 10; value <=> root.hover-delay; changed => { root.save(); } } }
                     Em { text: round(root.hover-delay) + "ms"; }
                 }
                 Row {
                     label: "离开后收起延迟";
-                    VerticalLayout { alignment: center; s4 := Slider { minimum: 0; maximum: 5000; step: 50; value <=> root.collapse-delay; changed => { root.save(); } } }
+                    VerticalLayout { alignment: center; s4 := Slider { changed dragging => { root.sliding = self.dragging; } minimum: 0; maximum: 5000; step: 50; value <=> root.collapse-delay; changed => { root.save(); } } }
                     Em { text: round(root.collapse-delay) + "ms"; }
                 }
                 Row {
                     label: "收起后释放面板";
                     // 后面还有 .note：不是 :last-child，Linux 上照样有底线（Windows 按 1.5x 截图保持原样）
                     last: !Fx.gtk;
-                    VerticalLayout { alignment: center; s5 := Slider { minimum: 0; maximum: 7200; step: 60; value <=> root.keep-alive; changed => { root.save(); } } }
+                    VerticalLayout { alignment: center; s5 := Slider { changed dragging => { root.sliding = self.dragging; } minimum: 0; maximum: 7200; step: 60; value <=> root.keep-alive; changed => { root.save(); } } }
                     Em { text: root.keep-alive == 0 ? "常驻" : (root.keep-alive < 60 ? round(root.keep-alive) + "s" : round(root.keep-alive / 60) + " 分钟"); }
                 }
                 Note { text: "面板收起几秒后会先冻结（不占 CPU，内存交还系统），再次弹出几乎是瞬间；超过这个时间才彻底释放界面，下次弹出要重新构建。设为 0 表示永不释放。"; }

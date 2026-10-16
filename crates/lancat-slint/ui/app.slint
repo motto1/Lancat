@@ -256,8 +256,9 @@ component SidebarItem inherits Rectangle {
     animate k { duration: 160ms; easing: cubic-bezier(0.2, 0.9, 0.3, 1.4); }
     // Android：长按 = 右键菜单（抬起时不再当作点击）
     property <bool> long-fired;
-    if Fx.touch && !root.all && ta.pressed && !root.long-fired: Timer {
+    Timer {
         interval: 550ms;
+        running: Fx.touch && !root.all && ta.pressed && !root.long-fired;
         triggered => {
             root.long-fired = true;
             root.menu(ta.mouse-x, ta.mouse-y);
