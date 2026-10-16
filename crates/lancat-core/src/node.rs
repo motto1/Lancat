@@ -25,6 +25,9 @@ pub struct NodeConfig {
     pub port: u16,
     /// UDP discovery port (probes / replies / bye).
     pub udp_port: u16,
+    /// Fall back to another TCP port when `port` is taken by some other program (off when the
+    /// port was pinned with LANCAT_PORT / --port).
+    pub port_fallback: bool,
     pub enable_mdns: bool,
     pub enable_udp: bool,
     /// Overrides the display name (e.g. LANCAT_NAME for a second local instance).
@@ -49,6 +52,7 @@ impl NodeConfig {
             data_dir: data_dir.into(),
             port: DEFAULT_PORT,
             udp_port: DEFAULT_PORT,
+            port_fallback: true,
             enable_mdns: true,
             enable_udp: true,
             name_override: None,
@@ -68,6 +72,7 @@ impl NodeConfig {
         }
         if let Some(p) = env("LANCAT_PORT").and_then(|p| p.parse().ok()) {
             self.port = p;
+            self.port_fallback = false;
         }
         if let Some(p) = env("LANCAT_UDP_PORT").and_then(|p| p.parse().ok()) {
             self.udp_port = p;
@@ -229,9 +234,7 @@ impl Node {
             .or_else(|| Some(settings.device_name.clone()).filter(|n| !n.is_empty()))
             .unwrap_or_else(netutil::host_name);
 
-        let listener = tokio::net::TcpListener::bind(SocketAddr::new(cfg.bind_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), cfg.port))
-            .await
-            .with_context(|| format!("bind TCP port {}", cfg.port))?;
+        let listener = bind_tcp(&store, &cfg).await?;
         let port = listener.local_addr()?.port();
 
         let me = DeviceInfo { id, name, os: netutil::os_name().into(), ver: env!("CARGO_PKG_VERSION").into(), port };
@@ -809,9 +812,13 @@ impl Node {
 
     /// Manually add a peer by "ip:port" (or "ip", default port) — for networks that block multicast/broadcast.
     pub async fn add_peer_addr(self: &Arc<Self>, addr: &str) -> Result<PeerView> {
-        let sa: SocketAddr = match addr.parse() {
-            Ok(sa) => sa,
-            Err(_) => SocketAddr::new(addr.parse::<IpAddr>().map_err(|_| anyhow!("无效地址: {addr}"))?, DEFAULT_PORT),
+        // a bare IP: the default port, then the fallback ports a Lancat moves to when 47820 is taken
+        let (sa, ports): (SocketAddr, Vec<u16>) = match addr.parse::<SocketAddr>() {
+            Ok(sa) => (sa, vec![sa.port()]),
+            Err(_) => {
+                let ip = addr.parse::<IpAddr>().map_err(|_| anyhow!("无效地址: {addr}"))?;
+                (SocketAddr::new(ip, DEFAULT_PORT), (0..10).filter_map(|i| DEFAULT_PORT.checked_add(i)).collect())
+            }
         };
         // Any address the user typed is allowed (KDE Connect's rule for custom devices): it may
         // be an overlay on a public block (Hamachi 25.x) or a routed subnet. From then on its
@@ -819,14 +826,28 @@ impl Node {
         if sa.ip().is_unspecified() || sa.ip().is_multicast() {
             bail!("无效地址: {addr}");
         }
-        let resp = self
-            .http
-            .get(format!("http://{}/info", fmt_sa(&sa)))
-            .header(HEADER_DEVICE_ID, self.me().id)
-            .timeout(Duration::from_secs(4))
-            .send()
-            .await?
-            .error_for_status()?;
+        let mut last = None;
+        let mut found = None;
+        for (i, p) in ports.iter().enumerate() {
+            let t = SocketAddr::new(sa.ip(), *p);
+            let r = self
+                .http
+                .get(format!("http://{}/info", fmt_sa(&t)))
+                .header(HEADER_DEVICE_ID, self.me().id)
+                .timeout(Duration::from_secs(if i == 0 { 4 } else { 2 }))
+                .send()
+                .await;
+            match r {
+                Ok(r) => {
+                    found = Some(r.error_for_status()?);
+                    break;
+                }
+                // only "nothing listens here" moves on to the next port
+                Err(e) if e.is_connect() && i + 1 < ports.len() => last = Some(e),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let Some(resp) = found else { return Err(last.map(anyhow::Error::from).unwrap_or_else(|| anyhow!("连接失败: {addr}"))) };
         let info: DeviceInfo = json_body(resp).await?;
         if info.id == self.me().id {
             bail!("这是本机");
@@ -1249,4 +1270,66 @@ pub(crate) fn fmt_sa(sa: &SocketAddr) -> String {
 pub(crate) async fn json_body<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> Result<T> {
     let b = resp.bytes().await?;
     Ok(serde_json::from_slice(&b)?)
+}
+
+/// Binds the HTTP/WS listener. The preferred port first; if something else holds it (another
+/// program, or a Windows Hyper-V/WSL reserved range), the port remembered from last time, then
+/// the next nine. Peers learn the real port from the UDP beacon / mDNS, so nobody has to change
+/// a setting. A port held by another Lancat is still an error: that one should be used instead.
+async fn bind_tcp(store: &Store, cfg: &NodeConfig) -> Result<tokio::net::TcpListener> {
+    let ip = cfg.bind_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let first = match tokio::net::TcpListener::bind(SocketAddr::new(ip, cfg.port)).await {
+        Ok(l) => {
+            // the preferred port works again: forget the fallback
+            if store.kv_get("tcp_port").ok().flatten().is_some_and(|p| !p.is_empty()) {
+                let _ = store.kv_set("tcp_port", "");
+            }
+            return Ok(l);
+        }
+        Err(e) => e,
+    };
+    // 10013 (Hyper-V / WSL reserved range): nothing listens there, skip the probe
+    if !cfg.port_fallback || (first.kind() != std::io::ErrorKind::PermissionDenied && lancat_on_port(ip, cfg.port).await) {
+        return Err(anyhow::Error::new(first).context(format!("bind TCP port {}", cfg.port)));
+    }
+    let remembered = store.kv_get("tcp_port").ok().flatten().and_then(|p| p.parse::<u16>().ok());
+    let mut tried = vec![cfg.port];
+    for p in remembered.into_iter().chain((1..=9).filter_map(|i| cfg.port.checked_add(i))) {
+        if tried.contains(&p) || p == 0 {
+            continue;
+        }
+        tried.push(p);
+        if let Ok(l) = tokio::net::TcpListener::bind(SocketAddr::new(ip, p)).await {
+            log::warn!("TCP port {} unavailable ({first}); using {p}", cfg.port);
+            let _ = store.kv_set("tcp_port", &p.to_string());
+            return Ok(l);
+        }
+    }
+    // reserved ranges are often 100 ports wide: let the OS pick one (peers learn it from beacons)
+    if let Ok(l) = tokio::net::TcpListener::bind(SocketAddr::new(ip, 0)).await {
+        if let Ok(a) = l.local_addr() {
+            log::warn!("TCP ports {tried:?} unavailable ({first}); using OS-assigned {}", a.port());
+            let _ = store.kv_set("tcp_port", &a.port().to_string());
+        }
+        return Ok(l);
+    }
+    Err(anyhow::Error::new(first).context(format!("bind TCP port {} (also tried {:?})", cfg.port, &tried[1..])))
+}
+
+/// Might the program on 127.0.0.1:port be a Lancat? Only a clear "no" allows the fallback: a
+/// Lancat that is still starting (accepts but does not answer yet) must not get a twin on the
+/// same database.
+async fn lancat_on_port(bind: IpAddr, port: u16) -> bool {
+    let host = match bind {
+        IpAddr::V4(a) if a.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(a) if a.is_unspecified() => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        a => a,
+    };
+    let Ok(c) = reqwest::Client::builder().no_proxy().timeout(Duration::from_millis(1500)).build() else { return true };
+    match c.get(format!("http://{}/info", fmt_sa(&SocketAddr::new(host, port)))).send().await {
+        Ok(r) if r.status().is_success() => r.bytes().await.map_or(true, |b| serde_json::from_slice::<DeviceInfo>(&b).is_ok()),
+        Ok(_) => false,
+        Err(e) if e.is_connect() => false,
+        Err(_) => true,
+    }
 }

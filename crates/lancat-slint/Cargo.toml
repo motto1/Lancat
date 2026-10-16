@@ -1,6 +1,6 @@
 [package]
 name = "lancat-slint"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 authors = ["Motto"]
 license = "GPL-3.0-only"

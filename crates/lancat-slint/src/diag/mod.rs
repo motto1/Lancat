@@ -144,7 +144,7 @@ fn run_checks(node: &Node, wanted_port: u16) -> Diagnostics {
     #[cfg(windows)]
     checks.extend(windows_checks(port, wanted_port));
     #[cfg(target_os = "linux")]
-    checks.extend(linux_checks(wanted_port));
+    checks.extend(linux_checks(port));
     checks.push(port_check(port, wanted_port));
     checks.push(recv_dir_check(node));
     checks.push(runtime_check(node));
@@ -255,7 +255,8 @@ pub async fn run_fix(id: String, dry_run: bool) -> Result<FixResult, String> {
     }
     #[cfg(windows)]
     {
-    let plan = tokio::task::spawn_blocking(move || windows_fix_plan(&id, wanted)).await.map_err(|e| e.to_string())??;
+    let actual = n.port();
+    let plan = tokio::task::spawn_blocking(move || windows_fix_plan(&id, wanted, actual)).await.map_err(|e| e.to_string())??;
     if dry {
         return Ok(FixResult { ok: true, dry_run: true, cancelled: false, message: "预览：以下命令会在一次管理员授权（UAC）后执行，现在不会做任何修改".into(), commands: plan.commands, script: Some(plan.script), diagnostics: None });
     }
@@ -292,11 +293,11 @@ fn port_check(port: u16, wanted: u16) -> Check {
     let mut c = Check::new(
         "port",
         "服务端口",
-        "error",
-        format!("端口 {wanted} 被{}占用，本程序改用了随机端口 {port}", owner.as_deref().map(|o| format!("「{o}」")).unwrap_or_else(|| "其他程序".into())),
+        "warn",
+        format!("端口 {wanted} 被{}占用，本程序改用了备用端口 {port}", owner.as_deref().map(|o| format!("「{o}」")).unwrap_or_else(|| "其他程序".into())),
     );
     c.inbound = true;
-    c.detail.push("其他设备按默认端口找不到本机，防火墙放行规则也对不上这个随机端口".into());
+    c.detail.push("局域网里的其他设备会通过发现广播自动用这个端口连过来；手动填地址或做端口转发时要写这个端口".into());
     if owner.as_deref().is_some_and(|o| o.to_lowercase().contains("lancat")) {
         c.detail.push("占用者看起来是另一个 Lancat（例如开发版或命令行版）".into());
     }
@@ -559,9 +560,11 @@ fn psq(s: &str) -> String {
 }
 
 #[cfg(windows)]
-fn windows_fix_plan(id: &str, wanted: u16) -> Result<FixPlan, String> {
+fn windows_fix_plan(id: &str, wanted: u16, actual: u16) -> Result<FixPlan, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?.to_string_lossy().to_string();
     let port = if wanted == 0 { lancat_core::protocol::DEFAULT_PORT } else { wanted };
+    // TCP may have fallen back to another port (47820 taken by some other program)
+    let tcp_ports = if actual != 0 && actual != port { format!("{port},{actual}") } else { port.to_string() };
     match id {
         "firewall" => {
             // same rules as the installer (src-tauri/windows/hooks.nsh): delete every rule for this
@@ -574,7 +577,7 @@ fn windows_fix_plan(id: &str, wanted: u16) -> Result<FixPlan, String> {
             for r in &stale {
                 steps.push((format!("advfirewall firewall delete rule name=\"{}\" program=\"{}\"", r.name, r.app), false));
             }
-            steps.push((format!("advfirewall firewall add rule name=\"Lancat\" dir=in action=allow program=\"{exe}\" protocol=TCP localport={port} profile=any"), true));
+            steps.push((format!("advfirewall firewall add rule name=\"Lancat\" dir=in action=allow program=\"{exe}\" protocol=TCP localport={tcp_ports} profile=any"), true));
             steps.push((format!("advfirewall firewall add rule name=\"Lancat\" dir=in action=allow program=\"{exe}\" protocol=UDP localport={port},5353 profile=any"), true));
             let commands = steps.iter().map(|(a, _)| format!("netsh {a}")).collect();
             // Start-Process passes the argument string verbatim (PowerShell's own native-argument

@@ -157,6 +157,7 @@ async fn offline_messages_are_queued_and_flushed() {
     // restart B with the same data dir (same identity) and port
     let mut cfg = NodeConfig::new(tb.path().join("data"));
     cfg.port = b_port;
+    cfg.port_fallback = false;
     cfg.enable_mdns = false;
     cfg.enable_udp = false;
     cfg.recv_dir_override = Some(tb.path().join("recv"));

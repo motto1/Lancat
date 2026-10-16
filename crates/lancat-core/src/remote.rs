@@ -56,7 +56,8 @@ pub fn remote_ws_url(addr: &str) -> Option<String> {
             return None;
         }
         if let Ok(sa) = a.parse::<std::net::SocketAddr>() {
-            if sa.port() == DEFAULT_PORT {
+            // 47820..=47829: a Lancat that moved off a taken port, still a LAN address
+            if (DEFAULT_PORT..=DEFAULT_PORT.saturating_add(9)).contains(&sa.port()) {
                 return None;
             }
             return Some(format!("ws://{a}/ws"));
@@ -477,6 +478,7 @@ mod tests {
         let tg = tempfile::tempdir().unwrap();
         let mut cfg = NodeConfig::new(th.path().join("data"));
         cfg.port = port;
+        cfg.port_fallback = false;
         cfg.enable_mdns = false;
         cfg.enable_udp = false;
         cfg.name_override = Some("host".into());

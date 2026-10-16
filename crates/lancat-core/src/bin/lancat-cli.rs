@@ -95,6 +95,7 @@ fn config(a: &Args, default_data: PathBuf) -> NodeConfig {
     let mut cfg = NodeConfig::new(a.data.clone().unwrap_or(default_data));
     cfg.port = a.port;
     cfg.udp_port = a.udp_port;
+    cfg.port_fallback = false;
     cfg.extra_probe_targets = a.probes.clone();
     cfg.enable_mdns = a.mdns;
     cfg.enable_udp = a.udp;

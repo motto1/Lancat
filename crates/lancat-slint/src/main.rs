@@ -1762,7 +1762,9 @@ fn main() {
             // 以前这里直接 panic：双击后什么都不发生。现在告诉用户原因
             let e = format!("{e:#}");
             log::error!("start lancat node: {e}");
-            let msg = if e.contains("bind TCP port") {
+            let msg = if e.contains("also tried") {
+                format!("Lancat 无法启动：找不到可用的端口（{wanted_port} 和备用端口都打不开）。\n\n可以在命令行运行 netstat -ano | findstr {wanted_port} 查看是哪个程序占用了端口。\n\n详细信息：{e}")
+            } else if e.contains("bind TCP port") {
                 format!("Lancat 无法启动：端口 {wanted_port} 已被占用。\n\n多半是另一个 Lancat（比如旧版）还在运行。请先在托盘图标上右键退出它，再打开这个版本。\n\n详细信息：{e}")
             } else {
                 format!("Lancat 无法启动。\n\n详细信息：{e}")

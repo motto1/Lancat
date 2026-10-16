@@ -59,7 +59,13 @@ pub(crate) fn start(node: Arc<Node>) {
         }
     }
     if node.cfg.enable_udp {
-        match udp_socket(node.cfg.udp_port) {
+        // Port taken exclusively by something else: a random port still sends probes and gets the
+        // replies (they go back to the source port); we just miss others' broadcasts, mDNS covers that.
+        let sock = udp_socket(node.cfg.udp_port).or_else(|e| {
+            log::warn!("UDP port {} unavailable ({e}); probing from a random port", node.cfg.udp_port);
+            udp_socket(0)
+        });
+        match sock {
             Ok(sock) => {
                 let sock = Arc::new(sock);
                 let _ = node.udp.set(sock.clone());
