@@ -349,6 +349,11 @@ pub fn on_hover_end() {
 }
 
 #[allow(dead_code)] // 托盘（下一步）用
+/// 当前停靠条 / 面板的位置（还没布局好时 None）
+pub fn geo() -> Option<Geo> {
+    with(|d| d.geo).flatten()
+}
+
 pub fn is_visible() -> bool {
     with(|d| d.visible).unwrap_or(false)
 }
@@ -751,6 +756,10 @@ fn tick() {
         }
         if !d.visible {
             let next = if near { POLL_NEAR_MS } else { POLL_FAR_MS };
+            // 悬停在停靠条上（150 ms 后打开）或拖着东西靠近：后台先截好展开要用的背景
+            if (in_dock && !d.hover_disarmed && !toast::shown()) || (near && down) {
+                morph::prefetch(geo.dock, geo.panel, geo.scale);
+            }
             if !in_dock {
                 d.hover_since = None;
                 d.hover_disarmed = false;

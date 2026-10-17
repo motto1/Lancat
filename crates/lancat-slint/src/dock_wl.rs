@@ -583,6 +583,10 @@ pub fn wl_strip_pointer(inside: bool) {
         !d.hover_disarmed && !probe
     });
     if act == Some(true) {
+        // hover_delay 之后才打开：趁这段时间先截好面板背后的屏幕（打开变形不用再等截图）
+        if let Some(Some((_, panel))) = with(|d| compute(d)) {
+            wl::push(Cmd::Prefetch(panel));
+        }
         let delay = with(|d| d.node.settings().hover_delay_ms).unwrap_or(150);
         with(|d| d.hover_timer.start(slint::TimerMode::SingleShot, Duration::from_millis(delay), || open_panel("hover")));
     }

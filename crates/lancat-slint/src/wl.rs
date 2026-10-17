@@ -120,6 +120,8 @@ pub enum Cmd {
     Toast(Option<ToastPlace>),
     /// 复制：把文字放到剪贴板（wl_data_source + set_selection）
     SetClip(String),
+    /// 光标进了停靠条（hover_delay 后要打开）：先把这块面板背后的屏幕截好，打开时不用再等截图
+    Prefetch(Place),
 }
 
 /// toast 的 layer surface：贴输出左上角、按 margin 定位（与旧版 linux_toast 的 set_layer_shell_margin 相同），
@@ -399,6 +401,8 @@ struct PanelSurf {
     egl: Option<crate::gl::Surf>,
     gsnap: Option<crate::gl::GTex>,
     gglass: Option<crate::gl::GTex>,
+    /// 当前设置的输入区域：Some(true) = 卡片，Some(false) = 空（收起中，点击穿透）
+    input: Option<bool>,
 }
 
 struct StripSurf {
@@ -491,6 +495,8 @@ struct State {
     screencopy: Option<ZwlrScreencopyManagerV1>,
     cap: Option<Cap>,
     cap_gen: u64,
+    /// 预取好的背景：面板位置、截的时间、模糊后的像素（面板 surface 物理 px）
+    pre: Option<(Place, Instant, Vec<Bgra>)>,
     cap_pool: Option<SlotPool>,
 }
 
@@ -505,7 +511,14 @@ struct Cap {
     /// 要的尺寸（面板 surface 物理 px）
     out: (usize, usize),
     t0: Instant,
+    /// 预取（面板还没建）：结果放进 State.pre，不给面板
+    pre: Option<Place>,
+    /// 分数缩放的输出：截的是整个输出，这里是要的那块（输出内逻辑坐标 x, y, w, h，输出逻辑尺寸 ow, oh）
+    crop: Option<(i32, i32, i32, i32, i32, i32)>,
 }
+
+/// 预取的背景（已模糊）多久内还能用
+const PRE_TTL: Duration = Duration::from_millis(1500);
 
 /// 打开变形最多等背景截图这么久
 const CAP_WAIT: Duration = Duration::from_millis(120);
@@ -685,6 +698,7 @@ impl WlPlatform {
             screencopy,
             cap: None,
             cap_gen: 0,
+            pre: None,
             cap_pool: None,
         };
         // 一次往返：拿到输出信息（dock 算位置要用）和 seat 能力
@@ -748,11 +762,44 @@ impl slint::platform::Platform for WlPlatform {
         // GPU（EGL + GLES 3）：设置已经读过了（render::init 在建面板之前），这里按设置建上下文；失败自动用 wl_shm
         let disp = self.conn.backend().display_ptr() as *mut std::ffi::c_void;
         if crate::render::wanted() {
-            crate::gl::init(disp);
+            crate::gl::init_async(disp);
         }
+        // 上下文丢了之后什么时候重建（先当场退回 wl_shm，画面不断）
+        let mut rebuild_at: Option<Instant> = None;
+        let mut lost_n = 0u32;
+        let mut lost_last: Option<Instant> = None;
         loop {
             if let Some(cpu) = RENDER_SWITCH.with(|r| r.take()) {
+                rebuild_at = None;
                 state.switch_render(cpu, disp);
+            }
+            if crate::gl::poll_async() {
+                state.reset_surfaces();
+                crate::settings_ui::refresh_render_note();
+            }
+            if crate::gl::take_lost() && crate::gl::active() {
+                if lost_last.is_some_and(|t| t.elapsed() > Duration::from_secs(60)) {
+                    lost_n = 0;
+                }
+                lost_n += 1;
+                lost_last = Some(Instant::now());
+                log::warn!("gl: context lost → wl_shm now, rebuilding (attempt {lost_n})");
+                state.reset_surfaces();
+                crate::gl::shutdown();
+                if lost_n > 3 {
+                    log::warn!("gl: context lost {lost_n} times in a row, staying on CPU");
+                    crate::render::mark_failed();
+                } else {
+                    rebuild_at = Some(Instant::now() + Duration::from_millis(1500));
+                }
+                crate::settings_ui::refresh_render_note();
+            }
+            if rebuild_at.is_some_and(|t| Instant::now() >= t) {
+                rebuild_at = None;
+                if crate::render::wanted() && !crate::gl::active() {
+                    log::info!("gl: rebuilding after context loss");
+                    crate::gl::init_async(disp);
+                }
             }
             // 新建的普通窗口
             for w in NEW_TOPS.with(|t| std::mem::take(&mut *t.borrow_mut())) {
@@ -1050,14 +1097,31 @@ impl State {
                             egl: None,
                             gsnap: None,
                             gglass: None,
+                            input: None,
                         });
                         if m {
                             let (strip, card, rs, rc) = self.morph_rects();
                             if let Some(ps) = self.panel.as_mut() {
                                 ps.morph = Some(crate::morph::Anim::new(true, strip, card, rs, rc, &ps.place.edge, 0.0, 0.0));
                             }
+                            // 预取的背景还新鲜、位置对得上：直接用，不用等截图
+                            let pre = self.pre.take().filter(|(pl, t, g)| {
+                                let sc = self.scale.max(1) as usize;
+                                self.panel.as_ref().is_some_and(|ps| *pl == ps.place) && t.elapsed() < PRE_TTL && g.len() == (pl.w as usize * sc) * (pl.h as usize * sc)
+                            });
+                            let pending_pre = self.cap.as_ref().is_some_and(|c| c.pre.as_ref() == self.panel.as_ref().map(|ps| &ps.place));
+                            if let Some((_, t, g)) = pre {
+                                log::info!("panel morph open: prefetched glass ({} ms old)", t.elapsed().as_millis());
+                                if let Some(ps) = self.panel.as_mut() {
+                                    ps.glass = Some(g);
+                                }
+                            } else if pending_pre {
+                                // 预取还在路上：等它（结果直接给面板）
+                                if let Some(ps) = self.panel.as_mut() {
+                                    ps.cap_wait = Some(Instant::now());
+                                }
                             // 面板 surface 还没上屏：现在截它背后的屏幕当玻璃底
-                            if self.start_capture() {
+                            } else if self.start_capture() {
                                 if let Some(ps) = self.panel.as_mut() {
                                     ps.cap_wait = Some(Instant::now());
                                 }
@@ -1183,6 +1247,13 @@ impl State {
                     }
                 }
             }
+            Cmd::Prefetch(p) => {
+                let fresh = self.pre.as_ref().is_some_and(|(pl, t, _)| *pl == p && t.elapsed() < PRE_TTL / 3);
+                let busy = self.cap.is_some();
+                if self.panel.is_none() && use_morph() && !fresh && !busy && std::env::var("LANCAT_MORPH_PREFETCH").as_deref() != Ok("0") {
+                    self.capture_place(p, true);
+                }
+            }
             Cmd::SetClip(text) => {
                 let (Some(m), Some(dd)) = (self.ddm.as_ref(), self.data_device.as_ref()) else { return };
                 let src = m.create_copy_paste_source(&self.qh, TEXT_MIMES);
@@ -1206,6 +1277,18 @@ impl State {
 
     /// 渲染方式切换：先丢掉所有 EGL surface 和纹理，再关掉 / 建上下文，所有 surface 整幅重画
     fn switch_render(&mut self, cpu: bool, disp: *mut std::ffi::c_void) {
+        self.reset_surfaces();
+        if cpu {
+            crate::gl::shutdown();
+        } else {
+            crate::gl::init(disp);
+        }
+        log::info!("render mode: {} (gl {})", if cpu { "CPU" } else { "GPU" }, crate::gl::active());
+        crate::settings_ui::refresh_render_note();
+    }
+
+    /// 所有 EGL surface 和纹理丢掉、整幅重画（切换渲染方式 / 上下文刚接上 / 丢了）
+    fn reset_surfaces(&mut self) {
         if let Some(ps) = self.panel.as_mut() {
             ps.egl = None;
             ps.gsnap = None;
@@ -1229,12 +1312,6 @@ impl State {
                 w.needs_redraw.set(true);
             }
         }
-        if cpu {
-            crate::gl::shutdown();
-        } else {
-            crate::gl::init(disp);
-        }
-        log::info!("render mode: {} (gl {})", if cpu { "CPU" } else { "GPU" }, crate::gl::active());
         self.buf = Vec::new();
         if let Some(w) = self.win.upgrade() {
             w.needs_redraw.set(true);
@@ -1265,9 +1342,13 @@ impl State {
 
     /// 截面板 surface 背后那块屏幕（异步，结果在 cap_ready 里放进 panel.glass）。true = 已发出请求
     fn start_capture(&mut self) -> bool {
+        let Some(p) = self.panel.as_ref().map(|ps| ps.place.clone()) else { return false };
+        self.capture_place(p, false)
+    }
+
+    /// 截 `p` 这块（面板 surface 的位置）背后的屏幕；`pre` = 预取（面板还没建）
+    fn capture_place(&mut self, p: Place, pre: bool) -> bool {
         let Some(mgr) = self.screencopy.as_ref() else { return false };
-        let Some(ps) = self.panel.as_ref() else { return false };
-        let p = ps.place.clone();
         let outs = OUTPUTS.with(|o| o.borrow().clone());
         let Some(&(ow, oh, _)) = outs.get(p.output).or(outs.first()) else {
             log::info!("screencopy: no output size known");
@@ -1291,9 +1372,22 @@ impl State {
         self.cap_gen += 1;
         let gen = self.cap_gen;
         let sc = self.scale.max(1) as usize;
-        let frame = mgr.capture_output_region(0, &out, x, y, w, h, &self.qh, ScFrame(gen));
-        log::info!("screencopy: request region {x},{y} {w}x{h} (output {ow}x{oh}, scale {sc})");
-        self.cap = Some(Cap { gen, frame, fmt: None, buf: None, y_invert: false, out: (p.w as usize * sc, p.h as usize * sc), t0: Instant::now() });
+        // 分数缩放（1.25 / 1.5 …）：按区域截时，niri 等合成器会拒收它自己报的缓冲尺寸（invalid buffer 协议错误，
+        // 整个连接断掉、进程退出）。改为截整个输出（缓冲 = 输出的物理模式，没有舍入问题），自己裁出这一块。
+        let phys = self.output_state.info(&out).and_then(|i| i.modes.iter().find(|m| m.current).map(|m| m.dimensions));
+        let frac = phys.is_some_and(|(pw, ph)| {
+            let r = pw.max(ph) as f64 / ow.max(oh).max(1) as f64;
+            (r - r.round()).abs() > 0.01
+        });
+        let (frame, crop) = if frac {
+            log::info!("screencopy: request output (fractional scale, mode {phys:?}) for region {x},{y} {w}x{h} (output {ow}x{oh})");
+            (mgr.capture_output(0, &out, &self.qh, ScFrame(gen)), Some((x, y, w, h, ow, oh)))
+        } else {
+            log::info!("screencopy: request region {x},{y} {w}x{h} (output {ow}x{oh}, scale {sc})");
+            (mgr.capture_output_region(0, &out, x, y, w, h, &self.qh, ScFrame(gen)), None)
+        };
+        let out = (p.w as usize * sc, p.h as usize * sc);
+        self.cap = Some(Cap { gen, frame, fmt: None, buf: None, y_invert: false, out, t0: Instant::now(), pre: pre.then_some(p), crop });
         true
     }
 
@@ -1313,6 +1407,7 @@ impl State {
             return self.cap_end(gen, false);
         };
         let r = pool.create_buffer(w as i32, h as i32, stride as i32, fmt).map(|(b, _)| b);
+        log::debug!("screencopy: copy into {fmt:?} {w}x{h} stride {stride}");
         match r {
             Ok(b) => {
                 cap.frame.copy(b.wl_buffer());
@@ -1340,12 +1435,24 @@ impl State {
                 let swap = matches!(fmt, wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888);
                 if w > 0 && h > 0 && ow > 0 && oh > 0 && data.len() >= stride * h {
                     let mut px = vec![Bgra::default(); ow * oh];
+                    // 源坐标：按区域截 = 整幅缩放；截整个输出 = 先换到输出里那一块（物理 px = 逻辑 × 缓冲/逻辑）
+                    let map = |i: usize, n: usize, full: usize, c: Option<(i32, i32, i32)>| -> usize {
+                        match c {
+                            Some((c0, cl, outl)) => {
+                                let k = full as f64 / outl.max(1) as f64;
+                                (((c0 as f64 + (i as f64 + 0.5) * cl as f64 / n as f64) * k) as usize).min(full - 1)
+                            }
+                            None => (i * full / n).min(full - 1),
+                        }
+                    };
+                    let cx = cap.crop.map(|(x, _, cw, _, ow_l, _)| (x, cw, ow_l));
+                    let cy = cap.crop.map(|(_, y, _, ch, _, oh_l)| (y, ch, oh_l));
                     for y in 0..oh {
-                        let sy = (y * h / oh).min(h - 1);
+                        let sy = map(y, oh, h, cy);
                         let sy = if cap.y_invert { h - 1 - sy } else { sy };
                         let row = &data[sy * stride..];
                         for x in 0..ow {
-                            let sx = (x * w / ow).min(w - 1) * 4;
+                            let sx = map(x, ow, w, cx) * 4;
                             let (c0, c1, c2) = (row[sx], row[sx + 1], row[sx + 2]);
                             px[y * ow + x] = if swap { Bgra { b: c2, g: c1, r: c0, a: 255 } } else { Bgra { b: c0, g: c1, r: c2, a: 255 } };
                         }
@@ -1359,6 +1466,20 @@ impl State {
         match (&glass, cap.fmt) {
             (Some(_), Some((f, w, h, _))) => log::info!("screencopy ok: {w}x{h} {f:?} -> {}x{} in {ms} ms (y_invert {})", cap.out.0, cap.out.1, cap.y_invert),
             _ => log::info!("screencopy unusable after {ms} ms (ok {ok}, fmt {:?}, buf {})", cap.fmt.map(|f| (f.0, f.1, f.2)), cap.buf.is_some()),
+        }
+        if let Some(place) = cap.pre.clone() {
+            drop(cap);
+            // 预取：先存着；面板已经在等截图（预取没赶上、面板先建了）就直接给它
+            if let Some(g) = glass {
+                match self.panel.as_mut() {
+                    Some(ps) if ps.place == place && ps.glass.is_none() && !ps.closing => {
+                        ps.glass = Some(g);
+                        ps.gglass = None;
+                    }
+                    _ => self.pre = Some((place, Instant::now(), g)),
+                }
+            }
+            return;
         }
         drop(cap);
         if let Some(ps) = self.panel.as_mut() {
@@ -1406,7 +1527,22 @@ impl State {
     fn draw_panel(&mut self) {
         let Some(w) = self.win.upgrade() else { return };
         let Some(ps) = self.panel.as_mut() else { return };
-        if ps.egl.is_some() && frame_wait(ps.layer.wl_surface()) {
+        // 输入区域：Wayland 不按像素 alpha 命中，surface 外圈的阴影边（FRAME）默认也接点击、挡住下面的窗口。
+        // 只让卡片接收指针（与旧版 input_shape_combine_region、Windows layered 窗口的逐像素命中一致）；
+        // 收起中整块穿透。下一次 commit 生效。
+        let want_input = !ps.closing;
+        if ps.input != Some(want_input) {
+            if let Ok(r) = smithay_client_toolkit::compositor::Region::new(&self.compositor) {
+                if want_input {
+                    let f = FRAME as i32;
+                    r.add(f, f, (ps.width as i32 - 2 * f).max(1), (ps.height as i32 - 2 * f).max(1));
+                }
+                ps.layer.wl_surface().set_input_region(Some(r.wl_region()));
+                ps.input = Some(want_input);
+            }
+        }
+        // GPU 和 CPU（wl_shm）都按合成器的 frame 回调出帧：跟显示器刷新走，动画不再按 8 ms 轮询空画
+        if frame_wait(ps.layer.wl_surface()) {
             return;
         }
         // 打开变形先等背景截图（surface 不上屏），到了 / 超时再从头开始计时
@@ -1547,6 +1683,7 @@ impl State {
                 canvas[..n * 4].copy_from_slice(bytes);
                 let s = ps.layer.wl_surface();
                 s.damage_buffer(0, 0, width as i32, height as i32);
+                frame_request(s, &self.qh);
                 if buffer.attach_to(s).is_ok() {
                     ps.layer.commit();
                 }
@@ -1583,6 +1720,7 @@ impl State {
         canvas[..n * 4].copy_from_slice(bytes);
         let s = ps.layer.wl_surface();
         s.damage_buffer(0, 0, width as i32, height as i32);
+        frame_request(s, &self.qh);
         if buffer.attach_to(s).is_ok() {
             ps.layer.commit();
         }
@@ -2624,6 +2762,7 @@ impl Dispatch2<ZwlrScreencopyFrameV1, State> for ScFrame {
         }
         match ev {
             Event::Buffer { format: WEnum::Value(f), width, height, stride } => {
+                log::debug!("screencopy: buffer offer {f:?} {width}x{height} stride {stride}");
                 let usable = matches!(f, wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888 | wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888);
                 if let Some(c) = s.cap.as_mut() {
                     if usable && c.fmt.is_none() {

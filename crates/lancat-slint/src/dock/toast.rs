@@ -221,6 +221,7 @@ fn sync_mode(s: &mut State) {
     unsafe {
         let _ = KillTimer(Some(s.hwnd), TIMER_ANIM);
         let _ = KillTimer(Some(s.hwnd), TIMER_HIDE);
+        crate::passthru::unwatch(s.hwnd);
         let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(s.hwnd);
     }
     s.hwnd = h;
@@ -234,6 +235,7 @@ pub fn render_mode_changed() {
         if s.gpu_win && !want_gpu() {
             let _ = KillTimer(Some(s.hwnd), TIMER_ANIM);
             let _ = KillTimer(Some(s.hwnd), TIMER_HIDE);
+            crate::passthru::unwatch(s.hwnd);
             let _ = ShowWindow(s.hwnd, SW_HIDE);
             *s.blit.borrow_mut() = None;
             if s.spec.is_some() {
@@ -323,6 +325,16 @@ pub fn show(spec: ToastSpec) {
         animate(s, 1.0);
         draw(s);
         let _ = ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
+        if s.gpu_win {
+            // DComp 窗口没有逐像素命中：卡片外（阴影外沿）的点击交给下面的窗口（跨进程也有效）
+            crate::passthru::watch(s.hwnd, |x, y| {
+                with(|s| card_rect(s).is_some_and(|(cx, cy, cw, ch)| {
+                    let (x, y) = (x as f64, y as f64);
+                    x >= cx && y >= cy && x < cx + cw && y < cy + ch
+                }))
+                .unwrap_or(true)
+            });
+        }
         SHOWN.store(true, Ordering::SeqCst);
         super::strip::set_hidden(true);
         let _ = KillTimer(Some(s.hwnd), TIMER_HIDE);
@@ -897,6 +909,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let _ = KillTimer(Some(hwnd), TIMER_ANIM);
                             if s.to <= 0.0 {
                                 let _ = KillTimer(Some(hwnd), TIMER_HIDE);
+                                crate::passthru::unwatch(s.hwnd);
                                 let _ = ShowWindow(s.hwnd, SW_HIDE);
                                 *s.blit.borrow_mut() = None;
                                 s.spec = None;

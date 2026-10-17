@@ -43,6 +43,8 @@ mod update;
 mod win;
 #[cfg(windows)]
 mod gpu;
+#[cfg(windows)]
+mod passthru;
 #[cfg(target_os = "linux")]
 mod gl;
 /// Linux 上 `crate::gpu` 就是 GLES 后端（compose.rs 的 GPU 合成两个平台共用一套 API）
@@ -2054,6 +2056,12 @@ fn run_script(parts: &[String]) {
         }
         "hide" => {
             dock::hide_panel();
+            return;
+        }
+        "strip-enter" | "strip-leave" => {
+            // 测试：光标进 / 出停靠条（Wayland 下没有可注入的指针；与真实 enter / leave 走同一条路：预取背景 → hover_delay 后打开）
+            #[cfg(target_os = "linux")]
+            dock::wl_strip_pointer(cmd == "strip-enter");
             return;
         }
         "dtoast" => {

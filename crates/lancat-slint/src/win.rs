@@ -124,6 +124,9 @@ impl slint::platform::Platform for Win32Platform {
     fn run_event_loop(&self) -> Result<(), slint::PlatformError> {
         loop {
             slint::platform::update_timers_and_animations();
+            if crate::gpu::take_lost() {
+                recover_lost_device();
+            }
             // render windows whose contents changed
             let wins: Vec<Rc<Win32Window>> = WINDOWS.with(|w| w.borrow().iter().filter_map(|(_, w)| w.upgrade()).collect());
             for w in &wins {
@@ -485,6 +488,9 @@ impl Win32Window {
                 slint::Timer::single_shot(Duration::ZERO, || {
                     if crate::gpu::active() && crate::gpu::wanted() {
                         other_windows_gpu(true);
+                        if dock_mode() {
+                            crate::dock::morph::prewarm();
+                        }
                     }
                     crate::settings_ui::refresh_render_note();
                 });
@@ -1200,21 +1206,68 @@ pub fn apply_render_mode(cpu: bool) {
     let Some(w) = panel() else { return };
     if cpu && (w.gpu.get() || w.gpu_pending.get()) {
         log::info!("render mode: switching to CPU");
-        crate::dock::morph::reset_gpu();
-        other_windows_gpu(false);
-        w.gpu.set(false);
-        w.gpu_pending.set(false);
-        w.lq_gpu.set(false);
-        w.lq_base.borrow_mut().clear();
-        w.lq_glass.borrow_mut().clear();
-        crate::gpu::shutdown();
-        recreate_cpu(&w);
+        switch_to_cpu(&w);
     } else if !cpu && !w.gpu.get() && !w.gpu_pending.get() {
         log::info!("render mode: switching to GPU");
-        crate::dock::morph::reset_gpu();
-        crate::gpu::restart();
-        recreate_gpu(&w);
+        switch_to_gpu(&w);
     }
+}
+
+fn switch_to_cpu(w: &Win32Window) {
+    crate::dock::morph::reset_gpu();
+    other_windows_gpu(false);
+    w.gpu.set(false);
+    w.gpu_pending.set(false);
+    w.lq_gpu.set(false);
+    w.lq_base.borrow_mut().clear();
+    w.lq_glass.borrow_mut().clear();
+    crate::gpu::shutdown();
+    recreate_cpu(w);
+}
+
+fn switch_to_gpu(w: &Win32Window) {
+    crate::dock::morph::reset_gpu();
+    crate::gpu::restart();
+    recreate_gpu(w);
+}
+
+thread_local! {
+    /// 连续几次设备丢失后重建（成功跑满 60 s 清零）；超过 3 次就留在 CPU，设置页显示「GPU 不可用」
+    static LOST_RETRIES: Cell<u32> = const { Cell::new(0) };
+    static LOST_AT: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+}
+
+/// GPU 设备丢了（DEVICE_REMOVED / RESET，驱动更新、TDR、待机唤醒）：所有窗口当场换成 CPU 呈现（画面不断），
+/// 1.5 s 后在后台重建设备，好了 poll_gpu 再接回 GPU。与设置里切换走同一套流程。
+fn recover_lost_device() {
+    let Some(w) = panel() else { return };
+    if !w.gpu.get() && !w.gpu_pending.get() {
+        return;
+    }
+    if LOST_AT.with(|t| t.get()).is_some_and(|t| t.elapsed() > Duration::from_secs(60)) {
+        LOST_RETRIES.with(|r| r.set(0));
+    }
+    LOST_AT.with(|t| t.set(Some(std::time::Instant::now())));
+    let n = LOST_RETRIES.with(|r| {
+        r.set(r.get() + 1);
+        r.get()
+    });
+    log::warn!("gpu: device lost → CPU present now, rebuilding the device (attempt {n})");
+    switch_to_cpu(&w);
+    if n > 3 {
+        log::warn!("gpu: device lost {n} times in a row, staying on CPU");
+        crate::render::mark_failed();
+        crate::settings_ui::refresh_render_note();
+        return;
+    }
+    crate::settings_ui::refresh_render_note();
+    slint::Timer::single_shot(Duration::from_millis(1500), || {
+        let Some(w) = panel() else { return };
+        if crate::gpu::wanted() && !w.gpu.get() && !w.gpu_pending.get() {
+            log::info!("gpu: rebuilding after device loss");
+            switch_to_gpu(&w);
+        }
+    });
 }
 
 // ---------- material (ported from src-tauri/src/platform/windows.rs) ----------
@@ -1329,6 +1382,34 @@ fn set_alpha(h: HWND, a: u8, wnd: &Win32Window) {
     }
 }
 
+/// GPU 面板完全显示后：圆角外、且 Slint 帧完全透明的像素点击穿透（与 CPU 版 layered 窗口的逐像素命中一致）
+fn panel_watch(w: &Win32Window) {
+    if !w.gpu.get() || w.normal {
+        return;
+    }
+    crate::passthru::watch(w.hwnd.get(), |x, y| {
+        let Some(w) = panel() else { return true };
+        let size = w.size.get();
+        let (pw, ph) = (size.width as i32, size.height as i32);
+        if x < 0 || y < 0 || x >= pw || y >= ph {
+            return false;
+        }
+        let r = (8.0 * w.scale.get()) as i32;
+        // 圆角矩形里面：实心（液态玻璃底铺满整块）
+        let (cx, cy) = (x.clamp(r, pw - 1 - r), y.clamp(r, ph - 1 - r));
+        let (dx, dy) = (x - cx, y - cy);
+        if dx * dx + dy * dy <= r * r {
+            return true;
+        }
+        let Ok(buf) = w.buf.try_borrow() else { return true };
+        buf.get((y * pw + x) as usize).is_none_or(|p| p.a > 0)
+    });
+}
+
+fn panel_unwatch(w: &Win32Window) {
+    crate::passthru::unwatch(w.hwnd.get());
+}
+
 fn set_layered(h: HWND, on: bool) {
     unsafe {
         let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
@@ -1348,6 +1429,7 @@ fn fade_to(wnd: &Win32Window, to: u8, ms: u64) {
     wnd.fade_gen.set(gen);
     let gpu = wnd.gpu.get();
     let from = wnd.alpha.get();
+    panel_unwatch(wnd);
     if gpu {
         // GPU：淡入淡出期间不是 layered（DComp 内容 + 着色器透明度）；淡出到底才停放（layered + 点击穿透）
         set_layered(h, false);
@@ -1377,6 +1459,7 @@ fn fade_to(wnd: &Win32Window, to: u8, ms: u64) {
             }
             if to == 255 {
                 set_layered(h, false);
+                panel_watch(&w);
                 log::info!("panel fully shown {} ms after start", crate::t0().elapsed().as_millis());
             }
         }
@@ -1671,6 +1754,7 @@ fn park_now(w: &Win32Window) {
     w.lq_glass.borrow_mut().clear();
     w.lq_gpu.set(false);
     w.fade_gen.set(w.fade_gen.get() + 1);
+    panel_unwatch(w);
     set_layered(h, true);
     set_alpha(h, 0, w);
 }
@@ -1710,6 +1794,7 @@ pub fn panel_show_morph(g: crate::dock::Geo, edge: String, dark: bool, accent: (
             w.fade_gen.set(w.fade_gen.get() + 1);
             set_alpha(h, 255, &w);
             set_layered(h, false);
+            panel_watch(&w);
             w.needs_redraw.set(true);
             unsafe {
                 let _ = InvalidateRect(Some(h), None, false);

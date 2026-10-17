@@ -175,7 +175,9 @@ fn ensure_gwin(s: &mut State) -> bool {
         }
         let wc = WNDCLASSW { lpfnWndProc: Some(wndproc), hInstance: hmod.into(), lpszClassName: class, ..Default::default() };
         RegisterClassW(&wc);
-        let layered = std::env::var("LANCAT_MORPH_LAYERED").as_deref() == Ok("1");
+        // WS_EX_LAYERED | WS_EX_TRANSPARENT（LWA_ALPHA 255）：整窗点击穿透，跨进程也有效（只靠 HTTRANSPARENT
+        // 挡不住别的进程的窗口）。LANCAT_MORPH_LAYERED=0 退回不带 layered。
+        let layered = std::env::var("LANCAT_MORPH_LAYERED").as_deref() != Ok("0");
         let mut ex = WS_EX_NOREDIRECTIONBITMAP | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
         if layered {
             ex |= WS_EX_LAYERED;
@@ -249,6 +251,38 @@ pub fn gpu_tick() {
 /// 打开动画最后的模糊背景（GPU）：真面板接着当液态玻璃底，不读回 CPU
 pub fn gpu_glass() -> Option<Rc<crate::gpu::Glass>> {
     with(|s| if s.gpu { s.gglass.clone() } else { None }).flatten()
+}
+
+/// 预取的背景截图：光标靠近停靠条（还没打开）时在后台线程先截好，打开时省掉 12–25 ms 的同步截屏。
+/// 只在窗口矩形一致、截了不到 PREFETCH_TTL 时用（期间屏幕变了也只差一点点模糊后的颜色）。
+static PREFETCH: std::sync::Mutex<Option<((i32, i32, i32, i32), Instant, Vec<Bgra>)>> = std::sync::Mutex::new(None);
+static PREFETCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const PREFETCH_TTL: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// 面板收着、光标靠近 / 悬停在停靠条上：后台先截下这次展开要用的那块屏幕（GPU 模式才有意义：模糊在 GPU 上几乎不花时间）
+pub fn prefetch(strip: Rect, panel: Rect, scale: f64) {
+    if !gpu_mode() || running() || std::env::var("LANCAT_MORPH_PREFETCH").as_deref() == Ok("0") {
+        return;
+    }
+    let win = union(strip, panel, 18.0 * scale);
+    if PREFETCH.lock().unwrap().as_ref().is_some_and(|(w, t, _)| *w == win && t.elapsed() < PREFETCH_TTL / 3) {
+        return;
+    }
+    if PREFETCHING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let px = capture_raw(win);
+        if let Some(px) = px {
+            *PREFETCH.lock().unwrap() = Some((win, Instant::now(), px));
+        }
+        PREFETCHING.store(false, std::sync::atomic::Ordering::Release);
+    });
+}
+
+fn take_prefetch(win: (i32, i32, i32, i32)) -> Option<Vec<Bgra>> {
+    let (w, t, px) = PREFETCH.lock().unwrap().take()?;
+    (w == win && t.elapsed() < PREFETCH_TTL).then_some(px)
 }
 
 fn union(strip: Rect, panel: Rect, m: f64) -> (i32, i32, i32, i32) {
@@ -593,6 +627,33 @@ fn choose(s: &mut State, want_gpu: bool) -> bool {
     gpu
 }
 
+/// GPU 设备刚接上（启动 / 切换 / 设备丢失后重建）：先把变形窗口和它的交换链按这次布局的尺寸建好、清一帧，
+/// 第一次展开就不用再现建 DComp 目标和交换链（首帧前少 5–8 ms，首次展开不掉帧）
+pub fn prewarm() {
+    if !gpu_mode() || running() {
+        return;
+    }
+    let Some(g) = super::geo() else { return };
+    if !ensure() {
+        return;
+    }
+    let t = Instant::now();
+    let ok = with(|s| {
+        if !ensure_gwin(s) {
+            return false;
+        }
+        s.win = union(g.dock, g.panel, 18.0 * g.scale);
+        let ok = prep_surface(s);
+        if let Some(x) = s.surf.as_ref() {
+            x.clear();
+            x.present();
+        }
+        ok
+    })
+    .unwrap_or(false);
+    log::info!("morph: prewarmed GPU surface ({ok}) in {:.1} ms", t.elapsed().as_secs_f32() * 1000.0);
+}
+
 fn prep_surface(s: &mut State) -> bool {
     let (w, h) = (s.win.2.max(1) as u32, s.win.3.max(1) as u32);
     match s.surf.as_mut() {
@@ -665,7 +726,11 @@ pub fn open(p: Params, on_done: impl FnOnce() + 'static) {
             }
             let tc = Instant::now();
             if gpu {
-                let px = capture_raw(s.win);
+                let pre = take_prefetch(s.win);
+                if pre.is_some() && crate::compose::stats_on() {
+                    log::info!("morph open: using prefetched backdrop");
+                }
+                let px = pre.or_else(|| capture_raw(s.win));
                 s.gglass = px.and_then(|px| crate::gpu::glass_from_pixels(&px, s.win.2 as usize, s.win.3 as usize, (s.win.0, s.win.1), blur_radius(scale)));
             } else {
                 s.glass = capture(s.win, scale);

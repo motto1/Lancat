@@ -371,6 +371,44 @@ pub fn shutdown() {
 }
 
 /// 切回 GPU：后台重新建设备（窗口按 GPU 重建后 poll_attach 接上）
+/// 设备丢了（驱动更新 / TDR / 拔显卡 / 待机唤醒后 DEVICE_REMOVED、DEVICE_RESET）：呈现时发现，事件循环里 take_lost() 接手
+static LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 测试钩子 LANCAT_GPU_TEST=lose（可写 lose:毫秒，默认 6000）：设备接上这么久后假装丢一次
+static LOSE_AT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+static LOSE_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn lose_test_ms() -> Option<u64> {
+    let t = std::env::var("LANCAT_GPU_TEST").ok()?;
+    let rest = t.strip_prefix("lose")?;
+    Some(rest.strip_prefix(':').and_then(|v| v.parse().ok()).unwrap_or(6000))
+}
+
+/// 呈现的返回值：设备没了就记下（只记一次，日志带原因）
+fn check_present(what: &str, hr: windows::core::HRESULT, dev: Option<&ID3D11Device>) {
+    if hr.is_ok() {
+        if let (Some(ms), Some(t0)) = (lose_test_ms(), *LOSE_AT.lock().unwrap()) {
+            if t0.elapsed().as_millis() as u64 >= ms && !LOSE_DONE.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                log::warn!("gpu: LANCAT_GPU_TEST=lose: simulating DXGI_ERROR_DEVICE_REMOVED");
+                LOST.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        return;
+    }
+    if hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET || hr == DXGI_ERROR_DEVICE_HUNG || hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR {
+        let reason = dev.map(|d| unsafe { d.GetDeviceRemovedReason() }).map(|r| format!("{r:?}")).unwrap_or_default();
+        if !LOST.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            log::warn!("gpu: {what}: device lost ({hr:?}, reason {reason})");
+        }
+    } else {
+        log::warn!("gpu: {what} failed: {hr:?}");
+    }
+}
+
+/// 事件循环每轮调一次：设备丢了 → true（只返回一次）
+pub fn take_lost() -> bool {
+    LOST.swap(false, std::sync::atomic::Ordering::AcqRel)
+}
+
 pub fn restart() {
     crate::render::clear_failed();
     let t = UI_THREAD.load(std::sync::atomic::Ordering::Relaxed);
@@ -504,6 +542,9 @@ pub fn poll_attach(hwnd: HWND, w: u32, h: u32) -> Attach {
     }
     let Some(p) = PREP.lock().unwrap().take() else { return Attach::Failed };
     if attach(hwnd, w, h, p) {
+        if lose_test_ms().is_some() && !LOSE_DONE.load(std::sync::atomic::Ordering::Acquire) {
+            *LOSE_AT.lock().unwrap() = Some(Instant::now());
+        }
         Attach::Ok
     } else {
         Attach::Failed
@@ -1128,7 +1169,10 @@ pub fn present() {
     let t = Instant::now();
     with(|g| unsafe {
         if g.pending_wait {
-            WaitForSingleObjectEx(g.wait, 50, false);
+            // 变形动画还在跑（展开的淡出阶段面板已接手）：事件循环跟着变形窗口的交换链走，这里不能再等面板的
+            // 交换链（会把变形的下一帧挤到下一个 vsync，掉帧）；等待式交换链的 Present 本身不阻塞
+            let ms = if crate::dock::morph::running() { 0 } else { 50 };
+            WaitForSingleObjectEx(g.wait, ms, false);
             g.pending_wait = false;
         }
         let src = if g.frame_gpu { g.acc[g.cur].as_ref() } else { g.cpu.as_ref() };
@@ -1149,9 +1193,7 @@ pub fn present() {
             _ => g.ctx.ClearRenderTargetView(&bb, &[0.0; 4]),
         }
         let hr = g.swap.Present(1, DXGI_PRESENT(0));
-        if hr.is_err() {
-            log::warn!("gpu: Present failed: {hr:?}");
-        }
+        check_present("Present", hr, Some(&g.dev));
         g.pending_wait = true;
     });
     PRESENT_MS.with(|p| p.set(t.elapsed().as_secs_f32() * 1000.0));
@@ -1289,9 +1331,7 @@ impl Surface {
     pub fn present(&self) {
         unsafe {
             let hr = self.swap.Present(1, DXGI_PRESENT(0));
-            if hr.is_err() {
-                log::warn!("gpu: surface Present failed: {hr:?}");
-            }
+            check_present("surface Present", hr, None);
         }
     }
 }

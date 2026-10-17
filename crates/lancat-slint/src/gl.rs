@@ -398,6 +398,101 @@ fn compile(gl: &glow::Context, src_fs: &str, name: &str) -> Option<Prog> {
 
 /// 建 EGL 显示 / 上下文、编译着色器。`display`：libwayland-client 的 wl_display*（系统后端）。
 /// 失败 = 一直用 CPU（render::mark_failed，设置页显示「GPU 不可用」）。
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// 上下文丢了（EGL_CONTEXT_LOST：GPU 复位、驱动重启、部分驱动待机唤醒后）；事件循环里 take_lost() 接手
+static LOST: AtomicBool = AtomicBool::new(false);
+/// 测试钩子 LANCAT_GPU_TEST=lose（lose:毫秒，默认 6000）：上下文建好这么久后假装丢一次
+static LOSE_AT: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+static LOSE_DONE: AtomicBool = AtomicBool::new(false);
+
+fn lose_test_ms() -> Option<u64> {
+    let t = std::env::var("LANCAT_GPU_TEST").ok()?;
+    let rest = t.strip_prefix("lose")?;
+    Some(rest.strip_prefix(':').and_then(|v| v.parse().ok()).unwrap_or(6000))
+}
+
+fn arm_lose_test() {
+    if lose_test_ms().is_some() && !LOSE_DONE.load(Ordering::Acquire) {
+        *LOSE_AT.lock().unwrap() = Some(Instant::now());
+    }
+}
+
+/// 上下文丢了 → true（只返回一次）
+pub fn take_lost() -> bool {
+    LOST.swap(false, Ordering::AcqRel)
+}
+
+/// 后台线程建好的上下文（建完在那个线程上 release，交给 UI 线程 make_current 一次）
+struct SendGl(Gl);
+// SAFETY: EGL 上下文在建它的线程上已经 release（不在任何线程上 current），之后只在 UI 线程用
+unsafe impl Send for SendGl {}
+
+static ASYNC: std::sync::Mutex<Option<Option<SendGl>>> = std::sync::Mutex::new(None);
+static ASYNC_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// 启动时在后台线程建 EGL 上下文、编译着色器（Mesa 加载驱动 + 编译 ~0.3–0.5 s，不再挡住第一帧和输入）；
+/// 好了唤醒事件循环，`poll_async()` 接上。期间 surface 走 wl_shm，接上后整幅重画到 EGL surface。
+pub fn init_async(display: *mut c_void) {
+    if active() || ASYNC_BUSY.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let d = display as usize;
+    std::thread::spawn(move || {
+        let t = Instant::now();
+        let test = std::env::var("LANCAT_GPU_TEST").unwrap_or_default();
+        let r = if test == "fail" {
+            log::warn!("gl: LANCAT_GPU_TEST=fail");
+            None
+        } else {
+            init_inner(d as *mut c_void)
+        };
+        let r = r.map(|g| {
+            let _ = g.egl.make_current(g.dpy, None, None, None);
+            SendGl(g)
+        });
+        log::info!("gl: background init {} in {:.1} ms", if r.is_some() { "ok" } else { "failed" }, t.elapsed().as_secs_f32() * 1000.0);
+        *ASYNC.lock().unwrap() = Some(r);
+        let _ = slint::invoke_from_event_loop(|| {});
+    });
+}
+
+/// 后台初始化结束了吗：刚接上返回 true（调用方让所有 surface 整幅重画）
+pub fn poll_async() -> bool {
+    let Some(r) = ASYNC.lock().unwrap().take() else { return false };
+    ASYNC_BUSY.store(false, Ordering::Release);
+    match r {
+        Some(SendGl(g)) => {
+            if !crate::render::wanted() || active() {
+                let _ = g.egl.destroy_context(g.dpy, g.ctx);
+                return false;
+            }
+            if g.egl.make_current(g.dpy, None, None, Some(g.ctx)).is_err() {
+                log::warn!("gl: make_current on the UI thread failed, using wl_shm (CPU) rendering");
+                let _ = g.egl.destroy_context(g.dpy, g.ctx);
+                crate::render::mark_failed();
+                return false;
+            }
+            let ver = unsafe { g.gl.get_parameter_string(glow::VERSION) };
+            let ren = unsafe { g.gl.get_parameter_string(glow::RENDERER) };
+            log::info!("gl: {ren:?} {ver:?} attached (half-float targets {})", g.half_rt);
+            GL.with(|x| *x.borrow_mut() = Some(g));
+            arm_lose_test();
+            true
+        }
+        None => {
+            crate::render::mark_failed();
+            log::warn!("gl: unavailable, using wl_shm (CPU) rendering");
+            false
+        }
+    }
+}
+
+/// 后台初始化还没结束
+pub fn initializing() -> bool {
+    ASYNC_BUSY.load(Ordering::Acquire)
+}
+
 pub fn init(display: *mut c_void) -> bool {
     if active() {
         return true;
@@ -416,6 +511,7 @@ pub fn init(display: *mut c_void) -> bool {
             let ren = unsafe { g.gl.get_parameter_string(glow::RENDERER) };
             log::info!("gl: {ren:?} {ver:?} in {:.1} ms (half-float targets {})", t.elapsed().as_secs_f32() * 1000.0, g.half_rt);
             GL.with(|x| *x.borrow_mut() = Some(g));
+            arm_lose_test();
             true
         }
         None => {
@@ -989,8 +1085,21 @@ impl Surf {
 
     /// 交换（= attach + damage + wl_surface.commit）
     fn swap(&self, g: &Gl) {
-        if let Err(e) = g.egl.swap_buffers(g.dpy, self.es) {
-            log::warn!("gl: eglSwapBuffers: {e}");
+        match g.egl.swap_buffers(g.dpy, self.es) {
+            Err(egl::Error::ContextLost) => {
+                if !LOST.swap(true, Ordering::AcqRel) {
+                    log::warn!("gl: eglSwapBuffers: EGL_CONTEXT_LOST (GPU reset / driver restart / resume)");
+                }
+            }
+            Err(e) => log::warn!("gl: eglSwapBuffers: {e}"),
+            Ok(()) => {
+                if let (Some(ms), Some(t0)) = (lose_test_ms(), *LOSE_AT.lock().unwrap()) {
+                    if t0.elapsed().as_millis() as u64 >= ms && !LOSE_DONE.swap(true, Ordering::AcqRel) {
+                        log::warn!("gl: LANCAT_GPU_TEST=lose: simulating EGL_CONTEXT_LOST");
+                        LOST.store(true, Ordering::Release);
+                    }
+                }
+            }
         }
     }
 }
