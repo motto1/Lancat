@@ -158,6 +158,13 @@ impl slint::platform::Platform for Win32Platform {
                     continue;
                 }
                 if w.needs_redraw.get() {
+                    if w.gwin.get() {
+                        // 设置页（GPU）：只上传变了的行，交换链呈现
+                        if let Some(r) = w.render() {
+                            w.present_blit(Some(r));
+                        }
+                        continue;
+                    }
                     // 先渲染（ReusedBuffer 只重画脏区），再只让脏区失效：WM_PAINT 只拷贝这一块，
                     // 不再每帧整窗 SetDIBitsToDevice（无设备时的雷达动画从 ~40% 单核降下来）
                     if let Some(r) = w.render() {
@@ -281,6 +288,9 @@ pub struct Win32Window {
     gpu_pending: Cell<bool>,
     /// 透明度 / 玻璃底变了，下一轮要重新呈现（GPU）
     needs_present: Cell<bool>,
+    /// 普通窗口（设置页）按 GPU 建的（NOREDIRECTIONBITMAP）：内容经 gpu::Blit 呈现
+    gwin: Cell<bool>,
+    blit: RefCell<Option<crate::gpu::Blit>>,
 }
 
 const CLASS: PCWSTR = w!("LancatSlintPanel");
@@ -312,6 +322,8 @@ impl Win32Window {
             gpu: Cell::new(false),
             gpu_pending: Cell::new(false),
             needs_present: Cell::new(false),
+            gwin: Cell::new(false),
+            blit: RefCell::new(None),
             normal: NEXT_NORMAL.with(|n| n.replace(false)),
             shown_once: Cell::new(false),
         });
@@ -331,8 +343,11 @@ impl Win32Window {
             // GPU：面板不要重定向位图（内容来自 DComp visual），一开始也不是 layered（停放时才加，见 set_layered）
             // 设备在后台线程建（Win32Platform::new 里 prewarm），事件循环里 poll_attach 接上交换链
             let want_gpu = !rc.normal && crate::gpu::wanted();
+            // 普通窗口（设置页）：设备已经在了就直接按 GPU 建（呈现走 gpu::Blit）
+            let normal_gpu = rc.normal && crate::gpu::wanted() && crate::gpu::active();
             let ex_gpu = (ex & !WS_EX_LAYERED) | WS_EX_NOREDIRECTIONBITMAP;
-            let h = CreateWindowExW(if want_gpu { ex_gpu } else { ex }, CLASS, w!("Lancat"), style, 0, 0, 480, 620, None, None, Some(inst), None).map_err(|e| e.to_string())?;
+            let h = CreateWindowExW(if want_gpu || normal_gpu { ex_gpu } else { ex }, CLASS, w!("Lancat"), style, 0, 0, 480, 620, None, None, Some(inst), None).map_err(|e| e.to_string())?;
+            rc.gwin.set(normal_gpu);
             rc.gpu_pending.set(want_gpu);
             rc.hwnd.set(h);
             WINDOWS.with(|w| w.borrow_mut().push((h.0 as isize, Rc::downgrade(&rc))));
@@ -466,7 +481,13 @@ impl Win32Window {
                 self.buf.borrow_mut().clear();
                 self.needs_redraw.set(true);
                 self.needs_present.set(true);
-                crate::settings_ui::refresh_render_note();
+                // 停靠条 / toast / 设置页也换成 GPU 呈现（下一轮，别在面板的 poll 里重入窗口过程）
+                slint::Timer::single_shot(Duration::ZERO, || {
+                    if crate::gpu::active() && crate::gpu::wanted() {
+                        other_windows_gpu(true);
+                    }
+                    crate::settings_ui::refresh_render_note();
+                });
             }
             crate::gpu::Attach::Failed => {
                 self.gpu_pending.set(false);
@@ -498,8 +519,50 @@ impl Win32Window {
         crate::gpu::present();
     }
 
+    /// 普通窗口（GPU）：上传 `r` 覆盖的行（None = 不上传，只重新呈现）并呈现
+    fn present_blit(&self, r: Option<RECT>) {
+        let size = self.size.get();
+        let (w, h) = (size.width as usize, size.height as usize);
+        let buf = self.buf.borrow();
+        if buf.len() != w * h || w == 0 {
+            return;
+        }
+        let mut b = self.blit.borrow_mut();
+        let mut fresh = false;
+        match b.as_mut() {
+            Some(x) => {
+                if x.size() != (w as u32, h as u32) {
+                    x.resize(w as u32, h as u32);
+                    fresh = true;
+                }
+            }
+            None => {
+                *b = crate::gpu::Blit::new(self.hwnd.get(), w as u32, h as u32);
+                fresh = true;
+            }
+        }
+        let Some(x) = b.as_mut() else { return };
+        if let Some(r) = r {
+            let rows = if fresh { None } else { Some((r.top.max(0) as usize, (r.bottom.max(0) as usize).min(h))) };
+            x.upload(&buf, w, h, rows);
+        } else if fresh {
+            x.upload(&buf, w, h, None);
+        }
+        x.present(1.0);
+    }
+
     fn paint(&self) {
         let h = self.hwnd.get();
+        if self.gwin.get() {
+            unsafe {
+                let mut ps = PAINTSTRUCT::default();
+                let _ = BeginPaint(h, &mut ps);
+                let _ = EndPaint(h, &ps);
+            }
+            let late = if self.needs_redraw.get() && !self.window.has_active_animations() { self.render() } else { None };
+            self.present_blit(late.or(Some(RECT::default())));
+            return;
+        }
         if self.gpu.get() {
             // 内容走 DComp：只把失效区标成有效；有没画的变化就补画并呈现
             unsafe {
@@ -1062,6 +1125,71 @@ fn recreate_gpu(w: &Win32Window) {
     }
 }
 
+/// 普通窗口（设置页）换成 GPU / CPU 版窗口：同位置、同显示状态、同前台，内容整幅重画
+fn recreate_normal(w: &Win32Window, gpu: bool) {
+    if w.gwin.get() == gpu {
+        return;
+    }
+    unsafe {
+        let old = w.hwnd.get();
+        let mut r = RECT::default();
+        let _ = GetWindowRect(old, &mut r);
+        let vis = IsWindowVisible(old).as_bool();
+        let fg = GetForegroundWindow() == old;
+        let Ok(inst) = GetModuleHandleW(None) else { return };
+        let ex = if gpu { WS_EX_NOREDIRECTIONBITMAP } else { WINDOW_EX_STYLE(0) };
+        let mut title = [0u16; 256];
+        let n = GetWindowTextW(old, &mut title).max(0) as usize;
+        let t: Vec<u16> = title[..n.min(255)].iter().copied().chain([0]).collect();
+        let h = match CreateWindowExW(ex, CLASS, PCWSTR(t.as_ptr()), WS_OVERLAPPEDWINDOW, r.left, r.top, r.right - r.left, r.bottom - r.top, None, None, Some(inst.into()), None) {
+            Ok(h) => h,
+            Err(e) => {
+                log::error!("render switch: CreateWindowExW (settings) failed: {e}");
+                return;
+            }
+        };
+        WINDOWS.with(|ws| {
+            for e in ws.borrow_mut().iter_mut() {
+                if e.0 == old.0 as isize {
+                    e.0 = h.0 as isize;
+                }
+            }
+        });
+        w.hwnd.set(h);
+        let dark: i32 = crate::theme_is_dark("system") as i32;
+        let _ = DwmSetWindowAttribute(h, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as *const _, 4);
+        let scale = w.scale.get();
+        for (kind, base) in [(ICON_SMALL, 16.0f32), (ICON_BIG, 32.0f32)] {
+            if let Some(ic) = crate::dock::tray::load_icon((base * scale).round() as u32) {
+                SendMessageW(h, WM_SETICON, Some(WPARAM(kind as usize)), Some(LPARAM(ic.0 as isize)));
+            }
+        }
+        *w.blit.borrow_mut() = None;
+        w.gwin.set(gpu);
+        w.buf.borrow_mut().clear();
+        w.needs_redraw.set(true);
+        if vis {
+            let _ = ShowWindow(h, SW_SHOW);
+            if fg {
+                let _ = SetForegroundWindow(h);
+            }
+        }
+        let _ = DestroyWindow(old);
+    }
+}
+
+/// GPU 设备接上 / 要关掉：停靠条、toast、设置页跟着换（面板自己在 poll_gpu / apply_render_mode 里换）
+fn other_windows_gpu(on: bool) {
+    crate::dock::strip::set_gpu(on);
+    if !on {
+        crate::dock::toast::render_mode_changed();
+    }
+    let wins: Vec<Rc<Win32Window>> = WINDOWS.with(|w| w.borrow().iter().filter_map(|(_, w)| w.upgrade()).collect());
+    for w in wins.iter().filter(|w| w.normal) {
+        recreate_normal(w, on);
+    }
+}
+
 /// 设置里换了渲染方式：当场切换（面板窗口重建、交换链 / 设备丢掉或重建；CPU 路径就是原来那套）。
 /// LANCAT_CPU_COMPOSE=1 时什么都不做（一直是 CPU）。
 pub fn apply_render_mode(cpu: bool) {
@@ -1073,6 +1201,7 @@ pub fn apply_render_mode(cpu: bool) {
     if cpu && (w.gpu.get() || w.gpu_pending.get()) {
         log::info!("render mode: switching to CPU");
         crate::dock::morph::reset_gpu();
+        other_windows_gpu(false);
         w.gpu.set(false);
         w.gpu_pending.set(false);
         w.lq_gpu.set(false);

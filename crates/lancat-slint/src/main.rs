@@ -2056,6 +2056,14 @@ fn run_script(parts: &[String]) {
             dock::hide_panel();
             return;
         }
+        "dtoast" => {
+            // 测试：停靠条 toast
+            #[cfg(windows)]
+            dock::test_toast(&arg);
+            #[cfg(target_os = "linux")]
+            dock::on_update_alert(&arg);
+            return;
+        }
         "render" => {
             // 测试：切换渲染方式（arg = gpu | cpu），和设置页一样保存并当场生效
             let m = arg.clone();

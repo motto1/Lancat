@@ -34,7 +34,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TR
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW,  KillTimer, LoadCursorW, RegisterClassW, SetTimer, SetWindowPos, ShowWindow, UpdateLayeredWindow, HWND_TOPMOST, IDC_HAND, MA_NOACTIVATE,
     SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_EX_NOREDIRECTIONBITMAP, WM_NCHITTEST,
 };
 
 use super::Rect;
@@ -116,6 +116,9 @@ pub fn shown() -> bool {
 
 struct State {
     hwnd: HWND,
+    /// 当前窗口是 GPU 版（NOREDIRECTIONBITMAP + DComp）
+    gpu_win: bool,
+    blit: std::cell::RefCell<Option<crate::gpu::Blit>>,
     gfx: Option<Gfx>,
     spec: Option<ToastSpec>,
     name: Option<IDWriteTextLayout>,
@@ -163,24 +166,8 @@ fn ensure_window() -> bool {
             ..Default::default()
         };
         RegisterClassW(&wc);
-        let hwnd_res = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-            class,
-            w!("Lancat Toast"),
-            WS_POPUP,
-            0,
-            0,
-            10,
-            10,
-            None,
-            None,
-            Some(hmod.into()),
-            None,
-        );
-        let Ok(hwnd) = hwnd_res else {
-            log::warn!("toast: CreateWindowExW failed");
-            return false;
-        };
+        let _ = class;
+        let Some(hwnd) = mk_window(false) else { return false };
         let gfx = create_gfx();
         STATE.with(|s| {
             *s.borrow_mut() = Some(State {
@@ -202,10 +189,62 @@ fn ensure_window() -> bool {
                 glass_dark: None,
                 pop: None,
                 pop_frame: None,
+                gpu_win: false,
+                blit: std::cell::RefCell::new(None),
             })
         });
     }
     true
+}
+
+/// toast 窗口：CPU 版是 layered（UpdateLayeredWindow，逐像素 alpha），GPU 版带 WS_EX_NOREDIRECTIONBITMAP（DComp 交换链）
+fn mk_window(gpu: bool) -> Option<HWND> {
+    unsafe {
+        let hmod = GetModuleHandleW(None).ok()?;
+        let ex = if gpu { WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE } else { WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE };
+        CreateWindowExW(ex, w!("LancatDockToast"), w!("Lancat Toast"), WS_POPUP, 0, 0, 10, 10, None, None, Some(hmod.into()), None).map_err(|e| log::warn!("toast: CreateWindowExW failed: {e}")).ok()
+    }
+}
+
+/// toast 走 GPU 呈现（渲染方式 GPU、设备在；LANCAT_TOAST_GPU=0 强制 CPU）
+fn want_gpu() -> bool {
+    crate::gpu::wanted() && crate::gpu::active() && std::env::var("LANCAT_TOAST_GPU").as_deref() != Ok("0")
+}
+
+/// 显示前对齐渲染方式：换了就换窗口（toast 这时是隐藏的）
+fn sync_mode(s: &mut State) {
+    let want = want_gpu();
+    if want == s.gpu_win {
+        return;
+    }
+    let Some(h) = mk_window(want) else { return };
+    unsafe {
+        let _ = KillTimer(Some(s.hwnd), TIMER_ANIM);
+        let _ = KillTimer(Some(s.hwnd), TIMER_HIDE);
+        let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(s.hwnd);
+    }
+    s.hwnd = h;
+    s.gpu_win = want;
+    *s.blit.borrow_mut() = None;
+}
+
+/// 渲染方式变了（设置页 / GPU 设备没了）：正在显示的 toast 直接收掉，下次按新方式显示
+pub fn render_mode_changed() {
+    with(|s| unsafe {
+        if s.gpu_win && !want_gpu() {
+            let _ = KillTimer(Some(s.hwnd), TIMER_ANIM);
+            let _ = KillTimer(Some(s.hwnd), TIMER_HIDE);
+            let _ = ShowWindow(s.hwnd, SW_HIDE);
+            *s.blit.borrow_mut() = None;
+            if s.spec.is_some() {
+                s.spec = None;
+                s.hovering = false;
+                s.glass = None;
+                SHOWN.store(false, Ordering::SeqCst);
+                super::strip::set_hidden(false);
+            }
+        }
+    });
 }
 
 fn layout(dw: &IDWriteFactory, s: &str, size: f32, weight: DWRITE_FONT_WEIGHT, max_w: f32) -> Option<(IDWriteTextLayout, f64)> {
@@ -234,6 +273,9 @@ pub fn show(spec: ToastSpec) {
     }
     let hold = spec.hold_ms;
     with(|s| unsafe {
+        if s.spec.is_none() {
+            sync_mode(s);
+        }
         if s.gfx.is_none() {
             // init failed earlier (e.g. during a driver update): try again
             s.gfx = create_gfx();
@@ -478,7 +520,8 @@ fn animate(s: &mut State, to: f64) {
         if to <= 0.0 {
             let _ = KillTimer(Some(s.hwnd), TIMER_HIDE);
         }
-        SetTimer(Some(s.hwnd), TIMER_ANIM, 16, None);
+        // GPU：按显示器刷新率出帧（交换链呈现跟 vsync）；CPU：16 ms
+        SetTimer(Some(s.hwnd), TIMER_ANIM, if s.gpu_win { crate::gpu::frame_ms() } else { 16 }, None);
     }
 }
 
@@ -759,11 +802,29 @@ fn render(s: &State) -> bool {
                     }
                 }
             }
-            let size = SIZE { cx: w, cy: h };
-            let src = POINT { x: 0, y: 0 };
-            let pt = POINT { x: s.win.0, y: s.win.1 };
-            let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
-            let _ = UpdateLayeredWindow(s.hwnd, Some(screen), Some(&pt), Some(&size), Some(mem), Some(&src), COLORREF(0), Some(&blend), ULW_ALPHA);
+            if s.gpu_win {
+                // GPU 呈现：D2D 画好的帧上传成纹理，DComp 交换链呈现
+                let mut b = s.blit.borrow_mut();
+                if b.as_ref().is_none_or(|x| x.size() != (w as u32, h as u32)) {
+                    match b.as_mut() {
+                        Some(x) => {
+                            x.resize(w as u32, h as u32);
+                        }
+                        None => *b = crate::gpu::Blit::new(s.hwnd, w as u32, h as u32),
+                    }
+                }
+                if let (Some(x), false) = (b.as_mut(), bits.is_null()) {
+                    let px = std::slice::from_raw_parts(bits as *const crate::compose::Bgra, (w * h) as usize);
+                    x.upload(px, w as usize, h as usize, None);
+                    x.present(1.0);
+                }
+            } else {
+                let size = SIZE { cx: w, cy: h };
+                let src = POINT { x: 0, y: 0 };
+                let pt = POINT { x: s.win.0, y: s.win.1 };
+                let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+                let _ = UpdateLayeredWindow(s.hwnd, Some(screen), Some(&pt), Some(&size), Some(mem), Some(&src), COLORREF(0), Some(&blend), ULW_ALPHA);
+            }
             SelectObject(mem, old);
             let _ = DeleteObject(bmp.into());
         }
@@ -776,6 +837,19 @@ fn render(s: &State) -> bool {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
+        WM_NCHITTEST => {
+            // GPU 版没有逐像素 alpha 命中：卡片外（阴影外沿）点击穿透
+            let pass = with(|s| {
+                if !s.gpu_win {
+                    return false;
+                }
+                let (x, y) = ((lparam.0 & 0xffff) as i16 as f64 - s.win.0 as f64, ((lparam.0 >> 16) & 0xffff) as i16 as f64 - s.win.1 as f64);
+                card_rect(s).is_some_and(|(cx, cy, cw, ch)| !(x >= cx && y >= cy && x < cx + cw && y < cy + ch))
+            });
+            if pass == Some(true) {
+                return LRESULT(windows::Win32::UI::WindowsAndMessaging::HTTRANSPARENT as isize);
+            }
+        }
         WM_MOUSEMOVE => {
             with(|s| {
                 if !s.hovering {
@@ -824,6 +898,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             if s.to <= 0.0 {
                                 let _ = KillTimer(Some(hwnd), TIMER_HIDE);
                                 let _ = ShowWindow(s.hwnd, SW_HIDE);
+                                *s.blit.borrow_mut() = None;
                                 s.spec = None;
                                 s.hovering = false;
                                 s.glass = None; // window-sized backdrop copy: free it

@@ -1470,3 +1470,67 @@ pub fn drop_panel_glass() {
 pub fn hardware() -> bool {
     with(|g| !g.warp).unwrap_or(false)
 }
+
+/// 一个窗口的 GPU 呈现（停靠条、toast、设置页）：内容还是 CPU 画的预乘 BGRA，上传成纹理后经 DComp
+/// 交换链呈现（不再走 UpdateLayeredWindow / SetDIBitsToDevice）。窗口要带 WS_EX_NOREDIRECTIONBITMAP。
+pub struct Blit {
+    surf: Surface,
+    tex: Option<Tex>,
+}
+
+impl Blit {
+    pub fn new(hwnd: HWND, w: u32, h: u32) -> Option<Blit> {
+        if !active() {
+            return None;
+        }
+        Some(Blit { surf: Surface::new(hwnd, w, h)?, tex: None })
+    }
+
+    pub fn resize(&mut self, w: u32, h: u32) -> bool {
+        self.surf.resize(w, h)
+    }
+
+    /// 上传 `rows`（None = 整幅；纹理尺寸变了也整幅）
+    pub fn upload(&mut self, px: &[Bgra], w: usize, h: usize, rows: Option<(usize, usize)>) {
+        if w == 0 || h == 0 || px.len() < w * h {
+            return;
+        }
+        let tex = self.tex.take();
+        self.tex = with(|g| {
+            let g: &Gpu = g;
+            let (t, fresh) = match tex {
+                Some(t) if t.w == w as u32 && t.h == h as u32 => (t, false),
+                _ => (g.tex(w as u32, h as u32, DXGI_FORMAT_B8G8R8A8_UNORM)?, true),
+            };
+            let (y0, y1) = if fresh { (0, h) } else { rows.unwrap_or((0, h)) };
+            g.upload(&t, px, w, y0, y1);
+            Some(t)
+        })
+        .flatten();
+    }
+
+    /// 呈现纹理 × 整体透明度（交换链空着才等；不阻塞 UI 线程超过 0 ms）
+    pub fn present(&self, alpha: f32) {
+        with(|g| {
+            let g: &Gpu = g;
+            let Some(bb) = self.surf.bb.as_ref() else { return };
+            self.surf.wait(0);
+            match self.tex.as_ref() {
+                Some(t) if alpha > 0.0 => {
+                    let mut cb = [0f32; 24];
+                    cb[5] = alpha.clamp(0.0, 1.0);
+                    cb[9] = 1.0;
+                    cb[16] = t.w as f32;
+                    cb[17] = t.h as f32;
+                    g.draw_rtv(&g.sh_.present, Some(bb), self.surf.w, self.surf.h, [t.srv.clone(), None], &cb, false, None);
+                }
+                _ => unsafe { g.ctx.ClearRenderTargetView(bb, &[0.0; 4]) },
+            }
+        });
+        self.surf.present();
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        (self.surf.w, self.surf.h)
+    }
+}

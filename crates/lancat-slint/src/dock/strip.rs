@@ -33,7 +33,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_CANCEL, T
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, KillTimer, LoadCursorW, RegisterClassW, SetTimer, SetWindowPos, ShowWindow, UpdateLayeredWindow, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE,
     SPI_SETWORKAREA, SWP_NOACTIVATE, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_SETTINGCHANGE, WM_TIMER,
-    WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_EX_NOREDIRECTIONBITMAP,
 };
 
 use super::{DockVisual, Rect};
@@ -87,6 +87,10 @@ struct State {
     timer_on: bool,
     /// Hidden (the message toast stands in for it): no timer at all.
     hidden: bool,
+    /// GPU 呈现（NOREDIRECTIONBITMAP 窗口 + DComp 交换链）；None = CPU（UpdateLayeredWindow）
+    blit: Option<crate::gpu::Blit>,
+    /// 最近一次 place 的窗口矩形（换窗口时用）
+    rect: (i32, i32, i32, i32),
 }
 
 thread_local! {
@@ -97,6 +101,44 @@ thread_local! {
 /// can re-enter the window procedure synchronously; those nested messages are simply skipped.
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
     STATE.with(|s| s.try_borrow_mut().ok().and_then(|mut b| b.as_mut().map(f)))
+}
+
+fn mk_window(gpu: bool) -> Option<HWND> {
+    unsafe {
+        let hmod = GetModuleHandleW(None).ok()?;
+        let ex = if gpu { WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE } else { WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE };
+        let h = CreateWindowExW(ex, w!("LancatDockStrip"), w!("Lancat Dock"), WS_POPUP, 0, 0, 6, 160, None, None, Some(hmod.into()), None).map_err(|e| log::warn!("native dock: CreateWindowExW failed: {e}")).ok()?;
+        super::drop::register(h);
+        Some(h)
+    }
+}
+
+/// 渲染方式切换（GPU 设备接上 / 设置页切换）：换成对应的窗口（同位置、同显示状态），重画
+pub fn set_gpu(on: bool) {
+    let on = on && std::env::var("LANCAT_STRIP_GPU").as_deref() != Ok("0");
+    with(|s| unsafe {
+        if on == s.blit.is_some() {
+            return;
+        }
+        let Some(h) = mk_window(on) else { return };
+        let old = s.hwnd;
+        let vis = windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(old).as_bool();
+        for t in [TIMER_HOVER, TIMER_ANIM, TIMER_LAYOUT] {
+            let _ = KillTimer(Some(old), t);
+        }
+        s.timer_on = false;
+        s.hwnd = h;
+        let (x, y, w, hh) = s.rect;
+        let _ = SetWindowPos(h, Some(HWND_TOPMOST), x, y, w, hh, SWP_NOACTIVATE);
+        s.blit = if on { crate::gpu::Blit::new(h, s.w.max(1) as u32, s.h.max(1) as u32) } else { None };
+        render(s);
+        if vis && !s.hidden {
+            let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+        }
+        let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(old);
+        sync_timer(s);
+        log::info!("dock strip: {} present", if s.blit.is_some() { "GPU" } else { "CPU" });
+    });
 }
 
 pub fn create() {
@@ -111,28 +153,12 @@ pub fn create() {
             ..Default::default()
         };
         RegisterClassW(&wc);
-        let Ok(hwnd) = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-            class,
-            w!("Lancat Dock"),
-            WS_POPUP,
-            0,
-            0,
-            6,
-            160,
-            None,
-            None,
-            Some(hmod.into()),
-            None,
-        ) else {
-            log::warn!("native dock: CreateWindowExW failed");
-            return;
-        };
-        super::drop::register(hwnd);
+        let _ = class;
+        let Some(hwnd) = mk_window(false) else { return };
         let idle = Look { thick: IDLE_THICK, alpha: IDLE_ALPHA };
         STATE.with(|s| {
             *s.borrow_mut() =
-                Some(State { hwnd, visual: DockVisual::default(), hovering: false, pulse_t0: None, w: 6, h: 160, scale: 1.0, look: idle, anim: None, timer_on: false, hidden: false })
+                Some(State { hwnd, visual: DockVisual::default(), hovering: false, pulse_t0: None, w: 6, h: 160, scale: 1.0, look: idle, anim: None, timer_on: false, hidden: false, blit: None, rect: (0, 0, 6, 160) })
         });
     }
 }
@@ -144,6 +170,10 @@ pub fn place(r: Rect, _origin: (f64, f64), scale: f64) {
         s.w = w;
         s.h = h;
         s.scale = scale;
+        s.rect = (r.x.round() as i32, r.y.round() as i32, w, h);
+        if let Some(b) = s.blit.as_mut() {
+            b.resize(w as u32, h as u32);
+        }
         let _ = SetWindowPos(s.hwnd, Some(HWND_TOPMOST), r.x.round() as i32, r.y.round() as i32, w, h, SWP_NOACTIVATE);
         render(s);
     });
@@ -295,7 +325,7 @@ fn sd_round_rect(px: f64, py: f64, x: f64, y: f64, w: f64, h: f64, r: f64) -> f6
 }
 
 /// Draws the strip into a premultiplied BGRA DIB and hands it to DWM (per-pixel alpha).
-fn render(s: &State) {
+fn render(s: &mut State) {
     let (w, h) = (s.w, s.h);
     let v = &s.visual;
     let vertical = v.edge == "left" || v.edge == "right";
@@ -339,6 +369,15 @@ fn render(s: &State) {
             let q = |c: f64| (c * 255.0).round().clamp(0.0, 255.0) as u32;
             px[(j * w + i) as usize] = q(a) << 24 | q(cr) << 16 | q(cg) << 8 | q(cb);
         }
+    }
+    let pa = pulse_alpha(s);
+    if let Some(b) = s.blit.as_mut() {
+        // GPU：像素（预乘 BGRA，就是 u32 的小端布局）上传成纹理，交换链呈现；脉动 = 呈现时的整体透明度
+        // SAFETY: u32 和 Bgra 都是 4 字节，小端下 0xAARRGGBB = B,G,R,A
+        let bg = unsafe { std::slice::from_raw_parts(px.as_ptr() as *const crate::compose::Bgra, px.len()) };
+        b.upload(bg, w as usize, h as usize, None);
+        b.present(pa as f32 / 255.0);
+        return;
     }
     unsafe {
         let screen = GetDC(None);
@@ -385,6 +424,10 @@ fn pulse_alpha(s: &State) -> u8 {
 
 /// Re-blends the last bitmap with the current pulse alpha (no redraw).
 fn pulse_only(s: &State) {
+    if let Some(b) = s.blit.as_ref() {
+        b.present(pulse_alpha(s) as f32 / 255.0);
+        return;
+    }
     let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: pulse_alpha(s), AlphaFormat: AC_SRC_ALPHA as u8 };
     unsafe {
         let _ = UpdateLayeredWindow(s.hwnd, None, None, None, None, None, COLORREF(0), Some(&blend), ULW_ALPHA);

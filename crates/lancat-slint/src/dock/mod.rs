@@ -531,6 +531,19 @@ pub fn on_diag_alert(title: &str, detail: &str) {
     }
 }
 
+/// 测试脚本 dtoast：直接鼓出一条停靠条 toast（不弹托盘气泡）
+pub fn test_toast(text: &str) {
+    let spec = with(|d| -> Option<toast::ToastSpec> {
+        let geo = d.geo?;
+        let dark = crate::theme_is_dark(&d.node.settings().theme);
+        Some(toast::ToastSpec { peer_id: UPDATE_TOAST.into(), name: "Lancat".into(), text: text.to_string(), edge: current_edge(d), strip: geo.dock, scale: geo.scale, dark, hold_ms: 4000, emoji: None })
+    })
+    .flatten();
+    if let Some(spec) = spec {
+        toast::show(spec);
+    }
+}
+
 /// 新版本提醒的 toast 标识：点它打开设置的「更新」。
 pub const UPDATE_TOAST: &str = "__update__";
 
