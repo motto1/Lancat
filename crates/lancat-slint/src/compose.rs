@@ -149,6 +149,21 @@ thread_local! {
     static LAYER_ANIM: Cell<bool> = const { Cell::new(false) };
 }
 
+thread_local! {
+    /// 这一帧是在 GPU 上合成的（结果在 GPU 纹理里，CPU 缓冲不是这一帧）
+    static GPU_FRAME: Cell<bool> = const { Cell::new(false) };
+}
+
+/// 上一次 render() 的结果在 GPU 上（win.rs：不用上传 CPU 缓冲，直接呈现）
+pub fn gpu_frame() -> bool {
+    GPU_FRAME.with(|g| g.get())
+}
+
+/// 有入场/弹出姿态动画在跑（高刷新率下由事件循环逐帧要帧，不靠 15 ms 的 tick）
+pub fn pose_animating() -> bool {
+    ANIMS.with(|m| !m.borrow().is_empty())
+}
+
 fn pose(id: i32) -> Option<Pose> {
     ANIMS.with(|m| {
         let m = m.borrow();
@@ -196,11 +211,18 @@ pub fn render(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize,
     let out = render_inner(renderer, buf, w, h, scale, reused);
     let gap = LAST.with(|l| l.replace(Some(t))).map(|p| t.duration_since(p).as_secs_f32() * 1000.0).unwrap_or(0.0);
     let ph = PH.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    #[cfg(windows)]
+    let ph = if crate::gpu::active() { format!("{ph} gpu present={:.1}", crate::gpu::last_present_ms()) } else { ph };
     log::info!("frame {:.1} ms (gap {:.1} ms){}{ph}", t.elapsed().as_secs_f32() * 1000.0, gap, if matches!(out, Out::Full) { " composed" } else { "" });
     out
 }
 
 fn render_inner(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize, scale: f32, reused: bool) -> Out {
+    GPU_FRAME.with(|g| g.set(false));
+    #[cfg(windows)]
+    if crate::gpu::compose_enabled() {
+        return render_gpu(renderer, buf, w, h, scale, reused);
+    }
     let Some(ui) = panel() else {
         let r = renderer.render(buf, w);
         return Out::Partial(region_box(&r));
@@ -1400,4 +1422,236 @@ fn blur_full(buf: &mut [f32], w: usize, h: usize, sigma: f32) {
             }
         }
     }
+}
+
+// ------------------------------------------------------------------ GPU 合成（Windows，见 gpu.rs）
+
+#[cfg(windows)]
+thread_local! {
+    /// GPU 路径的层 5（拖放选择器）冻结状态：出现时刻、是否已按静止底图重算并冻结
+    static G5: Cell<Option<(Instant, bool)>> = const { Cell::new(None) };
+    /// 冻结期间层 5 以上静态层的纹理已是最新（不再渲染/上传）
+    static GFROZEN: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+    /// GPU 路径上一帧的几何签名（单层、签名不变时可以只重画层、复用基底纹理）
+    static GSIG: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    /// 本帧上传纹理用掉的时间（已含在 base / rN 里，单独列出来）
+    static UP_MS: Cell<f32> = const { Cell::new(0.0) };
+}
+
+/// 层内容在源坐标里可能占的行（层矩形外扩 96 px 阴影边距，与 CPU 版 out_box 的边距相同）
+#[cfg(windows)]
+fn layer_rows(g: &Geo, scale: f32, h: usize) -> (usize, usize) {
+    let m = 96.0 * scale;
+    (((g.ly - m).floor().max(0.0) as usize).min(h), ((g.ly + g.lh + m).ceil().max(0.0) as usize).min(h))
+}
+
+/// GPU 版的 render_inner：Slint 照旧在 CPU 上逐层光栅化（基底 + 每个活动层），滤镜/变换/叠加在 GPU 上。
+/// 渲染器缓存、pass 切换、层 5 冻结、增量探测的规则与 CPU 版相同。
+#[cfg(windows)]
+fn render_gpu(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize, scale: f32, reused: bool) -> Out {
+    use crate::gpu;
+    let Some(ui) = panel() else {
+        let r = renderer.render(buf, w);
+        return Out::Partial(region_box(&r));
+    };
+    let fx = ui.global::<Fx>();
+    let layers = ui.get_fx_layers();
+    let mut active: Vec<(crate::FxLayer, Pose)> = Vec::new();
+    let mut any = false;
+    for l in layers.iter() {
+        if !l.shown {
+            continue;
+        }
+        let p = pose(l.id).or_else(|| if l.parent != 0 { pose(l.parent).map(|p| Pose { tx: 0.0, ty: 0.0, s: 1.0, ..p }) } else { None });
+        let p = if l.shrink > 0.0005 { Some(Pose { s: (1.0 - l.shrink) * p.map_or(1.0, |p| p.s), ..p.unwrap_or(Pose::ID) }) } else { p };
+        let needs = p.is_some() || l.blur > 0.0 || l.lq > 0.0;
+        if needs || any {
+            any = true;
+            active.push((l, p.unwrap_or(Pose::ID)));
+        }
+    }
+    let set_flags = |ids: &[i32]| {
+        let has = |i: i32| ids.contains(&i);
+        let pairs: [(i32, fn(&Fx, bool)); 9] = [
+            (2, |f, v| f.set_a2(v)),
+            (3, |f, v| f.set_a3(v)),
+            (4, |f, v| f.set_a4(v)),
+            (5, |f, v| f.set_a5(v)),
+            (6, |f, v| f.set_a6(v)),
+            (7, |f, v| f.set_a7(v)),
+            (8, |f, v| f.set_a8(v)),
+            (9, |f, v| f.set_a9(v)),
+            (10, |f, v| f.set_a10(v)),
+        ];
+        for (i, set) in pairs {
+            set(&fx, has(i));
+        }
+    };
+    let shown: Vec<i32> = active.iter().filter(|(l, _)| l.blur > 0.0 || l.lq > 0.0).map(|(l, _)| l.id).collect();
+    let ids: Vec<i32> = active.iter().map(|(l, _)| l.id).collect();
+    gpu::retain(&shown, &ids);
+    if active.is_empty() {
+        LAYER_ANIM.with(|a| a.set(false));
+        G5.with(|g| g.set(None));
+        GFROZEN.with(|f| f.borrow_mut().clear());
+        gpu::drop_under5();
+        if fx.get_pass() != 0 {
+            fx.set_pass(0);
+            set_flags(&[]);
+        }
+        if WAS.with(|w| w.replace(false)) {
+            set_flags(&[]);
+            clear(buf);
+            renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
+            renderer.render(buf, w);
+            if reused {
+                renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
+            }
+            return Out::Full;
+        }
+        let r = renderer.render(buf, w);
+        return Out::Partial(region_box(&r));
+    }
+    if !gpu::frame_begin(w, h) {
+        log::warn!("gpu: frame textures unavailable");
+        return Out::Partial(None);
+    }
+    let was = WAS.with(|x| x.replace(true));
+    set_flags(&ids);
+    let sig = layer_sig(&active, w, h, scale);
+    // 增量探测（单层、姿态不变）：没变化就不画；变化落在层矩形里时复用基底纹理（最多拖 BASE_LAG）
+    let mut reuse_base = false;
+    let single_ok = reused && was && active.len() == 1 && gpu::has_base() && GSIG.with(|g| *g.borrow() == sig);
+    if single_ok {
+        renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
+        let t0 = Instant::now();
+        let reg = renderer.render_by_line(Rearm);
+        phase("probe", t0);
+        let Some((dx, dy, dw, dh)) = region_box(&reg) else {
+            // 没变化：显示的仍是上一帧 GPU 合成的结果
+            GPU_FRAME.with(|g| g.set(true));
+            return finish(&ui, None);
+        };
+        let d = (dx.max(0) as usize, dy.max(0) as usize, ((dx + dw as i32).max(0) as usize).min(w), ((dy + dh as i32).max(0) as usize).min(h));
+        if d.2 <= d.0 || d.3 <= d.1 {
+            GPU_FRAME.with(|g| g.set(true));
+            return finish(&ui, None);
+        }
+        let (l, p) = &active[0];
+        let g = Geo::new(l, p, scale);
+        let inner = fbox((g.lx, g.ly, g.lx + g.lw, g.ly + g.lh), w, h);
+        let inside = p.identity() && d.0 >= inner.0 && d.1 >= inner.1 && d.2 <= inner.2 && d.3 <= inner.3;
+        let stale = BASE_SKIP.with(|b| b.get().is_some_and(|t| t.elapsed() >= BASE_LAG));
+        reuse_base = inside && !stale;
+        fx.set_pass(0);
+    }
+    renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
+    let i5 = active.iter().position(|(l, _)| l.id == 5);
+    if i5.is_none() {
+        G5.with(|g| g.set(None));
+        GFROZEN.with(|f| f.borrow_mut().clear());
+        gpu::drop_under5();
+    }
+    let frozen5 = i5.is_some() && G5.with(|g| g.get().is_some_and(|(_, s)| s)) && gpu::has_bs(5);
+    let skip_below = frozen5 && gpu::has_under5();
+    let t0 = Instant::now();
+    if skip_below {
+        gpu::start(true);
+    } else if reuse_base {
+        BASE_SKIP.with(|b| {
+            if b.get().is_none() {
+                b.set(Some(Instant::now()));
+            }
+        });
+        gpu::start(false);
+    } else {
+        fx.set_pass(1);
+        clear(buf);
+        renderer.render(buf, w);
+        let tu = Instant::now();
+        gpu::upload_base(buf, w, h);
+        UP_MS.with(|u| u.set(u.get() + tu.elapsed().as_secs_f32() * 1000.0));
+        BASE_SKIP.with(|b| b.set(None));
+        gpu::start(false);
+    }
+    phase("base", t0);
+    GSIG.with(|g| *g.borrow_mut() = sig);
+    TMP.with(|t| {
+        let mut tmp = t.borrow_mut();
+        if tmp.len() != buf.len() {
+            *tmp = vec![Bgra::default(); buf.len()];
+        }
+        for (k, (l, p)) in active.iter().enumerate() {
+            if skip_below && Some(k) < i5 {
+                continue;
+            }
+            let t0 = Instant::now();
+            let g = Geo::new(l, p, scale);
+            let static_above = frozen5 && Some(k) > i5 && l.id != 6;
+            let cached = static_above && gpu::has_layer(l.id) && GFROZEN.with(|f| f.borrow().contains(&l.id));
+            if !cached {
+                fx.set_pass(l.id);
+                clear(&mut tmp);
+                renderer.render(&mut tmp[..], w);
+                let tu = Instant::now();
+                gpu::upload_layer(l.id, &tmp, w, layer_rows(&g, scale, h));
+                UP_MS.with(|u| u.set(u.get() + tu.elapsed().as_secs_f32() * 1000.0));
+                if static_above {
+                    GFROZEN.with(|f| f.borrow_mut().push(l.id));
+                }
+            }
+            if stats_on() {
+                phase(&format!("r{}", l.id), t0);
+            }
+            let t0 = Instant::now();
+            let (x0, y0) = g.map(p, g.lx, g.ly);
+            let (x1, y1) = g.map(p, g.lx + g.lw, g.ly + g.lh);
+            let rect = [x0, y0, x1, y1];
+            let backdrop_done = skip_below && Some(k) == i5;
+            if backdrop_done {
+            } else if l.blur > 0.0 && l.lq <= 0.0 {
+                // 纯模糊：与 backdrop_static 相同的重算规则（层 5：出现时算一次，0.6 s 后按静止底图再算一次并冻结；
+                // 其他层：每帧按当前底图算 —— GPU 上很便宜，等价于 CPU 版的「输入变了就重算」）
+                let recompute = if l.id == 5 {
+                    match G5.with(|g| g.get()) {
+                        None => {
+                            G5.with(|g| g.set(Some((Instant::now(), false))));
+                            true
+                        }
+                        Some((born, false)) if born.elapsed().as_secs_f32() > 0.6 => {
+                            G5.with(|g| g.set(Some((born, true))));
+                            true
+                        }
+                        _ => !gpu::has_bs(5),
+                    }
+                } else {
+                    true
+                };
+                gpu::backdrop_blur(l.id, recompute, rect, l.r * scale * p.s, l.blur * scale, l.sat, p.op);
+                if stats_on() && recompute {
+                    PH.with(|ph| ph.borrow_mut().push_str(" bs-full"));
+                }
+            } else if l.blur > 0.0 || l.lq > 0.0 {
+                let bevel = 14.0f32.min(l.h / 2.0) * scale * p.s;
+                gpu::backdrop_liquid(rect, l.r * scale * p.s, l.blur * scale * p.s, l.sat, l.lq * scale * p.s, bevel, p.op);
+            }
+            if Some(k) == i5 && frozen5 && !skip_below {
+                // 层 5 冻结：「下面所有内容 + 模糊底图」存一份，之后每帧从它开始
+                gpu::save_under5();
+            }
+            let ob = fbox(g.out_box(p, scale), w, h);
+            gpu::over_layer(l.id, g.ox, g.oy, p.s, g.tx, g.ty, p.op, ob);
+            if stats_on() {
+                phase(&format!("c{}", l.id), t0);
+            }
+        }
+    });
+    fx.set_pass(0);
+    gpu::end_compose();
+    if stats_on() {
+        let up = UP_MS.with(|u| u.replace(0.0));
+        PH.with(|p| p.borrow_mut().push_str(&format!(" up={up:.1}")));
+    }
+    GPU_FRAME.with(|g| g.set(true));
+    finish_rearm(renderer, &ui, reused, None)
 }

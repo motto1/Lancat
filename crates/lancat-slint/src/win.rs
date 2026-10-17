@@ -79,7 +79,9 @@ impl Win32Platform {
             let mut msg = MSG::default();
             let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
         }
-        Win32Platform { thread: unsafe { GetCurrentThreadId() }, queue: Default::default(), quit: Default::default() }
+        let thread = unsafe { GetCurrentThreadId() };
+        crate::gpu::prewarm(thread);
+        Win32Platform { thread, queue: Default::default(), quit: Default::default() }
     }
 }
 
@@ -125,6 +127,29 @@ impl slint::platform::Platform for Win32Platform {
             // render windows whose contents changed
             let wins: Vec<Rc<Win32Window>> = WINDOWS.with(|w| w.borrow().iter().filter_map(|(_, w)| w.upgrade()).collect());
             for w in &wins {
+                if w.gpu_pending.get() {
+                    w.poll_gpu();
+                }
+            }
+            // GPU 面板在合成 / 层动画中：按显示器刷新率逐帧要帧（144 Hz），不再等 15 ms 的 tick
+            let fast = wins.iter().any(|w| w.gpu.get()) && (crate::compose::animating() || crate::compose::gpu_frame());
+            if fast && crate::compose::pose_animating() {
+                if let Some(p) = wins.iter().find(|w| w.gpu.get()) {
+                    p.needs_redraw.set(true);
+                }
+            }
+            for w in &wins {
+                if w.gpu.get() {
+                    if w.needs_redraw.get() {
+                        let r = w.render();
+                        if r.is_some() || w.needs_present.get() {
+                            w.present_gpu(r);
+                        }
+                    } else if w.needs_present.get() {
+                        w.present_gpu(None);
+                    }
+                    continue;
+                }
                 if w.needs_redraw.get() {
                     // 先渲染（ReusedBuffer 只重画脏区），再只让脏区失效：WM_PAINT 只拷贝这一块，
                     // 不再每帧整窗 SetDIBitsToDevice（无设备时的雷达动画从 ~40% 单核降下来）
@@ -138,9 +163,19 @@ impl slint::platform::Platform for Win32Platform {
             }
             let wait = slint::platform::duration_until_next_timer_update();
             let anim = wins.iter().any(|w| w.window.has_active_animations() || w.settling()) || crate::compose::animating();
-            let ms = if anim { 16 } else { wait.map(|d| d.as_millis().min(u32::MAX as u128 - 1) as u32).unwrap_or(INFINITE) };
+            let anim = anim || fast;
+            let ms = if fast { crate::gpu::frame_ms() } else if anim { 16 } else { wait.map(|d| d.as_millis().min(u32::MAX as u128 - 1) as u32).unwrap_or(INFINITE) };
+            // 刚呈现过：等交换链的 frame-latency 句柄（vsync 节拍），期间照常处理消息
+            let wh = if fast { crate::gpu::wait_handle() } else { None };
             unsafe {
-                MsgWaitForMultipleObjectsEx(None, ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                if let Some(hh) = wh {
+                    let r = MsgWaitForMultipleObjectsEx(Some(&[hh]), 40, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                    if r == WAIT_OBJECT_0 {
+                        crate::gpu::waited();
+                    }
+                } else {
+                    MsgWaitForMultipleObjectsEx(None, ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                }
                 let mut msg = MSG::default();
                 while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                     if msg.message == WM_QUIT {
@@ -221,6 +256,12 @@ pub struct Win32Window {
     /// 合成 lq_base 用的那张模糊背景（收起动画直接拿它当玻璃，不用再截屏）
     lq_glass: RefCell<Vec<Bgra>>,
     lq_dark: Cell<bool>,
+    /// 面板走 GPU 呈现（DirectComposition 交换链）；false = CPU（SetDIBitsToDevice）
+    gpu: Cell<bool>,
+    /// 窗口按 GPU 建的（NOREDIRECTIONBITMAP），交换链还没接上
+    gpu_pending: Cell<bool>,
+    /// 透明度 / 玻璃底变了，下一轮要重新呈现（GPU）
+    needs_present: Cell<bool>,
 }
 
 const CLASS: PCWSTR = w!("LancatSlintPanel");
@@ -248,6 +289,9 @@ impl Win32Window {
             lq_base: RefCell::new(Vec::new()),
             lq_glass: RefCell::new(Vec::new()),
             lq_dark: Cell::new(false),
+            gpu: Cell::new(false),
+            gpu_pending: Cell::new(false),
+            needs_present: Cell::new(false),
             normal: NEXT_NORMAL.with(|n| n.replace(false)),
             shown_once: Cell::new(false),
         });
@@ -264,7 +308,12 @@ impl Win32Window {
             };
             RegisterClassExW(&wc);
             let (ex, style) = if rc.normal { (WINDOW_EX_STYLE(0), WS_OVERLAPPEDWINDOW) } else { (WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, WS_POPUP) };
-            let h = CreateWindowExW(ex, CLASS, w!("Lancat"), style, 0, 0, 480, 620, None, None, Some(inst), None).map_err(|e| e.to_string())?;
+            // GPU：面板不要重定向位图（内容来自 DComp visual），一开始也不是 layered（停放时才加，见 set_layered）
+            // 设备在后台线程建（Win32Platform::new 里 prewarm），事件循环里 poll_attach 接上交换链
+            let want_gpu = !rc.normal && crate::gpu::wanted();
+            let ex_gpu = (ex & !WS_EX_LAYERED) | WS_EX_NOREDIRECTIONBITMAP;
+            let h = CreateWindowExW(if want_gpu { ex_gpu } else { ex }, CLASS, w!("Lancat"), style, 0, 0, 480, 620, None, None, Some(inst), None).map_err(|e| e.to_string())?;
+            rc.gpu_pending.set(want_gpu);
             rc.hwnd.set(h);
             WINDOWS.with(|w| w.borrow_mut().push((h.0 as isize, Rc::downgrade(&rc))));
             PANEL.with(|p| {
@@ -272,7 +321,7 @@ impl Win32Window {
                     *p.borrow_mut() = Rc::downgrade(&rc);
                 }
             });
-            if !rc.normal {
+            if !rc.normal && !rc.gpu_pending.get() {
                 let _ = SetLayeredWindowAttributes(h, COLORREF(0), 0, LWA_ALPHA);
             }
             let scale = GetDpiForWindow(h) as f32 / 96.0;
@@ -346,6 +395,13 @@ impl Win32Window {
             if k < 1.0 {
                 let e = crate::fx::bezier(0.2, 0.8, 0.3, 1.0, k);
                 let sc = 0.985 + 0.015 * e;
+                if self.gpu.get() {
+                    // GPU：缩放在呈现着色器里做；帧本身照常（脏区上传）
+                    crate::gpu::set_settle(sc);
+                    self.xformed.set(true);
+                    self.needs_redraw.set(true);
+                    return Some(RECT { left: 0, top: 0, right: w as i32, bottom: hgt as i32 });
+                }
                 let mut xb = self.xbuf.borrow_mut();
                 if xb.len() != buf.len() {
                     *xb = vec![Bgra::default(); buf.len()];
@@ -356,6 +412,9 @@ impl Win32Window {
                 return Some(RECT { left: 0, top: 0, right: w as i32, bottom: hgt as i32 });
             }
             self.settle.set(None);
+            if self.gpu.get() {
+                crate::gpu::set_settle(1.0);
+            }
         }
         if was {
             full = true;
@@ -369,12 +428,68 @@ impl Win32Window {
         }
     }
 
+    /// 后台设备好了没有：好了就接上交换链，切到 GPU 呈现；失败就把窗口换成 CPU 版（layered + 重定向位图）
+    fn poll_gpu(&self) {
+        let h = self.hwnd.get();
+        let size = self.size.get();
+        match crate::gpu::poll_attach(h, size.width, size.height) {
+            crate::gpu::Attach::Pending => {}
+            crate::gpu::Attach::Ok => {
+                self.gpu_pending.set(false);
+                self.gpu.set(true);
+                crate::gpu::set_opacity(self.alpha.get() as f32 / 255.0);
+                // 不停放时不要 layered（DComp 内容）；停放的保持 layered + 点击穿透
+                if self.alpha.get() > 0 {
+                    set_layered(h, false);
+                }
+                // 整帧重画并上传
+                self.buf.borrow_mut().clear();
+                self.needs_redraw.set(true);
+                self.needs_present.set(true);
+            }
+            crate::gpu::Attach::Failed => {
+                self.gpu_pending.set(false);
+                log::warn!("gpu: unavailable, rebuilding the panel window for CPU present");
+                recreate_cpu(self);
+            }
+        }
+    }
+
     fn settling(&self) -> bool {
         self.settle.get().is_some()
     }
 
+    /// GPU：把这一帧交给交换链。CPU 渲染的帧只上传变了的行；GPU 合成的帧已经在纹理里。
+    fn present_gpu(&self, r: Option<RECT>) {
+        if let Some(r) = r {
+            if !crate::compose::gpu_frame() {
+                let size = self.size.get();
+                let (w, h) = (size.width as usize, size.height as usize);
+                let buf = self.buf.borrow();
+                if buf.len() == w * h && w > 0 {
+                    crate::gpu::upload_cpu(&buf, w, h, r.top.max(0) as usize, (r.bottom.max(0) as usize).min(h));
+                }
+            }
+        }
+        self.needs_present.set(false);
+        crate::gpu::present();
+    }
+
     fn paint(&self) {
         let h = self.hwnd.get();
+        if self.gpu.get() {
+            // 内容走 DComp：只把失效区标成有效；有没画的变化就补画并呈现
+            unsafe {
+                let mut ps = PAINTSTRUCT::default();
+                let _ = BeginPaint(h, &mut ps);
+                let _ = EndPaint(h, &ps);
+            }
+            let late = if self.needs_redraw.get() && !self.window.has_active_animations() { self.render() } else { None };
+            if late.is_some() || self.needs_present.get() {
+                self.present_gpu(late);
+            }
+            return;
+        }
         // 在 WM_PAINT 里才发现有新变化（两次循环之间又改了东西）：先渲染，拷完本次失效区后
         // 再把这次的脏区单独失效，否则落在 rcPaint 外的那部分新内容就永远不会被拷到窗口上。
         // 动画进行中的脏区交给外层循环按 16 ms 节奏画，这里补画会和 WM_PAINT 互相触发
@@ -652,6 +767,10 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             let (pw, ph) = ((lp.0 & 0xffff) as u32, ((lp.0 >> 16) & 0xffff) as u32);
             if pw > 0 && ph > 0 {
                 w.size.set(PhysicalSize::new(pw, ph));
+                if w.gpu.get() {
+                    crate::gpu::resize(pw, ph);
+                    w.needs_present.set(true);
+                }
                 let s = w.scale.get();
                 w.window.dispatch_event(WindowEvent::Resized { size: slint::LogicalSize::new(pw as f32 / s, ph as f32 / s) });
                 w.needs_redraw.set(true);
@@ -826,6 +945,44 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
     }
 }
 
+/// GPU 初始化失败：没有重定向位图的窗口画不出 GDI 内容 → 换一个普通的 layered 窗口（同位置、同显示状态）
+fn recreate_cpu(w: &Win32Window) {
+    unsafe {
+        let old = w.hwnd.get();
+        let mut r = RECT::default();
+        let _ = GetWindowRect(old, &mut r);
+        let vis = IsWindowVisible(old).as_bool();
+        let Ok(inst) = GetModuleHandleW(None) else { return };
+        let ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED;
+        let h = match CreateWindowExW(ex, CLASS, w!("Lancat"), WS_POPUP, r.left, r.top, r.right - r.left, r.bottom - r.top, None, None, Some(inst.into()), None) {
+            Ok(h) => h,
+            Err(e) => {
+                log::error!("gpu fallback: CreateWindowExW failed: {e}");
+                return;
+            }
+        };
+        WINDOWS.with(|ws| {
+            for e in ws.borrow_mut().iter_mut() {
+                if e.0 == old.0 as isize {
+                    e.0 = h.0 as isize;
+                }
+            }
+        });
+        w.hwnd.set(h);
+        let _ = SetLayeredWindowAttributes(h, COLORREF(0), w.alpha.get(), LWA_ALPHA);
+        setup_material(h, crate::theme_is_dark("system"));
+        if dock_mode() {
+            crate::dock::drop::register_panel(h);
+        }
+        if vis {
+            let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+        }
+        let _ = DestroyWindow(old);
+        w.buf.borrow_mut().clear();
+        w.needs_redraw.set(true);
+    }
+}
+
 // ---------- material (ported from src-tauri/src/platform/windows.rs) ----------
 
 #[repr(C)]
@@ -922,6 +1079,17 @@ pub fn fade_ms(opening: bool) -> u64 {
 
 fn set_alpha(h: HWND, a: u8, wnd: &Win32Window) {
     wnd.alpha.set(a);
+    if wnd.gpu.get() {
+        // GPU：透明度在呈现着色器里乘；layered 只在停放时开（那时 alpha 0），属性跟着设上，免得 layered 窗口没属性
+        crate::gpu::set_opacity(a as f32 / 255.0);
+        wnd.needs_present.set(true);
+        unsafe {
+            if GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_LAYERED.0 as isize != 0 {
+                let _ = SetLayeredWindowAttributes(h, COLORREF(0), a, LWA_ALPHA);
+            }
+        }
+        return;
+    }
     unsafe {
         let _ = SetLayeredWindowAttributes(h, COLORREF(0), a, LWA_ALPHA);
     }
@@ -944,8 +1112,14 @@ fn fade_to(wnd: &Win32Window, to: u8, ms: u64) {
     let h = wnd.hwnd.get();
     let gen = wnd.fade_gen.get() + 1;
     wnd.fade_gen.set(gen);
-    set_layered(h, true);
+    let gpu = wnd.gpu.get();
     let from = wnd.alpha.get();
+    if gpu {
+        // GPU：淡入淡出期间不是 layered（DComp 内容 + 着色器透明度）；淡出到底才停放（layered + 点击穿透）
+        set_layered(h, false);
+    } else {
+        set_layered(h, true);
+    }
     set_alpha(h, from, wnd);
     let start = std::time::Instant::now();
     let weak = window_for(h).map(|w| Rc::downgrade(&w));
@@ -963,6 +1137,10 @@ fn fade_to(wnd: &Win32Window, to: u8, ms: u64) {
         set_alpha(h, a, &w);
         if t >= 1.0 {
             t2.stop();
+            if gpu && to == 0 {
+                set_layered(h, true);
+                set_alpha(h, 0, &w);
+            }
             if to == 255 {
                 set_layered(h, false);
                 log::info!("panel fully shown {} ms after start", crate::t0().elapsed().as_millis());
@@ -1051,10 +1229,36 @@ fn panel_snapshot() -> Option<(Vec<Bgra>, usize, usize)> {
     let size = w.size.get();
     let n = (size.width * size.height) as usize;
     if w.needs_redraw.get() || w.buf.borrow().len() != n {
-        let _ = w.render();
+        let r = w.render();
+        if w.gpu.get() && r.is_some() && !crate::compose::gpu_frame() {
+            let b = w.buf.borrow();
+            if b.len() == n {
+                crate::gpu::upload_cpu(&b, size.width as usize, size.height as usize, 0, size.height as usize);
+            }
+        }
+    }
+    if w.gpu.get() && crate::compose::gpu_frame() {
+        // GPU 合成的帧不在 CPU 缓冲里：读回
+        return crate::gpu::readback().filter(|(_, pw, ph)| *pw == size.width as usize && *ph == size.height as usize);
     }
     let b = w.buf.borrow();
     (n > 0 && b.len() == n).then(|| (b.clone(), size.width as usize, size.height as usize))
+}
+
+/// 调试：把面板当前合成好的一帧（不含液态玻璃底）写成 PNG（预乘 RGBA 原样），比对 GPU / CPU 合成用
+pub fn dump_panel(path: &str) {
+    let Some((px, w, h)) = panel_snapshot() else { return log::warn!("dump: no frame") };
+    let mut rgba = Vec::with_capacity(px.len() * 4);
+    for p in &px {
+        rgba.extend_from_slice(&[p.r, p.g, p.b, p.a]);
+    }
+    let r = std::fs::File::create(path).map_err(|e| e.to_string()).and_then(|f| {
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w as u32, h as u32);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().and_then(|mut wr| wr.write_image_data(&rgba)).map_err(|e| e.to_string())
+    });
+    log::info!("dump {w}x{h} gpu={} -> {path}: {r:?}", crate::compose::gpu_frame());
 }
 
 /// 用一张背后屏幕的模糊图（窗口尺寸）重建面板的液态玻璃底，整窗重画
@@ -1062,6 +1266,9 @@ fn set_liquid(w: &Win32Window, glass: Option<Vec<Bgra>>, dark: bool) {
     let size = w.size.get();
     let (pw, ph) = (size.width as usize, size.height as usize);
     let Some(glass) = glass.filter(|g| g.len() == pw * ph && pw > 0) else {
+        if w.gpu.get() {
+            crate::gpu::set_lq(None);
+        }
         w.lq_base.borrow_mut().clear();
         w.lq_glass.borrow_mut().clear();
         return;
@@ -1073,6 +1280,10 @@ fn set_liquid(w: &Win32Window, glass: Option<Vec<Bgra>>, dark: bool) {
     // 和变形最后一帧一样的参数（content = 1 只影响顶部高光强度）
     let f = crate::morph::Frame { rect: [0.0, 0.0, pw as f64, ph as f64], radius: 8.0 * sc, content: 1.0, grow: 1.0, done: true };
     crate::morph::render(&mut base, pw, ph, &f, Some(&glass), &content, &crate::morph::Look { dark, scale: sc, accent: crate::dock::ACCENT });
+    if w.gpu.get() {
+        crate::gpu::set_lq(Some((&base, pw, ph)));
+        w.needs_present.set(true);
+    }
     *w.lq_base.borrow_mut() = base;
     *w.lq_glass.borrow_mut() = glass;
     w.lq_dark.set(dark);
@@ -1157,6 +1368,9 @@ fn start_liquid_refresh() {
 /// 立刻停放（alpha 0、点击穿透），取消正在进行的淡入淡出
 fn park_now(w: &Win32Window) {
     let h = w.hwnd.get();
+    if w.gpu.get() {
+        crate::gpu::set_lq(None);
+    }
     w.lq_base.borrow_mut().clear();
     w.lq_glass.borrow_mut().clear();
     w.fade_gen.set(w.fade_gen.get() + 1);

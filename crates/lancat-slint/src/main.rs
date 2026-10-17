@@ -40,6 +40,8 @@ mod toast_emoji;
 mod update;
 #[cfg(windows)]
 mod win;
+#[cfg(windows)]
+mod gpu;
 #[cfg(target_os = "linux")]
 mod wl;
 
@@ -2038,6 +2040,11 @@ fn run_script(parts: &[String]) {
         }
         "hide" => {
             dock::hide_panel();
+            return;
+        }
+        #[cfg(windows)]
+        "dump" => {
+            win::dump_panel(&arg);
             return;
         }
         _ => {}
