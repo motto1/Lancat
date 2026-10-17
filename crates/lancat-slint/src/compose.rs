@@ -304,10 +304,28 @@ fn render_inner(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usiz
         }
     }
     renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
+    // 拖放选择器（层 5）的模糊底图冻结后，它下面的基底和各层都不再影响画面：直接用冻结时存下的合成结果，
+    // 省掉每帧的基底 + 缩小内容层（约 15 ms）
+    let i5 = active.iter().position(|(l, _)| l.id == 5);
+    let frozen5 = i5.is_some() && bs_frozen(5, buf.len());
+    if i5.is_none() {
+        UNDER5.with(|u| u.borrow_mut().clear());
+        FROZEN_TMP.with(|f| f.borrow_mut().clear());
+    }
+    let skip_below = frozen5
+        && UNDER5.with(|u| {
+            let u = u.borrow();
+            u.len() == buf.len() && {
+                buf.copy_from_slice(&u);
+                true
+            }
+        });
     fx.set_pass(1);
-    clear(buf);
     let t0 = Instant::now();
-    renderer.render(buf, w);
+    if !skip_below {
+        clear(buf);
+        renderer.render(buf, w);
+    }
     phase("base", t0);
     BASE_SKIP.with(|b| b.set(None));
     INC.with(|c| {
@@ -322,16 +340,47 @@ fn render_inner(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usiz
         if tmp.len() != buf.len() {
             *tmp = vec![Bgra::default(); buf.len()];
         }
-        for (l, p) in &active {
-            fx.set_pass(l.id);
-            clear(&mut tmp);
+        for (k, (l, p)) in active.iter().enumerate() {
+            if skip_below && Some(k) < i5 {
+                continue;
+            }
             let t0 = Instant::now();
-            renderer.render(&mut tmp[..], w);
+            // 冻结期间层 5 以上的静态层（窗口边框层 8）内容不变：渲染结果缓存起来，不必每帧重画
+            let cached = frozen5 && Some(k) > i5 && l.id != 6 && FROZEN_TMP.with(|f| {
+                f.borrow().get(&l.id).is_some_and(|v| {
+                    let ok = v.len() == tmp.len();
+                    if ok {
+                        tmp.copy_from_slice(v);
+                    }
+                    ok
+                })
+            });
+            if !cached {
+                fx.set_pass(l.id);
+                clear(&mut tmp);
+                renderer.render(&mut tmp[..], w);
+                if frozen5 && Some(k) > i5 && l.id != 6 {
+                    FROZEN_TMP.with(|f| f.borrow_mut().insert(l.id, tmp.to_vec()));
+                }
+            }
             if stats_on() {
                 phase(&format!("r{}", l.id), t0);
             }
             let t0 = Instant::now();
-            compose_layer(buf, &tmp, w, h, scale, l, p, (0, 0, w, h), None);
+            if Some(k) == i5 && frozen5 {
+                // 层 5 冻结：「下面所有内容 + 模糊底图」整体存一份，之后每帧只叠层 5 自己的内容
+                if !skip_below {
+                    compose_layer(buf, &tmp, w, h, scale, l, p, (0, 0, w, h), None, Part::Backdrop);
+                    UNDER5.with(|u| {
+                        let mut u = u.borrow_mut();
+                        u.clear();
+                        u.extend_from_slice(buf);
+                    });
+                }
+                compose_layer(buf, &tmp, w, h, scale, l, p, (0, 0, w, h), None, Part::Content);
+            } else {
+                compose_layer(buf, &tmp, w, h, scale, l, p, (0, 0, w, h), None, Part::All);
+            }
             if stats_on() {
                 phase(&format!("c{}", l.id), t0);
             }
@@ -451,11 +500,12 @@ fn fbox(b: (f32, f32, f32, f32), w: usize, h: usize) -> (usize, usize, usize, us
 
 /// 一层：背景滤镜 + 内容（只动 clip 内的输出像素）。`bs_win`：增量时纯模糊缓存已更新过，不再按输入比对
 #[allow(clippy::too_many_arguments)]
-fn compose_layer(buf: &mut [Bgra], tmp: &[Bgra], w: usize, h: usize, scale: f32, l: &crate::FxLayer, p: &Pose, clip: (usize, usize, usize, usize), bs_ready: Option<()>) {
+fn compose_layer(buf: &mut [Bgra], tmp: &[Bgra], w: usize, h: usize, scale: f32, l: &crate::FxLayer, p: &Pose, clip: (usize, usize, usize, usize), bs_ready: Option<()>, part: Part) {
     let g = Geo::new(l, p, scale);
     let (x0, y0) = g.map(p, g.lx, g.ly);
     let (x1, y1) = g.map(p, g.lx + g.lw, g.ly + g.lh);
-    if l.blur > 0.0 && l.lq <= 0.0 {
+    if part == Part::Content {
+    } else if l.blur > 0.0 && l.lq <= 0.0 {
         // 纯模糊（表情面板、拖放选择器）：底下的模糊结果与层的姿态无关，按层的静止矩形外扩一圈算一次缓存，
         // 弹出动画的每帧只按当前矩形裁圆角、乘透明度贴上（模糊半径取静止时的值）
         let region = g.bs_region(scale, w, h);
@@ -468,6 +518,9 @@ fn compose_layer(buf: &mut [Bgra], tmp: &[Bgra], w: usize, h: usize, scale: f32,
         // liquid 的 bevel = min(14, h/2)（CSS px）
         let bevel = 14.0f32.min(l.h / 2.0) * scale * p.s;
         backdrop_cached(l.id, buf, w, h, (x0, y0, x1, y1), l.r * scale * p.s, l.blur * scale * p.s, l.sat, l.lq * scale * p.s, bevel, p.op);
+    }
+    if part == Part::Backdrop {
+        return;
     }
     let ob = g.out_box(p, scale);
     let ob = fbox(ob, w, h);
@@ -569,7 +622,7 @@ fn incremental(renderer: &SoftwareRenderer, fx: &Fx<'_>, buf: &mut [Bgra], w: us
     });
     TMP.with(|t| {
         let tmp = t.borrow();
-        compose_layer(buf, &tmp, w, h, scale, l, p, o, bs_ok.then_some(()));
+        compose_layer(buf, &tmp, w, h, scale, l, p, o, bs_ok.then_some(()), Part::All);
     });
     phase("c-inc", t0);
     Some(o)
@@ -638,9 +691,12 @@ fn over_px(d: &mut Bgra, s: Bgra) {
 }
 
 fn over_all(dst: &mut [Bgra], src: &[Bgra]) {
-    for (d, s) in dst.iter_mut().zip(src) {
-        over_px(d, *s);
-    }
+    use rayon::prelude::*;
+    dst.par_chunks_mut(16384).zip(src.par_chunks(16384)).for_each(|(d, s)| {
+        for (d, s) in d.iter_mut().zip(s) {
+            over_px(d, *s);
+        }
+    });
 }
 
 /// 只叠一个矩形（层矩形外扩阴影边距）：小层（提示、toast）不必扫整幅
@@ -694,12 +750,12 @@ fn xform_into(dst: &mut [Bgra], src: &[Bgra], w: usize, h: usize, bbox: (f32, f3
             [p.b as u32, p.g as u32, p.r as u32, p.a as u32]
         }
     };
-    for y in y0..y1 {
+    use rayon::prelude::*;
+    dst.par_chunks_mut(w).enumerate().skip(y0).take(y1 - y0).for_each(|(y, row)| {
         let (sy, wy) = map(y, oy, ty);
         if sy < -1 || sy >= hi {
-            continue;
+            return;
         }
-        let row = &mut dst[y * w..(y + 1) * w];
         for (i, x) in (x0..x1).enumerate() {
             let (sx, wx) = cols[i];
             if sx < -1 || sx >= wi {
@@ -717,7 +773,7 @@ fn xform_into(dst: &mut [Bgra], src: &[Bgra], w: usize, h: usize, bbox: (f32, f3
             }
             over_px(&mut row[x], Bgra { b: c[0].min(255) as u8, g: c[1].min(255) as u8, r: c[2].min(255) as u8, a: c[3].min(255) as u8 });
         }
-    }
+    });
 }
 
 /// 整帧变换（面板弹出/收起）：dst = src 以中心缩放 s、平移 (tx,ty)、乘 opacity；dst 先清空
@@ -903,6 +959,29 @@ struct BsCache {
     w: usize,
     input: Vec<Bgra>,
     filt: Vec<Bgra>,
+    /// 缓存建立的时刻（层出现的时刻）
+    born: Instant,
+    /// 层 5：出现 0.6 s 后已按静止的底图重算过一次，之后冻结
+    settled: bool,
+}
+
+thread_local! {
+    /// 层 5 冻结后，它下面所有内容合成好的样子
+    static UNDER5: RefCell<Vec<Bgra>> = const { RefCell::new(Vec::new()) };
+    /// 层 5 冻结期间，它上面静态层的渲染结果
+    static FROZEN_TMP: RefCell<HashMap<i32, Vec<Bgra>>> = RefCell::new(HashMap::new());
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Part {
+    All,
+    Backdrop,
+    Content,
+}
+
+/// 层 `id` 的纯模糊底图是否已冻结（见 backdrop_static）
+fn bs_frozen(id: i32, len: usize) -> bool {
+    BS.with(|m| m.borrow().get(&id).is_some_and(|c| c.input.len() == len && c.settled))
 }
 
 thread_local! {
@@ -923,6 +1002,16 @@ fn backdrop_static(id: i32, dst: &mut [Bgra], w: usize, h: usize, region: (usize
         let m = m.borrow();
         let c = m.get(&id)?;
         if c.key != key || c.w != w || c.input.len() != dst.len() {
+            return None;
+        }
+        // 拖放选择器（层 5）是盖住整个面板的模态遮罩：拖动时底下的内容（缩小动画收尾、悬停效果）每帧都有细小变化，
+        // 逐帧重算 14px 模糊要 20~50 ms，拖动直接掉到 10 FPS。出现 0.6 s（缩小动画结束）后冻结底图；层隐藏时缓存会被丢掉。
+        // 前 0.6 s（面板从隐藏条展开、缩小动画）底图每帧都在变：沿用第一次算的模糊（反正选择器正在淡入），
+        // 动画结束后按静止的底图整块重算一次再冻结。
+        if id == 5 {
+            if c.settled || c.born.elapsed().as_secs_f32() <= 0.6 {
+                return Some(None);
+            }
             return None;
         }
         let (ry0, ry1) = (gy0.saturating_sub(reach), (gy1 + reach).min(h));
@@ -957,7 +1046,7 @@ fn backdrop_static(id: i32, dst: &mut [Bgra], w: usize, h: usize, region: (usize
         backdrop(&mut tmp, w, h, (gx0 as f32, gy0 as f32, gx1 as f32, gy1 as f32), 0.0, sigma, sat, 0.0, 0.0, 1.0, Some(win));
         BS.with(|m| {
             let mut m = m.borrow_mut();
-            let c = m.entry(id).or_insert_with(|| BsCache { key, w, input: Vec::new(), filt: Vec::new() });
+            let c = m.entry(id).or_insert_with(|| BsCache { key, w, input: Vec::new(), filt: Vec::new(), born: Instant::now(), settled: false });
             if full || c.filt.len() != dst.len() {
                 c.filt = vec![Bgra::default(); dst.len()];
             }
@@ -966,6 +1055,9 @@ fn backdrop_static(id: i32, dst: &mut [Bgra], w: usize, h: usize, region: (usize
             }
             c.key = key;
             c.w = w;
+            if id == 5 && c.born.elapsed().as_secs_f32() > 0.6 {
+                c.settled = true;
+            }
             c.input.clear();
             c.input.extend_from_slice(dst);
         });
@@ -1195,11 +1287,14 @@ fn backdrop(dst: &mut [Bgra], w: usize, h: usize, rect: (f32, f32, f32, f32), ra
         }
     }
     let op = op.clamp(0.0, 1.0);
-    for y in 0..bh {
-        if iy0 + y < wy0 || iy0 + y >= wy1 {
-            continue;
+    use rayon::prelude::*;
+    let ch = &ch;
+    dst.par_chunks_mut(w).enumerate().skip(iy0).take(bh).for_each(|(yy, drow)| {
+        let y = yy - iy0;
+        if yy < wy0 || yy >= wy1 {
+            return;
         }
-        let py = (iy0 + y) as f32 + 0.5;
+        let py = yy as f32 + 0.5;
         for x in 0..bw {
             if ix0 + x < wx0 || ix0 + x >= wx1 {
                 continue;
@@ -1210,14 +1305,14 @@ fn backdrop(dst: &mut [Bgra], w: usize, h: usize, rect: (f32, f32, f32, f32), ra
                 continue;
             }
             let i = y * bw + x;
-            let d = &mut dst[(iy0 + y) * w + ix0 + x];
+            let d = &mut drow[ix0 + x];
             let mixv = |o: u8, n: f32| (o as f32 + (n - o as f32) * c).round().clamp(0.0, 255.0) as u8;
             d.b = mixv(d.b, ch[0][i]);
             d.g = mixv(d.g, ch[1][i]);
             d.r = mixv(d.r, ch[2][i]);
             d.a = mixv(d.a, ch[3][i]);
         }
-    }
+    });
 }
 
 fn bilinear(src: &[f32], w: usize, h: usize, x: f32, y: f32) -> f32 {
@@ -1257,13 +1352,14 @@ fn blur_clamped(buf: &mut [f32], w: usize, h: usize, sigma: f32) {
         }
     }
     blur_full(&mut small, sw, sh, sigma / f as f32);
-    for y in 0..h {
-        for x in 0..w {
+    use rayon::prelude::*;
+    buf.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let sy = (y as f32 + 0.5) / f as f32;
+        for (x, v) in row.iter_mut().enumerate() {
             let sx = (x as f32 + 0.5) / f as f32;
-            let sy = (y as f32 + 0.5) / f as f32;
-            buf[y * w + x] = bilinear(&small, sw, sh, sx, sy);
+            *v = bilinear(&small, sw, sh, sx, sy);
         }
-    }
+    });
 }
 
 fn blur_full(buf: &mut [f32], w: usize, h: usize, sigma: f32) {
@@ -1287,13 +1383,20 @@ fn blur_full(buf: &mut [f32], w: usize, h: usize, sigma: f32) {
                 acc += at(x as i64 + r as i64 + 1) - at(x as i64 - r as i64);
             }
         }
-        // 竖
-        for x in 0..w {
-            let at = |i: i64| tmp[i.clamp(0, h as i64 - 1) as usize * w + x];
-            let mut acc: f32 = (-(r as i64)..=r as i64).map(at).sum();
-            for y in 0..h {
-                buf[y * w + x] = acc * k;
-                acc += at(y as i64 + r as i64 + 1) - at(y as i64 - r as i64);
+        // 竖：按行顺序扫，整行一起累加（逐列扫的步长是 w，缓存命中极差）
+        let rowat = |i: i64| &tmp[i.clamp(0, h as i64 - 1) as usize * w..][..w];
+        let mut acc = vec![0f32; w];
+        for i in -(r as i64)..=r as i64 {
+            for (a, v) in acc.iter_mut().zip(rowat(i)) {
+                *a += v;
+            }
+        }
+        for y in 0..h {
+            let (add, sub) = (rowat(y as i64 + r as i64 + 1), rowat(y as i64 - r as i64));
+            let out = &mut buf[y * w..(y + 1) * w];
+            for x in 0..w {
+                out[x] = acc[x] * k;
+                acc[x] += add[x] - sub[x];
             }
         }
     }

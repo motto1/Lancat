@@ -846,6 +846,7 @@ export component SettingsWindow inherits Window {
     y: root.csd-h;
     height: parent.height - root.csd-h;
     fl := Flickable {
+        mouse-drag-pan-enabled: false;
         width: parent.width;
         height: parent.height;
         content-height: col.preferred-height;

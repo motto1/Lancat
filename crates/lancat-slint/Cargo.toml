@@ -10,6 +10,7 @@ description = "Lancat 面板的 Slint 版（直接调用 lancat-core，软件渲
 [workspace]
 
 [dependencies]
+rayon = "1"
 lancat-core = { path = "../lancat-core", default-features = false }
 slint = { version = "=1.18.1", default-features = false, features = ["std", "compat-1-2", "renderer-software", "software-renderer-systemfonts"] }
 # IME 预编辑 / 输入法候选框位置走 Slint 内部 API（WindowAdapterInternal / InternalKeyEvent），必须钉死版本

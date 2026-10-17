@@ -1498,6 +1498,8 @@ export component PanelWindow inherits Window {
                                 max-height: 100000px;
                                 lha := TouchArea {
                                 list := Flickable {
+                                    // 桌面：左键拖动是选文字，不是平移（滚轮、触摸照常滚动）
+                                    mouse-drag-pan-enabled: false;
                                     min-width: 0px;
                                     preferred-width: 0px;
                                     max-width: 100000px;
