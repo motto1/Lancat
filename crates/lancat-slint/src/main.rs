@@ -45,6 +45,9 @@ mod win;
 mod gpu;
 #[cfg(target_os = "linux")]
 mod gl;
+/// Linux 上 `crate::gpu` 就是 GLES 后端（compose.rs 的 GPU 合成两个平台共用一套 API）
+#[cfg(target_os = "linux")]
+use gl as gpu;
 #[cfg(target_os = "linux")]
 mod wl;
 

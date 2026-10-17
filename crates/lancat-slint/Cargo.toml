@@ -43,6 +43,13 @@ wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 # 托盘：StatusNotifierItem（旧版 tauri 托盘在 Linux 上走 libappindicator → SNI）
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
 swash = { version = "0.2.10", default-features = false, features = ["std", "scale", "render"] }
+# GPU 路径（EGL + GLES 3，src/gl.rs）：libEGL / libwayland-egl 运行时加载，没有就用 wl_shm（CPU）
+khronos-egl = { version = "6", features = ["dynamic"] }
+glow = "0.18"
+libloading = "0.8"
+# EGL 要 libwayland-client 的 wl_display* / wl_proxy*：系统后端（运行时 dlopen libwayland-client）
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-sys = { version = "0.31", features = ["dlopen"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Input_Ime", "Win32_UI_HiDpi", "Win32_UI_Controls", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Registry", "Win32_System_DataExchange", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_DirectWrite", "Win32_Graphics_Dxgi_Common", "Win32_Security", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_System_ProcessStatus", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_System_Memory", "Win32_System_Diagnostics_ToolHelp", "Win32_NetworkManagement_WindowsFirewall", "Win32_Networking_NetworkListManager", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Media_Audio", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D_Fxc", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_DirectComposition"] }

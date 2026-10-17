@@ -211,7 +211,7 @@ pub fn render(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize,
     let out = render_inner(renderer, buf, w, h, scale, reused);
     let gap = LAST.with(|l| l.replace(Some(t))).map(|p| t.duration_since(p).as_secs_f32() * 1000.0).unwrap_or(0.0);
     let ph = PH.with(|p| std::mem::take(&mut *p.borrow_mut()));
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     let ph = if crate::gpu::active() { format!("{ph} gpu present={:.1}", crate::gpu::last_present_ms()) } else { ph };
     log::info!("frame {:.1} ms (gap {:.1} ms){}{ph}", t.elapsed().as_secs_f32() * 1000.0, gap, if matches!(out, Out::Full) { " composed" } else { "" });
     out
@@ -219,7 +219,7 @@ pub fn render(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize,
 
 fn render_inner(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize, scale: f32, reused: bool) -> Out {
     GPU_FRAME.with(|g| g.set(false));
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     if crate::gpu::compose_enabled() {
         return render_gpu(renderer, buf, w, h, scale, reused);
     }
@@ -1424,9 +1424,9 @@ fn blur_full(buf: &mut [f32], w: usize, h: usize, sigma: f32) {
     }
 }
 
-// ------------------------------------------------------------------ GPU 合成（Windows，见 gpu.rs）
+// ------------------------------------------------------------------ GPU 合成（Windows：gpu.rs，D3D11；Linux/Wayland：gl.rs，GLES 3 —— 同一套 API）
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 thread_local! {
     /// GPU 路径的层 5（拖放选择器）冻结状态：出现时刻、是否已按静止底图重算并冻结
     static G5: Cell<Option<(Instant, bool)>> = const { Cell::new(None) };
@@ -1449,7 +1449,7 @@ thread_local! {
     static GPCOOL: Cell<u32> = const { Cell::new(0) };
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn content_key(l: Option<&crate::FxLayer>, w: usize, h: usize, scale: f32) -> [f32; 8] {
     match l {
         Some(l) => [l.x, l.y, l.w, l.h, l.r, w as f32, h as f32, scale],
@@ -1459,7 +1459,7 @@ fn content_key(l: Option<&crate::FxLayer>, w: usize, h: usize, scale: f32) -> [f
 
 
 /// 层内容在源坐标里可能占的行（层矩形外扩 96 px 阴影边距，与 CPU 版 out_box 的边距相同）
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn layer_rows(g: &Geo, scale: f32, h: usize) -> (usize, usize) {
     let m = 96.0 * scale;
     (((g.ly - m).floor().max(0.0) as usize).min(h), ((g.ly + g.lh + m).ceil().max(0.0) as usize).min(h))
@@ -1467,7 +1467,7 @@ fn layer_rows(g: &Geo, scale: f32, h: usize) -> (usize, usize) {
 
 /// GPU 版的 render_inner：Slint 照旧在 CPU 上逐层光栅化（基底 + 每个活动层），滤镜/变换/叠加在 GPU 上。
 /// 渲染器缓存、pass 切换、层 5 冻结、增量探测的规则与 CPU 版相同。
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn render_gpu(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize, scale: f32, reused: bool) -> Out {
     use crate::gpu;
     let Some(ui) = panel() else {

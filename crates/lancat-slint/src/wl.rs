@@ -65,7 +65,7 @@ use smithay_client_toolkit::{
 use wayland_client::{
     globals::{registry_queue_init, GlobalList},
     protocol::{wl_data_device::WlDataDevice, wl_data_device_manager::DndAction, wl_data_source::WlDataSource, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
-    Connection, EventQueue, QueueHandle,
+    Connection, EventQueue, Proxy as _, QueueHandle,
 };
 use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_manager_v3::ZwpTextInputManagerV3,
@@ -187,9 +187,55 @@ pub fn outputs() -> Vec<(i32, i32, i32)> {
 }
 
 /// 自写后端在用（main.rs 据此决定挂 Linux dock）。
-/// 设置页换了渲染方式（render::apply）
+thread_local! {
+    /// GPU 呈现：已经提交、还在等合成器 frame 回调的 surface（等到了才画下一帧 = 跟显示器刷新走，不空转）
+    static FRAME_PENDING: RefCell<std::collections::HashMap<wayland_client::backend::ObjectId, Instant>> = RefCell::new(std::collections::HashMap::new());
+}
+
+/// GPU：这个 surface 还在等 frame 回调（超过 100 ms 不算：隐藏 / 被挡住时合成器可能不回）
+fn frame_wait(s: &wl_surface::WlSurface) -> bool {
+    FRAME_PENDING.with(|f| f.borrow().get(&s.id()).is_some_and(|t| t.elapsed() < Duration::from_millis(100)))
+}
+
+/// GPU：提交前要一个 frame 回调（eglSwapBuffers 里 commit）
+fn frame_request(s: &wl_surface::WlSurface, qh: &QueueHandle<State>) {
+    s.frame(qh, smithay_client_toolkit::compositor::FrameCallbackData(s.clone()));
+    FRAME_PENDING.with(|f| f.borrow_mut().insert(s.id(), Instant::now()));
+}
+
+/// GPU 呈现一幅 CPU 画好的预乘 BGRA（toast / 停靠条 / 普通窗口）：true = 已经提交；false = 调用方走 wl_shm
+fn gpu_blit(egl: &mut Option<crate::gl::Surf>, blit: &mut crate::gl::Blit, surface: *mut std::ffi::c_void, px: &[Bgra], w: u32, h: u32) -> bool {
+    if !crate::gl::active() {
+        *egl = None;
+        return false;
+    }
+    if egl.is_none() {
+        *egl = crate::gl::Surf::new(surface, w, h);
+    }
+    let Some(e) = egl.as_mut() else { return false };
+    e.resize(w, h);
+    blit.present(e, px, w as usize, h as usize, None);
+    true
+}
+
+/// LANCAT_FRAME_STATS：变形每帧的耗时和间隔
+fn morph_stats(t: Instant, gpu: bool) {
+    if !crate::compose::stats_on() {
+        return;
+    }
+    thread_local! { static LAST: Cell<Option<Instant>> = const { Cell::new(None) }; }
+    let gap = LAST.with(|l| l.replace(Some(t))).map(|p| t.duration_since(p).as_secs_f32() * 1000.0).unwrap_or(0.0);
+    log::info!("morph frame {:.1} ms (gap {gap:.1} ms) {}", t.elapsed().as_secs_f32() * 1000.0, if gpu { "gpu" } else { "cpu" });
+}
+
+thread_local! {
+    /// 设置页要切换的渲染方式（事件循环里在 State 上执行）
+    static RENDER_SWITCH: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// 设置页换了渲染方式（render::apply）：下一轮事件循环里切换（丢掉 / 建 EGL surface，CPU 路径就是 wl_shm）
 pub fn apply_render_mode(cpu: bool) {
-    let _ = cpu;
+    RENDER_SWITCH.with(|r| r.set(Some(cpu)));
 }
 
 pub fn active() -> bool {
@@ -349,6 +395,10 @@ struct PanelSurf {
     snap: Option<Vec<Bgra>>,
     closing: bool,
     focus_req: bool,
+    /// GPU（EGL）：surface、收起时冻结的帧、上传过的玻璃底
+    egl: Option<crate::gl::Surf>,
+    gsnap: Option<crate::gl::GTex>,
+    gglass: Option<crate::gl::GTex>,
 }
 
 struct StripSurf {
@@ -358,6 +408,8 @@ struct StripSurf {
     width: u32,
     height: u32,
     dirty: bool,
+    egl: Option<crate::gl::Surf>,
+    blit: crate::gl::Blit,
 }
 
 struct TopSurf {
@@ -369,6 +421,8 @@ struct TopSurf {
     width: u32,
     height: u32,
     buf: Vec<Bgra>,
+    egl: Option<crate::gl::Surf>,
+    blit: crate::gl::Blit,
 }
 
 struct ToastSurf {
@@ -378,6 +432,8 @@ struct ToastSurf {
     width: u32,
     height: u32,
     buf: Vec<Bgra>,
+    egl: Option<crate::gl::Surf>,
+    blit: crate::gl::Blit,
 }
 
 struct TopWin {
@@ -689,7 +745,15 @@ impl slint::platform::Platform for WlPlatform {
         if std::env::var("LANCAT_SLINT_NODOCK").as_deref() == Ok("1") {
             push(Cmd::Panel(Some(Place { edge: "right".into(), along: 200, inset: 0, w: W, h: H, output: 0 })));
         }
+        // GPU（EGL + GLES 3）：设置已经读过了（render::init 在建面板之前），这里按设置建上下文；失败自动用 wl_shm
+        let disp = self.conn.backend().display_ptr() as *mut std::ffi::c_void;
+        if crate::render::wanted() {
+            crate::gl::init(disp);
+        }
         loop {
+            if let Some(cpu) = RENDER_SWITCH.with(|r| r.take()) {
+                state.switch_render(cpu, disp);
+            }
             // 新建的普通窗口
             for w in NEW_TOPS.with(|t| std::mem::take(&mut *t.borrow_mut())) {
                 if let Some(rc) = w.upgrade() {
@@ -943,12 +1007,14 @@ impl State {
                             ps.place = p;
                             // 换了位置：原来截的背景对不上了
                             ps.glass = None;
+                            ps.gglass = None;
                         }
                     }
                     Some(ps) => {
                         // 正在收起又被打开：旧版 anim.cancel() 后重新 springTo（从固定起点），surface 不重建
                         ps.closing = false;
                         ps.snap = None;
+                        ps.gsnap = None;
                         ps.layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
                         ps.layer.commit();
                         if use_morph() {
@@ -981,6 +1047,9 @@ impl State {
                             snap: None,
                             closing: false,
                             focus_req: false,
+                            egl: None,
+                            gsnap: None,
+                            gglass: None,
                         });
                         if m {
                             let (strip, card, rs, rc) = self.morph_rects();
@@ -1010,9 +1079,13 @@ impl State {
                             let configured = ps.configured;
                             let (strip, card, rs, rc) = self.morph_rects();
                             // 冻结收起起点那一帧（dock 的 on_close 已经改了界面状态，但还没重画进 buf）
-                            let snap = if configured && !self.buf.is_empty() { Some(self.buf.clone()) } else { None };
+                            let on_gpu = self.panel.as_ref().is_some_and(|p| p.egl.is_some());
+                            // GPU：帧在纹理里（合成结果不一定在 buf 里），冻结那张纹理
+                            let gsnap = if configured && on_gpu { crate::gl::snapshot() } else { None };
+                            let snap = if configured && !on_gpu && !self.buf.is_empty() { Some(self.buf.clone()) } else { None };
                             if let Some(ps) = self.panel.as_mut() {
                                 ps.snap = snap;
+                                ps.gsnap = gsnap;
                                 if configured {
                                     let (from, fr, fc, fg) = match ps.mlast {
                                         Some(f) if ps.morph.as_ref().is_some_and(|a| a.opening) => (f.rect, f.radius, f.content, f.grow),
@@ -1069,7 +1142,7 @@ impl State {
                 None => {
                     let layer = self.new_layer("lancat-dock", &p, KeyboardInteractivity::None);
                     let (w, h) = (p.w, p.h);
-                    self.strip = Some(StripSurf { layer, place: p, configured: false, width: w, height: h, dirty: true });
+                    self.strip = Some(StripSurf { layer, place: p, configured: false, width: w, height: h, dirty: true, egl: None, blit: crate::gl::Blit::new() });
                 }
             },
             Cmd::Strip(None) => {
@@ -1103,7 +1176,7 @@ impl State {
                     layer.set_size(p.w, p.h);
                     layer.wl_surface().set_buffer_scale(self.scale);
                     let (w, h) = (p.w, p.h);
-                    self.toast = Some(ToastSurf { layer, place: p.clone(), configured: false, width: w, height: h, buf: Vec::new() });
+                    self.toast = Some(ToastSurf { layer, place: p.clone(), configured: false, width: w, height: h, buf: Vec::new(), egl: None, blit: crate::gl::Blit::new() });
                     self.toast_input(&p);
                     if let Some(t) = self.toast.as_ref() {
                         t.layer.commit();
@@ -1129,6 +1202,47 @@ impl State {
                 }
             }
         }
+    }
+
+    /// 渲染方式切换：先丢掉所有 EGL surface 和纹理，再关掉 / 建上下文，所有 surface 整幅重画
+    fn switch_render(&mut self, cpu: bool, disp: *mut std::ffi::c_void) {
+        if let Some(ps) = self.panel.as_mut() {
+            ps.egl = None;
+            ps.gsnap = None;
+            ps.gglass = None;
+        }
+        if let Some(st) = self.strip.as_mut() {
+            st.egl = None;
+            st.blit = crate::gl::Blit::new();
+            st.dirty = true;
+        }
+        if let Some(ts) = self.toast.as_mut() {
+            ts.egl = None;
+            ts.blit = crate::gl::Blit::new();
+        }
+        for t in self.tops.iter_mut() {
+            if let Some(ts) = t.surf.as_mut() {
+                ts.egl = None;
+                ts.blit = crate::gl::Blit::new();
+            }
+            if let Some(w) = t.win.upgrade() {
+                w.needs_redraw.set(true);
+            }
+        }
+        if cpu {
+            crate::gl::shutdown();
+        } else {
+            crate::gl::init(disp);
+        }
+        log::info!("render mode: {} (gl {})", if cpu { "CPU" } else { "GPU" }, crate::gl::active());
+        self.buf = Vec::new();
+        if let Some(w) = self.win.upgrade() {
+            w.needs_redraw.set(true);
+        }
+        if let Some(w) = TOAST_WIN.with(|t| t.borrow().upgrade()) {
+            w.needs_redraw.set(true);
+        }
+        crate::settings_ui::refresh_render_note();
     }
 
     /// 淡出结束：销毁面板 surface，释放像素缓冲。
@@ -1250,6 +1364,7 @@ impl State {
         if let Some(ps) = self.panel.as_mut() {
             if glass.is_some() {
                 ps.glass = glass;
+                ps.gglass = None;
             } else if ps.cap_wait.is_some() {
                 // 截不到：不再等，直接只用色调
                 ps.cap_wait = Some(Instant::now().checked_sub(CAP_WAIT).unwrap_or_else(Instant::now));
@@ -1291,6 +1406,9 @@ impl State {
     fn draw_panel(&mut self) {
         let Some(w) = self.win.upgrade() else { return };
         let Some(ps) = self.panel.as_mut() else { return };
+        if ps.egl.is_some() && frame_wait(ps.layer.wl_surface()) {
+            return;
+        }
         // 打开变形先等背景截图（surface 不上屏），到了 / 超时再从头开始计时
         if let Some(t0) = ps.cap_wait {
             if ps.morph.is_some() && ps.glass.is_none() && t0.elapsed() < CAP_WAIT {
@@ -1307,7 +1425,16 @@ impl State {
         let n = (width * height) as usize;
         // 缓冲是我们自己的、常驻：ReusedBuffer 局部重画（每帧再整幅拷进 shm）；新分配（尺寸变了 / 收起后释放）时整幅画一次
         // 收起变形用冻结的那一帧，不再重画（重画会把收起时界面里的变化叠进变形，成重影）
-        let frozen = ps.closing && ps.morph.is_some() && ps.snap.as_ref().is_some_and(|b| b.len() == n);
+        let frozen = ps.closing && ps.morph.is_some() && (ps.snap.as_ref().is_some_and(|b| b.len() == n) || ps.gsnap.is_some());
+        // GPU（EGL surface）：帧上传 / 合成在纹理里，变形和姿态在着色器里，eglSwapBuffers 提交
+        if crate::gl::active() && ps.egl.is_none() {
+            let sp = ps.layer.wl_surface().id().as_ptr() as *mut std::ffi::c_void;
+            ps.egl = crate::gl::Surf::new(sp, width, height);
+        } else if !crate::gl::active() {
+            ps.egl = None;
+        }
+        let gpu = ps.egl.is_some();
+        let mut rows: Option<(usize, usize)> = None;
         if !frozen {
             let fresh = self.buf.len() != n;
             if fresh {
@@ -1319,9 +1446,66 @@ impl State {
             if fresh {
                 w.renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
             }
+            rows = match &out {
+                _ if fresh => Some((0, height as usize)),
+                crate::compose::Out::Full => Some((0, height as usize)),
+                crate::compose::Out::Partial(Some((_, y, _, h))) | crate::compose::Out::Inc((_, y, _, h)) => Some(((*y).max(0) as usize, (*y).max(0) as usize + *h as usize)),
+                crate::compose::Out::Partial(None) => None,
+            };
             if out.composed() {
                 w.needs_redraw.set(false);
             }
+        }
+        if gpu {
+            if !crate::compose::gpu_frame() {
+                let (y0, y1) = rows.unwrap_or((0, 0));
+                // 没变也调用：确保纹理在（尺寸变了 / 刚切到 GPU 时整幅上传）
+                crate::gl::upload_cpu(&self.buf, width as usize, height as usize, y0, y1.min(height as usize));
+            }
+            let Some(es) = ps.egl.as_mut() else { return };
+            es.resize(width, height);
+            let t = Instant::now();
+            frame_request(ps.layer.wl_surface(), &self.qh);
+            if let Some(a) = ps.morph.as_ref() {
+                let f = a.frame();
+                let opening = a.opening;
+                ps.mlast = Some(f);
+                if f.done && opening {
+                    ps.morph = None;
+                } else {
+                    if ps.gglass.is_none() {
+                        if let Some(g) = ps.glass.as_deref().filter(|g| g.len() == n) {
+                            ps.gglass = crate::gl::upload_glass(g, width as usize, height as usize);
+                        }
+                    }
+                    let dark = MORPH_DARK.load(std::sync::atomic::Ordering::Relaxed);
+                    let look = crate::morph::Look { dark, scale: sc as f64, accent: self.strip_look.accent };
+                    let rest = if dark {
+                        crate::morph::Rest { tint: (36.0 / 255.0, 36.0 / 255.0, 40.0 / 255.0), alpha: 0.82 }
+                    } else {
+                        crate::morph::Rest { tint: (246.0 / 255.0, 246.0 / 255.0, 248.0 / 255.0), alpha: 0.86 }
+                    };
+                    let fr = (FRAME * sc) as f64;
+                    let snap = if !opening { ps.gsnap.as_ref() } else { None };
+                    if let Some(es) = ps.egl.as_ref() {
+                        crate::gl::present_morph(es, &f, &look, &rest, ps.gglass.as_ref(), snap, (fr, fr));
+                    }
+                    morph_stats(t, true);
+                    return;
+                }
+            }
+            let edge = ps.place.edge.clone();
+            let pose = ps.anim.and_then(|a| a.pose(&edge));
+            if pose.is_none() && !ps.closing {
+                ps.anim = None;
+            }
+            if let Some(es) = ps.egl.as_ref() {
+                match pose {
+                    Some((tx, ty, s, op)) => crate::gl::present_panel(es, (tx * sc as f32, ty * sc as f32, s, op), false),
+                    None => crate::gl::present_panel(es, (0.0, 0.0, 1.0, 1.0), ps.closing),
+                }
+            }
+            return;
         }
         // 液态玻璃变形：从停靠条长出来 / 缩回去
         if let Some(a) = ps.morph.as_ref() {
@@ -1353,7 +1537,9 @@ impl State {
                 if f.done {
                     self.xbuf.iter_mut().for_each(|p| *p = Bgra::default());
                 } else {
+                    let t = Instant::now();
                     crate::morph::render_rest(&mut self.xbuf, wu, hu, &f, ps.glass.as_deref().filter(|g| g.len() == n), &c, &look, &rest);
+                    morph_stats(t, false);
                 }
                 let Ok((buffer, canvas)) = self.pool.create_buffer(width as i32, height as i32, width as i32 * 4, wl_shm::Format::Argb8888) else { return };
                 // SAFETY: Bgra is repr(C) 4 bytes
@@ -1418,6 +1604,9 @@ impl State {
         if !(w.needs_redraw.get() || w.window.has_active_animations()) {
             return;
         }
+        if ts.egl.is_some() && frame_wait(ts.layer.wl_surface()) {
+            return;
+        }
         let sc = self.scale.max(1) as u32;
         let (width, height) = (ts.width * sc, ts.height * sc);
         let n = (width * height) as usize;
@@ -1427,6 +1616,13 @@ impl State {
         w.needs_redraw.set(false);
         ts.buf.iter_mut().for_each(|p| *p = Bgra::default());
         w.renderer.render(&mut ts.buf[..], width as usize);
+        let sp = ts.layer.wl_surface().id().as_ptr() as *mut std::ffi::c_void;
+        if crate::gl::active() {
+            frame_request(ts.layer.wl_surface(), &self.qh);
+        }
+        if gpu_blit(&mut ts.egl, &mut ts.blit, sp, &ts.buf, width, height) {
+            return;
+        }
         let Ok((buffer, canvas)) = self.pool.create_buffer(width as i32, height as i32, width as i32 * 4, wl_shm::Format::Argb8888) else { return };
         // SAFETY: Bgra is repr(C) 4 bytes
         let bytes = unsafe { std::slice::from_raw_parts(ts.buf.as_ptr() as *const u8, n * 4) };
@@ -1443,6 +1639,18 @@ impl State {
         st.dirty = false;
         let sc = self.scale.max(1) as u32;
         let (w, h) = (st.width * sc, st.height * sc);
+        if crate::gl::active() {
+            let mut px = vec![Bgra::default(); (w * h) as usize];
+            // SAFETY: Bgra 是 4 字节 repr(C)
+            let bytes = unsafe { std::slice::from_raw_parts_mut(px.as_mut_ptr() as *mut u8, px.len() * 4) };
+            paint_strip(bytes, w as usize, h as usize, &self.strip_look);
+            let sp = st.layer.wl_surface().id().as_ptr() as *mut std::ffi::c_void;
+            if gpu_blit(&mut st.egl, &mut st.blit, sp, &px, w, h) {
+                return;
+            }
+        } else {
+            st.egl = None;
+        }
         let Ok((buffer, canvas)) = self.pool.create_buffer(w as i32, h as i32, w as i32 * 4, wl_shm::Format::Argb8888) else { return };
         paint_strip(canvas, w as usize, h as usize, &self.strip_look);
         let s = st.layer.wl_surface();
@@ -1533,7 +1741,7 @@ impl State {
         xw.commit();
         w.props_dirty.set(false);
         let (pw, ph) = w.pref.get();
-        t.surf = Some(TopSurf { xdg: xw, configured: false, csd: false, maximized: false, width: pw.max(1), height: ph.max(1), buf: Vec::new() });
+        t.surf = Some(TopSurf { xdg: xw, configured: false, csd: false, maximized: false, width: pw.max(1), height: ph.max(1), buf: Vec::new(), egl: None, blit: crate::gl::Blit::new() });
     }
 
     fn draw_tops(&mut self) {
@@ -1557,6 +1765,9 @@ impl State {
 
     fn draw_top(&mut self, id: usize, w: &Rc<WlWindow>, sc: u32) {
         let Some(ts) = self.tops.iter_mut().find(|t| t.id == id).and_then(|t| t.surf.as_mut()) else { return };
+        if ts.egl.is_some() && frame_wait(ts.xdg.wl_surface()) {
+            return;
+        }
         let (width, height) = (ts.width * sc, ts.height * sc);
         let n = (width * height) as usize;
         if ts.buf.len() != n {
@@ -1565,6 +1776,13 @@ impl State {
         w.needs_redraw.set(false);
         ts.buf.iter_mut().for_each(|p| *p = Bgra::default());
         w.renderer.render(&mut ts.buf[..], width as usize);
+        let sp = ts.xdg.wl_surface().id().as_ptr() as *mut std::ffi::c_void;
+        if crate::gl::active() {
+            frame_request(ts.xdg.wl_surface(), &self.qh);
+        }
+        if gpu_blit(&mut ts.egl, &mut ts.blit, sp, &ts.buf, width, height) {
+            return;
+        }
         let Ok((buffer, canvas)) = self.pool.create_buffer(width as i32, height as i32, width as i32 * 4, wl_shm::Format::Argb8888) else { return };
         // SAFETY: Bgra is repr(C) 4 bytes
         let bytes = unsafe { std::slice::from_raw_parts(ts.buf.as_ptr() as *const u8, n * 4) };
@@ -1921,7 +2139,10 @@ fn paint_strip(canvas: &mut [u8], w: usize, h: usize, v: &StripLook) {
 impl CompositorHandler for State {
     fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32) {}
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, s: &wl_surface::WlSurface, _: u32) {
+        // GPU 呈现的节拍：合成器说可以画下一帧了
+        FRAME_PENDING.with(|f| f.borrow_mut().remove(&s.id()));
+    }
     fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
     fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
 }

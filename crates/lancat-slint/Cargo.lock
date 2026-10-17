@@ -2610,6 +2610,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "khronos-egl"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6aae1df220ece3c0ada96b8153459b67eebe9ae9212258bb0134ae60416fdf76"
+dependencies = [
+ "libc",
+ "libloading",
+]
+
+[[package]]
 name = "khronos_api"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2678,10 +2688,13 @@ dependencies = [
  "dirs",
  "env_logger",
  "flate2",
+ "glow",
  "i-slint-core",
  "image",
+ "khronos-egl",
  "ksni",
  "lancat-core",
+ "libloading",
  "log",
  "png",
  "rayon",
@@ -2693,8 +2706,10 @@ dependencies = [
  "swash",
  "thorvg-sys",
  "tokio",
+ "wayland-backend",
  "wayland-client",
  "wayland-protocols",
+ "wayland-sys",
  "windows 0.61.3",
  "windows-numerics 0.2.0",
  "winresource",
