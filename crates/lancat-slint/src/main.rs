@@ -31,6 +31,7 @@ mod lottie;
 mod settings_ui;
 mod sound;
 mod morph;
+mod render;
 #[cfg(windows)]
 mod clip_win;
 mod paste;
@@ -42,6 +43,8 @@ mod update;
 mod win;
 #[cfg(windows)]
 mod gpu;
+#[cfg(target_os = "linux")]
+mod gl;
 #[cfg(target_os = "linux")]
 mod wl;
 
@@ -1861,6 +1864,8 @@ fn main() {
     };
     log::info!("node started in {} ms", t0().elapsed().as_millis());
     migrate_keep_alive(&node);
+    // 渲染方式（GPU / CPU）在建面板窗口之前定下来
+    render::init(&node.settings());
 
     let ui = PanelWindow::new().expect("create panel");
     install_fx!(ui, false);
@@ -2046,6 +2051,18 @@ fn run_script(parts: &[String]) {
         }
         "hide" => {
             dock::hide_panel();
+            return;
+        }
+        "render" => {
+            // 测试：切换渲染方式（arg = gpu | cpu），和设置页一样保存并当场生效
+            let m = arg.clone();
+            with_app(move |app| {
+                let mut s = app.node.settings();
+                s.render_mode = m;
+                let _ = app.node.set_settings(s);
+            });
+            render::apply(&arg);
+            settings_ui::refresh_render_note();
             return;
         }
         #[cfg(windows)]

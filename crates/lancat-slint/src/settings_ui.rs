@@ -134,6 +134,8 @@ impl SettingsCtl {
         w.set_dock_edge(s.dock_edge.clone().into());
         w.set_dock_monitor(s.dock_monitor as i32);
         w.set_theme(s.theme.clone().into());
+        w.set_render_mode(if s.render_mode == "cpu" { "cpu".into() } else { "gpu".into() });
+        w.set_render_note(crate::render::note().into());
         w.set_auto_update(s.auto_update);
         w.set_message_sound(s.message_sound);
         let dir = self.node.receive_dir().display().to_string();
@@ -433,6 +435,15 @@ fn wire(w: &SettingsWindow) {
     w.on_set_edge(|e| ctl(|sc| sc.update(|s| s.dock_edge = e.to_string())));
     w.on_set_monitor(|m| ctl(|sc| sc.update(|s| s.dock_monitor = m.max(0) as usize)));
     w.on_set_theme(|t| ctl(|sc| sc.update(|s| s.theme = t.to_string())));
+    w.on_set_render_mode(|m| {
+        let m = m.to_string();
+        let m2 = m.clone();
+        ctl(move |sc| sc.update(move |s| s.render_mode = m2));
+        crate::render::apply(&m);
+        refresh_render_note();
+        // GPU 设备在后台建（~0.5 s）：过一会儿再刷新一次状态
+        slint::Timer::single_shot(std::time::Duration::from_millis(1500), refresh_render_note);
+    });
     w.on_reset_dir(|| ctl(|sc| sc.update(|s| s.receive_dir.clear())));
     w.on_pick_dir(|| {
         crate::filedlg::pick_folder(|p| {
@@ -719,4 +730,9 @@ fn rtl_shown(p: &str) -> String {
         Some(rest) => format!("{rest}/"),
         None => p.to_string(),
     }
+}
+
+/// 设置页「渲染方式」的状态说明（GPU 初始化完 / 失败后刷新）
+pub fn refresh_render_note() {
+    ctl(|sc| sc.win.set_render_note(crate::render::note().into()));
 }

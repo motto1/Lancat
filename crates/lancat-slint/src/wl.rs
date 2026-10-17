@@ -187,6 +187,11 @@ pub fn outputs() -> Vec<(i32, i32, i32)> {
 }
 
 /// 自写后端在用（main.rs 据此决定挂 Linux dock）。
+/// 设置页换了渲染方式（render::apply）
+pub fn apply_render_mode(cpu: bool) {
+    let _ = cpu;
+}
+
 pub fn active() -> bool {
     ACTIVE.with(|a| a.get())
 }

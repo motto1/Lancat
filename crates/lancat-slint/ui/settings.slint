@@ -826,6 +826,9 @@ export component SettingsWindow inherits Window {
     callback set-edge(string);
     callback set-monitor(int);
     callback set-theme(string);
+    in property <string> render-mode: "gpu";
+    in property <string> render-note;
+    callback set-render-mode(string);
     callback pick-dir();
     callback reset-dir();
     callback toggle-block(string);
@@ -1179,7 +1182,6 @@ export component SettingsWindow inherits Window {
                 }
                 Row {
                     label: "外观";
-                    last: true;
                     VerticalLayout {
                         alignment: center;
                         Seg {
@@ -1188,6 +1190,24 @@ export component SettingsWindow inherits Window {
                             pick(v) => { root.set-theme(v); }
                         }
                     }
+                }
+                Row {
+                    label: "渲染方式";
+                    last: root.render-note == "";
+                    VerticalLayout {
+                        alignment: center;
+                        Seg {
+                            items: [{ v: "gpu", l: "GPU（默认）" }, { v: "cpu", l: "CPU" }];
+                            value: root.render-mode;
+                            pick(v) => { root.set-render-mode(v); }
+                        }
+                    }
+                }
+                if root.render-note != "": Text {
+                    text: root.render-note;
+                    font-size: 11.5px;
+                    color: Theme.text-3;
+                    wrap: word-wrap;
                 }
             }
             Section {

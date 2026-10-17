@@ -312,26 +312,21 @@ fn log_err<T>(what: &str, r: windows::core::Result<T>) -> Option<T> {
     }
 }
 
-/// 设置里选了 CPU 渲染（Settings.render_mode == "cpu"）
-static PREF_CPU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// GPU 初始化（设备 / 着色器 / 交换链）失败过：自动退回 CPU
-static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// UI 线程 id（设备建好后给它发唤醒消息；切回 GPU 时重建设备用）
 static UI_THREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// 环境变量 LANCAT_CPU_COMPOSE=1：强制 CPU（优先于设置）
 pub fn env_forced_cpu() -> bool {
-    std::env::var("LANCAT_CPU_COMPOSE").as_deref() == Ok("1")
+    crate::render::env_forced_cpu()
 }
 
-/// 想不想用 GPU（LANCAT_CPU_COMPOSE=1 或设置里选了 CPU 就不用）
+/// 想不想用 GPU（LANCAT_CPU_COMPOSE=1 或设置里选了 CPU 就不用；见 render.rs）
 pub fn wanted() -> bool {
-    !env_forced_cpu() && !PREF_CPU.load(std::sync::atomic::Ordering::Relaxed)
+    crate::render::wanted()
 }
 
 /// 设置里的渲染方式（启动时在建面板窗口之前设；运行中切换见 win.rs apply_render_mode）
 pub fn set_pref_cpu(cpu: bool) {
-    PREF_CPU.store(cpu, std::sync::atomic::Ordering::Relaxed);
     if cpu {
         // 后台已经建好的设备用不上了
         if PREP_STATE.load(std::sync::atomic::Ordering::Acquire) == 1 && !active() {
@@ -349,10 +344,10 @@ pub fn status() -> &'static str {
     if active() {
         return if hardware() { "gpu" } else { "warp" };
     }
-    if PREF_CPU.load(std::sync::atomic::Ordering::Relaxed) {
+    if crate::render::pref_cpu() {
         return "cpu";
     }
-    if FAILED.load(std::sync::atomic::Ordering::Relaxed) || PREP_STATE.load(std::sync::atomic::Ordering::Acquire) == 2 {
+    if crate::render::failed() || PREP_STATE.load(std::sync::atomic::Ordering::Acquire) == 2 {
         return "failed";
     }
     "pending"
@@ -377,7 +372,7 @@ pub fn shutdown() {
 
 /// 切回 GPU：后台重新建设备（窗口按 GPU 重建后 poll_attach 接上）
 pub fn restart() {
-    FAILED.store(false, std::sync::atomic::Ordering::Relaxed);
+    crate::render::clear_failed();
     let t = UI_THREAD.load(std::sync::atomic::Ordering::Relaxed);
     if t != 0 {
         prewarm(t);
@@ -479,7 +474,7 @@ pub fn prewarm(ui_thread: u32) {
     }
     std::thread::spawn(move || {
         let p = build_prep();
-        if PREF_CPU.load(std::sync::atomic::Ordering::Relaxed) {
+        if crate::render::pref_cpu() {
             // 设置里是 CPU：设备用不上，放掉（显卡驱动的线程和内存）
             drop(p);
             PREP_STARTED.store(false, std::sync::atomic::Ordering::Release);
@@ -625,7 +620,7 @@ fn attach(hwnd: HWND, w: u32, h: u32, p: Prep) -> bool {
         }
         Err(e) => {
             log::warn!("gpu: attach failed: {e}; falling back to CPU present");
-            FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::render::mark_failed();
             false
         }
     }

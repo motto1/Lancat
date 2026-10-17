@@ -466,11 +466,14 @@ impl Win32Window {
                 self.buf.borrow_mut().clear();
                 self.needs_redraw.set(true);
                 self.needs_present.set(true);
+                crate::settings_ui::refresh_render_note();
             }
             crate::gpu::Attach::Failed => {
                 self.gpu_pending.set(false);
+                crate::render::mark_failed();
                 log::warn!("gpu: unavailable, rebuilding the panel window for CPU present");
                 recreate_cpu(self);
+                crate::settings_ui::refresh_render_note();
             }
         }
     }

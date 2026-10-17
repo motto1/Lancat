@@ -101,6 +101,9 @@ pub struct Settings {
     pub paired_remotes: Vec<PairedRemote>,
     /// Public addresses this side dials (another device's tunnel), with what pairing gave us.
     pub remote_peers: Vec<RemotePeer>,
+    /// Desktop (Slint) rendering: "gpu" (default; falls back to CPU automatically when the GPU
+    /// cannot be used) or "cpu". `LANCAT_CPU_COMPOSE=1` overrides it.
+    pub render_mode: String,
 }
 
 /// A device that paired with us over the public path.
@@ -150,6 +153,7 @@ impl Default for Settings {
             pair_code: String::new(),
             paired_remotes: vec![],
             remote_peers: vec![],
+            render_mode: "gpu".into(),
         }
     }
 }
