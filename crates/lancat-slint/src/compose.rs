@@ -1436,7 +1436,27 @@ thread_local! {
     static GSIG: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     /// 本帧上传纹理用掉的时间（已含在 base / rN 里，单独列出来）
     static UP_MS: Cell<f32> = const { Cell::new(0.0) };
+    /// 上一帧收尾做过 rearm（渲染器的逐项缓存是 pass 0 的状态，增量探测可信）
+    static GREARMED: Cell<bool> = const { Cell::new(false) };
+    /// 层 5 出现后、冻结前：基底和静态层（层 5、6 以外）本次拖拽里渲染过的内容键（层矩形 + 窗口尺寸）
+    static GPRE: RefCell<HashMap<i32, [f32; 8]>> = RefCell::new(HashMap::new());
+    /// 上一帧所有活动层的内容键（层 id + 矩形 + 窗口尺寸，不含姿态）
+    static GCKEY: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    /// 上一次探测没有任何变化（只有姿态在动）；连续跳过 rearm 的帧数
+    static GPROBE_CLEAN: Cell<bool> = const { Cell::new(false) };
+    static GSKIP: Cell<u32> = const { Cell::new(0) };
+    /// 探测到变化后先停几帧不探测（拖放选择器的弹簧动画每帧都在变，探测白花 ~3 ms）
+    static GPCOOL: Cell<u32> = const { Cell::new(0) };
 }
+
+#[cfg(windows)]
+fn content_key(l: Option<&crate::FxLayer>, w: usize, h: usize, scale: f32) -> [f32; 8] {
+    match l {
+        Some(l) => [l.x, l.y, l.w, l.h, l.r, w as f32, h as f32, scale],
+        None => [0.0, 0.0, 0.0, 0.0, 0.0, w as f32, h as f32, scale],
+    }
+}
+
 
 /// 层内容在源坐标里可能占的行（层矩形外扩 96 px 阴影边距，与 CPU 版 out_box 的边距相同）
 #[cfg(windows)]
@@ -1519,33 +1539,69 @@ fn render_gpu(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize,
     let was = WAS.with(|x| x.replace(true));
     set_flags(&ids);
     let sig = layer_sig(&active, w, h, scale);
-    // 增量探测（单层、姿态不变）：没变化就不画；变化落在层矩形里时复用基底纹理（最多拖 BASE_LAG）
+    // 探测：上一帧以 pass 0 的 rearm 收尾、层的内容键没变、纹理都在 → 在 pass 0 下跑一遍不光栅化的逐行渲染拿脏区。
+    // 没有脏区 = 只有姿态在动（入场动画、内容缩放回弹）：所有纹理照用，只在 GPU 上按新姿态重合成。
+    // 单层且脏区落在层矩形里：复用基底纹理（最多拖 BASE_LAG），只重画层。
+    let ckey: Vec<f32> = {
+        let mut v = vec![w as f32, h as f32, scale];
+        for (l, _) in &active {
+            v.extend_from_slice(&[l.id as f32, l.x, l.y, l.w, l.h, l.r]);
+        }
+        v
+    };
     let mut reuse_base = false;
-    let single_ok = reused && was && active.len() == 1 && gpu::has_base() && GSIG.with(|g| *g.borrow() == sig);
-    if single_ok {
+    let mut pose_only = false;
+    let cool = GPCOOL.with(|c| c.replace(c.get().saturating_sub(1)));
+    let probe_ok = reused
+        && was
+        && GREARMED.with(|r| r.get())
+        && gpu::has_base()
+        && GCKEY.with(|k| *k.borrow() == ckey)
+        && active.iter().all(|(l, _)| gpu::has_layer(l.id))
+        && (GPROBE_CLEAN.with(|p| p.get()) || cool == 0);
+    if probe_ok {
         renderer.set_repaint_buffer_type(RepaintBufferType::ReusedBuffer);
         let t0 = Instant::now();
         let reg = renderer.render_by_line(Rearm);
         phase("probe", t0);
-        let Some((dx, dy, dw, dh)) = region_box(&reg) else {
-            // 没变化：显示的仍是上一帧 GPU 合成的结果
-            GPU_FRAME.with(|g| g.set(true));
-            return finish(&ui, None);
-        };
-        let d = (dx.max(0) as usize, dy.max(0) as usize, ((dx + dw as i32).max(0) as usize).min(w), ((dy + dh as i32).max(0) as usize).min(h));
-        if d.2 <= d.0 || d.3 <= d.1 {
-            GPU_FRAME.with(|g| g.set(true));
-            return finish(&ui, None);
+        let d = region_box(&reg)
+            .map(|(dx, dy, dw, dh)| (dx.max(0) as usize, dy.max(0) as usize, ((dx + dw as i32).max(0) as usize).min(w), ((dy + dh as i32).max(0) as usize).min(h)))
+            .filter(|d| d.2 > d.0 && d.3 > d.1);
+        GPROBE_CLEAN.with(|p| p.set(d.is_none()));
+        if d.is_some() {
+            GPCOOL.with(|c| c.set(6));
         }
-        let (l, p) = &active[0];
-        let g = Geo::new(l, p, scale);
-        let inner = fbox((g.lx, g.ly, g.lx + g.lw, g.ly + g.lh), w, h);
-        let inside = p.identity() && d.0 >= inner.0 && d.1 >= inner.1 && d.2 <= inner.2 && d.3 <= inner.3;
-        let stale = BASE_SKIP.with(|b| b.get().is_some_and(|t| t.elapsed() >= BASE_LAG));
-        reuse_base = inside && !stale;
-        fx.set_pass(0);
+        if stats_on() {
+            if let Some(d) = d {
+                PH.with(|p| p.borrow_mut().push_str(&format!(" d={},{} {}x{}", d.0, d.1, d.2 - d.0, d.3 - d.1)));
+            }
+        }
+        match d {
+            None if GSIG.with(|g| *g.borrow() == sig) => {
+                // 什么都没变：显示的仍是上一帧
+                GPU_FRAME.with(|g| g.set(true));
+                return finish(&ui, None);
+            }
+            None => pose_only = true,
+            Some(d) if active.len() == 1 => {
+                let (l, p) = &active[0];
+                let g = Geo::new(l, p, scale);
+                let inner = fbox((g.lx, g.ly, g.lx + g.lw, g.ly + g.lh), w, h);
+                let inside = p.identity() && d.0 >= inner.0 && d.1 >= inner.1 && d.2 <= inner.2 && d.3 <= inner.3;
+                let stale = BASE_SKIP.with(|b| b.get().is_some_and(|t| t.elapsed() >= BASE_LAG));
+                reuse_base = inside && !stale;
+            }
+            Some(_) => {}
+        }
+        if stats_on() && pose_only {
+            PH.with(|ph| ph.borrow_mut().push_str(" pose-only"));
+        }
     }
-    renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
+    GCKEY.with(|k| *k.borrow_mut() = ckey);
+    if !pose_only {
+        // 只重合成的帧不碰渲染器：换 NewBuffer 会清掉逐项缓存，下一帧的探测就成了整窗
+        renderer.set_repaint_buffer_type(RepaintBufferType::NewBuffer);
+    }
     let i5 = active.iter().position(|(l, _)| l.id == 5);
     if i5.is_none() {
         G5.with(|g| g.set(None));
@@ -1554,9 +1610,21 @@ fn render_gpu(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize,
     }
     let frozen5 = i5.is_some() && G5.with(|g| g.get().is_some_and(|(_, s)| s)) && gpu::has_bs(5);
     let skip_below = frozen5 && gpu::has_under5();
+    // 层 5 出现后、冻结前（~0.6 s，选择器淡入 + 内容缩小动画）：基底和层 5/6 以外的层内容不变，只有姿态在动 ——
+    // 第一帧渲染后沿用 GPU 上的纹理，到冻结那一帧（按静止底图重算模糊）再全部重画一次。
+    // 期间这些层里若有内容变化，最多晚 0.6 s 出现（选择器淡入后它们本来就被模糊底图盖住）。
+    let settle5 = G5.with(|g| g.get().is_some_and(|(born, s)| !s && born.elapsed().as_secs_f32() > 0.6));
+    let pre5 = i5.is_some() && !frozen5 && !settle5 && G5.with(|g| g.get().is_some());
+    if i5.is_none() || settle5 || frozen5 {
+        GPRE.with(|p| p.borrow_mut().clear());
+    }
+    let pre_hit = |id: i32, key: [f32; 8]| pre5 && GPRE.with(|p| p.borrow().get(&id) == Some(&key));
+    let base_key = content_key(None, w, h, scale);
     let t0 = Instant::now();
     if skip_below {
         gpu::start(true);
+    } else if pose_only || (gpu::has_base() && pre_hit(1, base_key)) {
+        gpu::start(false);
     } else if reuse_base {
         BASE_SKIP.with(|b| {
             if b.get().is_none() {
@@ -1572,6 +1640,9 @@ fn render_gpu(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize,
         gpu::upload_base(buf, w, h);
         UP_MS.with(|u| u.set(u.get() + tu.elapsed().as_secs_f32() * 1000.0));
         BASE_SKIP.with(|b| b.set(None));
+        if i5.is_some() && !frozen5 {
+            GPRE.with(|p| p.borrow_mut().insert(1, base_key));
+        }
         gpu::start(false);
     }
     phase("base", t0);
@@ -1588,7 +1659,9 @@ fn render_gpu(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize,
             let t0 = Instant::now();
             let g = Geo::new(l, p, scale);
             let static_above = frozen5 && Some(k) > i5 && l.id != 6;
-            let cached = static_above && gpu::has_layer(l.id) && GFROZEN.with(|f| f.borrow().contains(&l.id));
+            let key = content_key(Some(l), w, h, scale);
+            let pre_static = i5.is_some() && !frozen5 && Some(k) != i5 && l.id != 6;
+            let cached = pose_only || (static_above && gpu::has_layer(l.id) && GFROZEN.with(|f| f.borrow().contains(&l.id))) || (pre_static && gpu::has_layer(l.id) && pre_hit(l.id, key));
             if !cached {
                 fx.set_pass(l.id);
                 clear(&mut tmp);
@@ -1598,6 +1671,9 @@ fn render_gpu(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize,
                 UP_MS.with(|u| u.set(u.get() + tu.elapsed().as_secs_f32() * 1000.0));
                 if static_above {
                     GFROZEN.with(|f| f.borrow_mut().push(l.id));
+                }
+                if pre_static {
+                    GPRE.with(|p| p.borrow_mut().insert(l.id, key));
                 }
             }
             if stats_on() {
@@ -1653,5 +1729,24 @@ fn render_gpu(renderer: &SoftwareRenderer, buf: &mut [Bgra], w: usize, h: usize,
         PH.with(|p| p.borrow_mut().push_str(&format!(" up={up:.1}")));
     }
     GPU_FRAME.with(|g| g.set(true));
+    if pose_only {
+        // 整帧都在 pass 0 下：探测已经把渲染器缓存和依赖登记成 pass 0 的状态，不用 rearm
+        GSKIP.with(|s| s.set(0));
+        let _ = finish(&ui, None);
+        return Out::Full;
+    }
+    // 还有动画在跑：下一帧无论如何都会画（LAYER_ANIM 接着要帧），省掉这次整场景的 rearm（~1.5–3 ms）；
+    // 动画停下的那一帧照常 rearm，之后的属性变化才会通知重画。上次探测是干净的（只有姿态在动）或已连续
+    // 跳过 6 帧时照样 rearm，让下一帧能探测、走只重合成的路
+    let skips = GSKIP.with(|s| s.get());
+    if ui.window().has_active_animations() && !GPROBE_CLEAN.with(|p| p.get()) && skips < 6 {
+        GSKIP.with(|s| s.set(skips + 1));
+        GREARMED.with(|r| r.set(false));
+        renderer.set_repaint_buffer_type(if reused { RepaintBufferType::ReusedBuffer } else { RepaintBufferType::NewBuffer });
+        let _ = finish(&ui, None);
+        return Out::Full;
+    }
+    GSKIP.with(|s| s.set(0));
+    GREARMED.with(|r| r.set(true));
     finish_rearm(renderer, &ui, reused, None)
 }

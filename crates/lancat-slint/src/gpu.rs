@@ -272,7 +272,14 @@ fn create_device(kind: D3D_DRIVER_TYPE) -> Option<(ID3D11Device, ID3D11DeviceCon
 
 fn build_prep() -> Option<Prep> {
     let t = Instant::now();
-    let (dev, ctx, warp) = match create_device(D3D_DRIVER_TYPE_HARDWARE) {
+    // 测试降级路径：LANCAT_GPU_TEST=fail（设备失败 → 窗口换回 CPU 版）/ warp（只用 WARP 呈现，合成走 CPU）
+    let test = std::env::var("LANCAT_GPU_TEST").unwrap_or_default();
+    if test == "fail" {
+        log::warn!("gpu: LANCAT_GPU_TEST=fail");
+        return None;
+    }
+    let hw = if test == "warp" { None } else { create_device(D3D_DRIVER_TYPE_HARDWARE) };
+    let (dev, ctx, warp) = match hw {
         Some((d, c)) => (d, c, false),
         None => {
             // 没有可用的硬件设备：WARP 只用来呈现（合成仍走 CPU）

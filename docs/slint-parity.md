@@ -24,6 +24,14 @@ Windows 1.5x 缩放下分别跑旧版 `lancat.exe` 和新版 `lancat-slint.exe`�
 
 更早的对齐（外壳动画、消息入场、可选中、会话历史缓存、贴纸播放规则、提示气泡、设置控件、软件渲染器画不了的阴影 / 旋转 / 圆角裁剪改由 `fx.rs`、`compose.rs` 合成）见提交 05c20f3 及之前。
 
+## Windows：GPU 呈现与合成（`src/gpu.rs`）
+
+- 面板窗口带 `WS_EX_NOREDIRECTIONBITMAP`，内容是 D3D11 composition swapchain（预乘 alpha）挂在 DirectComposition visual 上；整窗淡入淡出改在呈现着色器里乘透明度，停放时仍加 `WS_EX_LAYERED | WS_EX_TRANSPARENT` 点击穿透。设备和着色器在后台线程建，好了再接上交换链。
+- `compose.rs` 的分层合成搬到像素着色器：背景模糊（同一套降采样 + 三次盒式）、饱和度、liquid 位移、圆角覆盖、层的缩放/平移/透明度和预乘 over。Slint 仍在 CPU 上逐层光栅化，层的缓冲上传成纹理；只有姿态在动的帧（入场动画、拖放结束的回弹、toast）探测无变化后直接复用纹理重合成。与 CPU 合成逐像素比对：每通道差 ≤2（偶发 ≤7，来自冻结模糊的取样时刻）。
+- 动画中事件循环按 swapchain 的 frame-latency 句柄（显示器刷新率）要帧；Slint 层渲染仍是主要开销。
+- `LANCAT_CPU_COMPOSE=1`：整条走原来的 CPU 路径（GDI 呈现）。没有硬件设备时用 WARP 只做呈现、合成走 CPU；连 WARP 都失败则把面板窗口重建成 CPU 版。`LANCAT_GPU_COMPOSE=0`：GPU 只呈现。`LANCAT_GPU_TEST=warp|fail` 用来测降级路径。
+- 停靠条 ⇄ 面板的变形窗口（`dock/morph.rs`）仍是 CPU + `UpdateLayeredWindow`。
+
 ## 有意不同 / 无法对齐
 
 - 深色主题下旧版文字略粗：Chromium 在深底上做了对比度增强，Slint 软件渲染器的灰度抗锯齿没有这一步。
