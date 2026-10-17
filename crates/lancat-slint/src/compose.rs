@@ -867,7 +867,7 @@ thread_local! {
     static PH: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
-fn stats_on() -> bool {
+pub(crate) fn stats_on() -> bool {
     static STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *STATS.get_or_init(|| std::env::var_os("LANCAT_FRAME_STATS").is_some())
 }

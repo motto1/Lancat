@@ -139,7 +139,13 @@ impl slint::platform::Platform for Win32Platform {
                     p.needs_redraw.set(true);
                 }
             }
+            // 变形动画期间停放着（看不见）的面板不画：Slint 软件渲染一帧 7–10 ms，会挤掉变形的 vsync
+            // （快照在变形开始前已经拿了；面板接手时 needs_redraw 还在，照常补画）
+            let morphing = crate::dock::morph::running();
             for w in &wins {
+                if morphing && !w.normal && w.alpha.get() == 0 {
+                    continue;
+                }
                 if w.gpu.get() {
                     if w.needs_redraw.get() {
                         let r = w.render();
@@ -166,13 +172,23 @@ impl slint::platform::Platform for Win32Platform {
             let anim = wins.iter().any(|w| w.window.has_active_animations() || w.settling()) || crate::compose::animating();
             let anim = anim || fast;
             let ms = if fast { crate::gpu::frame_ms() } else if anim { 16 } else { wait.map(|d| d.as_millis().min(u32::MAX as u128 - 1) as u32).unwrap_or(INFINITE) };
+            // GPU 变形动画：等它的交换链（显示器刷新节拍），有信号就画下一帧
+            let mwait = crate::dock::morph::gpu_wait();
             // 刚呈现过：等交换链的 frame-latency 句柄（vsync 节拍），期间照常处理消息
-            let wh = if fast { crate::gpu::wait_handle() } else { None };
+            let wh = if mwait.is_some() { mwait } else if fast { crate::gpu::wait_handle() } else { None };
             unsafe {
                 if let Some(hh) = wh {
+                    let tw = std::time::Instant::now();
                     let r = MsgWaitForMultipleObjectsEx(Some(&[hh]), 40, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                    if mwait.is_some() {
+                        crate::dock::morph::note_wait(tw.elapsed().as_secs_f32() * 1000.0);
+                    }
                     if r == WAIT_OBJECT_0 {
-                        crate::gpu::waited();
+                        if mwait.is_some() {
+                            crate::dock::morph::gpu_tick();
+                        } else {
+                            crate::gpu::waited();
+                        }
                     }
                 } else {
                     MsgWaitForMultipleObjectsEx(None, ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
@@ -257,6 +273,8 @@ pub struct Win32Window {
     /// 合成 lq_base 用的那张模糊背景（收起动画直接拿它当玻璃，不用再截屏）
     lq_glass: RefCell<Vec<Bgra>>,
     lq_dark: Cell<bool>,
+    /// 液态玻璃底在 GPU 上（gpu::set_lq_glass；lq_base / lq_glass 是空的）
+    lq_gpu: Cell<bool>,
     /// 面板走 GPU 呈现（DirectComposition 交换链）；false = CPU（SetDIBitsToDevice）
     gpu: Cell<bool>,
     /// 窗口按 GPU 建的（NOREDIRECTIONBITMAP），交换链还没接上
@@ -290,6 +308,7 @@ impl Win32Window {
             lq_base: RefCell::new(Vec::new()),
             lq_glass: RefCell::new(Vec::new()),
             lq_dark: Cell::new(false),
+            lq_gpu: Cell::new(false),
             gpu: Cell::new(false),
             gpu_pending: Cell::new(false),
             needs_present: Cell::new(false),
@@ -484,6 +503,10 @@ impl Win32Window {
                 let mut ps = PAINTSTRUCT::default();
                 let _ = BeginPaint(h, &mut ps);
                 let _ = EndPaint(h, &ps);
+            }
+            if !self.normal && self.alpha.get() == 0 && crate::dock::morph::running() {
+                // 变形动画期间停放着：不补画（见 run_event_loop）
+                return;
             }
             let late = if self.needs_redraw.get() && !self.window.has_active_animations() { self.render() } else { None };
             if late.is_some() || self.needs_present.get() {
@@ -954,7 +977,11 @@ fn recreate_cpu(w: &Win32Window) {
         let _ = GetWindowRect(old, &mut r);
         let vis = IsWindowVisible(old).as_bool();
         let Ok(inst) = GetModuleHandleW(None) else { return };
-        let ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED;
+        let mut ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED;
+        if w.alpha.get() == 0 {
+            // 停放着：点击穿透
+            ex |= WS_EX_TRANSPARENT;
+        }
         let h = match CreateWindowExW(ex, CLASS, w!("Lancat"), WS_POPUP, r.left, r.top, r.right - r.left, r.bottom - r.top, None, None, Some(inst.into()), None) {
             Ok(h) => h,
             Err(e) => {
@@ -981,6 +1008,80 @@ fn recreate_cpu(w: &Win32Window) {
         let _ = DestroyWindow(old);
         w.buf.borrow_mut().clear();
         w.needs_redraw.set(true);
+    }
+}
+
+/// 切回 GPU：面板窗口换成 NOREDIRECTIONBITMAP 版（同位置、同显示状态），等后台设备好了 poll_gpu 接上
+fn recreate_gpu(w: &Win32Window) {
+    unsafe {
+        let old = w.hwnd.get();
+        let mut r = RECT::default();
+        let _ = GetWindowRect(old, &mut r);
+        let vis = IsWindowVisible(old).as_bool();
+        let Ok(inst) = GetModuleHandleW(None) else { return };
+        let parked = w.alpha.get() == 0;
+        let mut ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP;
+        if parked {
+            ex |= WS_EX_LAYERED | WS_EX_TRANSPARENT;
+        }
+        let h = match CreateWindowExW(ex, CLASS, w!("Lancat"), WS_POPUP, r.left, r.top, r.right - r.left, r.bottom - r.top, None, None, Some(inst.into()), None) {
+            Ok(h) => h,
+            Err(e) => {
+                log::error!("gpu switch: CreateWindowExW failed: {e}");
+                return;
+            }
+        };
+        WINDOWS.with(|ws| {
+            for e in ws.borrow_mut().iter_mut() {
+                if e.0 == old.0 as isize {
+                    e.0 = h.0 as isize;
+                }
+            }
+        });
+        w.hwnd.set(h);
+        if parked {
+            let _ = SetLayeredWindowAttributes(h, COLORREF(0), 0, LWA_ALPHA);
+        }
+        setup_material(h, crate::theme_is_dark("system"));
+        if dock_mode() {
+            crate::dock::drop::register_panel(h);
+        }
+        if vis {
+            let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+        }
+        let _ = DestroyWindow(old);
+        w.lq_base.borrow_mut().clear();
+        w.lq_glass.borrow_mut().clear();
+        w.lq_gpu.set(false);
+        w.gpu_pending.set(true);
+        w.buf.borrow_mut().clear();
+        w.needs_redraw.set(true);
+    }
+}
+
+/// 设置里换了渲染方式：当场切换（面板窗口重建、交换链 / 设备丢掉或重建；CPU 路径就是原来那套）。
+/// LANCAT_CPU_COMPOSE=1 时什么都不做（一直是 CPU）。
+pub fn apply_render_mode(cpu: bool) {
+    crate::gpu::set_pref_cpu(cpu);
+    if crate::gpu::env_forced_cpu() {
+        return;
+    }
+    let Some(w) = panel() else { return };
+    if cpu && (w.gpu.get() || w.gpu_pending.get()) {
+        log::info!("render mode: switching to CPU");
+        crate::dock::morph::reset_gpu();
+        w.gpu.set(false);
+        w.gpu_pending.set(false);
+        w.lq_gpu.set(false);
+        w.lq_base.borrow_mut().clear();
+        w.lq_glass.borrow_mut().clear();
+        crate::gpu::shutdown();
+        recreate_cpu(&w);
+    } else if !cpu && !w.gpu.get() && !w.gpu_pending.get() {
+        log::info!("render mode: switching to GPU");
+        crate::dock::morph::reset_gpu();
+        crate::gpu::restart();
+        recreate_gpu(&w);
     }
 }
 
@@ -1251,6 +1352,29 @@ fn panel_snapshot() -> Option<(Vec<Bgra>, usize, usize)> {
     (n > 0 && b.len() == n).then(|| (b.clone(), size.width as usize, size.height as usize))
 }
 
+/// 变形动画要的面板快照：GPU 变形时直接复制面板的 GPU 帧（不读回），否则 CPU 像素
+fn morph_snapshot() -> Option<(Vec<Bgra>, usize, usize, Option<crate::gpu::GTex>)> {
+    let w = panel()?;
+    if w.gpu.get() && crate::dock::morph::gpu_mode() {
+        let size = w.size.get();
+        let n = (size.width * size.height) as usize;
+        if w.needs_redraw.get() || w.buf.borrow().len() != n {
+            let r = w.render();
+            if r.is_some() && !crate::compose::gpu_frame() {
+                let b = w.buf.borrow();
+                if b.len() == n {
+                    crate::gpu::upload_cpu(&b, size.width as usize, size.height as usize, 0, size.height as usize);
+                }
+            }
+        }
+        if let Some(t) = crate::gpu::snapshot().filter(|t| t.size() == (size.width as usize, size.height as usize)) {
+            return Some((Vec::new(), size.width as usize, size.height as usize, Some(t)));
+        }
+    }
+    let (px, cw, ch) = panel_snapshot()?;
+    Some((px, cw, ch, None))
+}
+
 /// 调试：把面板当前合成好的一帧（不含液态玻璃底）写成 PNG（预乘 RGBA 原样），比对 GPU / CPU 合成用
 pub fn dump_panel(path: &str) {
     let Some((px, w, h)) = panel_snapshot() else { return log::warn!("dump: no frame") };
@@ -1271,6 +1395,7 @@ pub fn dump_panel(path: &str) {
 fn set_liquid(w: &Win32Window, glass: Option<Vec<Bgra>>, dark: bool) {
     let size = w.size.get();
     let (pw, ph) = (size.width as usize, size.height as usize);
+    w.lq_gpu.set(false);
     let Some(glass) = glass.filter(|g| g.len() == pw * ph && pw > 0) else {
         if w.gpu.get() {
             crate::gpu::set_lq(None);
@@ -1296,6 +1421,29 @@ fn set_liquid(w: &Win32Window, glass: Option<Vec<Bgra>>, dark: bool) {
     unsafe {
         let _ = InvalidateRect(Some(w.hwnd.get()), None, false);
     }
+}
+
+/// GPU 版 set_liquid：模糊图已经在 GPU 上（变形动画的那张 / 刚截的），玻璃底在着色器里画，不经过 CPU
+fn set_liquid_gpu(w: &Win32Window, glass: std::rc::Rc<crate::gpu::Glass>, dark: bool) {
+    let size = w.size.get();
+    let (pw, ph) = (size.width as usize, size.height as usize);
+    let sc = w.scale.get() as f64;
+    let mut r = RECT::default();
+    unsafe {
+        let _ = GetWindowRect(w.hwnd.get(), &mut r);
+    }
+    let f = crate::morph::Frame { rect: [0.0, 0.0, pw as f64, ph as f64], radius: 8.0 * sc, content: 1.0, grow: 1.0, done: true };
+    let look = crate::morph::Look { dark, scale: sc, accent: crate::dock::ACCENT };
+    w.lq_base.borrow_mut().clear();
+    w.lq_glass.borrow_mut().clear();
+    let ok = crate::gpu::set_lq_glass(glass, (r.left, r.top), pw, ph, &look, &f);
+    w.lq_gpu.set(ok);
+    w.lq_dark.set(dark);
+    w.needs_present.set(true);
+}
+
+fn has_liquid(w: &Win32Window) -> bool {
+    w.lq_gpu.get() || !w.lq_base.borrow().is_empty()
 }
 
 thread_local! {
@@ -1337,7 +1485,7 @@ fn start_liquid_refresh() {
         // 不再定时截屏（每截一次面板要从录屏/截图里消失一帧）：只在面板背后的窗口变了（切换、挪动、开关）时才重截
         t.start(slint::TimerMode::Repeated, Duration::from_millis(350), || {
             let Some(w) = panel() else { return };
-            if w.alpha.get() != 255 || !crate::dock::is_visible() || crate::dock::morph::running() || w.lq_base.borrow().is_empty() {
+            if w.alpha.get() != 255 || !crate::dock::is_visible() || crate::dock::morph::running() || !has_liquid(&w) {
                 LQ_SIG.with(|s| s.set(0));
                 return;
             }
@@ -1357,12 +1505,22 @@ fn start_liquid_refresh() {
             let rect = (r.left, r.top, r.right - r.left, r.bottom - r.top);
             let sc = w.scale.get() as f64;
             let dark = w.lq_dark.get();
+            let on_gpu = w.lq_gpu.get();
             std::thread::spawn(move || {
-                let g = crate::dock::morph::capture_excluding(HWND(h as _), rect, sc);
+                // GPU：只截屏，模糊在 UI 线程的着色器里做
+                let g = if on_gpu { crate::dock::morph::capture_excluding_raw(HWND(h as _), rect) } else { crate::dock::morph::capture_excluding(HWND(h as _), rect, sc) };
                 let _ = slint::invoke_from_event_loop(move || {
                     LQ_BUSY.store(false, std::sync::atomic::Ordering::Release);
                     let Some(w) = panel() else { return };
-                    if w.alpha.get() == 255 && !w.lq_base.borrow().is_empty() && g.is_some() {
+                    if w.alpha.get() != 255 || !has_liquid(&w) || g.is_none() {
+                        return;
+                    }
+                    if on_gpu && w.lq_gpu.get() && w.gpu.get() {
+                        let px = g.unwrap_or_default();
+                        if let Some(gl) = crate::gpu::glass_from_pixels(&px, rect.2 as usize, rect.3 as usize, (rect.0, rect.1), crate::dock::morph::blur_radius(sc)) {
+                            set_liquid_gpu(&w, gl, dark);
+                        }
+                    } else if !on_gpu {
                         set_liquid(&w, g, dark);
                     }
                 });
@@ -1379,6 +1537,7 @@ fn park_now(w: &Win32Window) {
     }
     w.lq_base.borrow_mut().clear();
     w.lq_glass.borrow_mut().clear();
+    w.lq_gpu.set(false);
     w.fade_gen.set(w.fade_gen.get() + 1);
     set_layered(h, true);
     set_alpha(h, 0, w);
@@ -1400,8 +1559,8 @@ pub fn panel_show_morph(g: crate::dock::Geo, edge: String, dark: bool, accent: (
         if !crate::dock::is_visible() {
             return;
         }
-        let Some((px, cw, ch)) = panel_snapshot() else { return panel_show(g.panel) };
-        let p = crate::dock::morph::Params { strip: g.dock, panel: g.panel, edge, scale: g.scale, dark, accent, content: px, cw, ch };
+        let Some((px, cw, ch, gc)) = morph_snapshot() else { return panel_show(g.panel) };
+        let p = crate::dock::morph::Params { strip: g.dock, panel: g.panel, edge, scale: g.scale, dark, accent, content: px, cw, ch, gcontent: gc };
         crate::dock::morph::open(p, move || {
             if !crate::dock::is_visible() {
                 return;
@@ -1410,7 +1569,10 @@ pub fn panel_show_morph(g: crate::dock::Geo, edge: String, dark: bool, accent: (
             let h = w.hwnd.get();
             // 变形用的那张背景图接着给真面板当玻璃底，玻璃效果不会在停稳后消失
             if std::env::var("LANCAT_WIN_LIQUID").as_deref() != Ok("0") {
-                set_liquid(&w, crate::dock::morph::crop_glass(g.panel), dark);
+                match crate::dock::morph::gpu_glass() {
+                    Some(gl) if w.gpu.get() => set_liquid_gpu(&w, gl, dark),
+                    _ => set_liquid(&w, crate::dock::morph::crop_glass(g.panel), dark),
+                }
                 start_liquid_refresh();
             }
             w.fade_gen.set(w.fade_gen.get() + 1);
@@ -1434,12 +1596,13 @@ pub fn panel_hide_morph(prev: Option<isize>, g: crate::dock::Geo, edge: String, 
     }
     let h = w.hwnd.get();
     give_back_foreground(h, prev);
-    let Some((px, cw, ch)) = panel_snapshot() else { return panel_hide(None) };
-    let p = crate::dock::morph::Params { strip: g.dock, panel: g.panel, edge, scale: g.scale, dark, accent, content: px, cw, ch };
+    let Some((px, cw, ch, gc)) = morph_snapshot() else { return panel_hide(None) };
+    let p = crate::dock::morph::Params { strip: g.dock, panel: g.panel, edge, scale: g.scale, dark, accent, content: px, cw, ch, gcontent: gc };
     // 面板现成的玻璃背景（≤1 s 前截的）：收起不用再截屏，动画立刻开始
     let glass = std::mem::take(&mut *w.lq_glass.borrow_mut());
     let glass = (glass.len() == cw * ch).then_some(glass);
-    crate::dock::morph::close(p, glass, shown.then_some(h), || park_now(&w), || {});
+    let gglass = if w.lq_gpu.get() { crate::gpu::panel_glass() } else { None };
+    crate::dock::morph::close(p, glass, gglass, shown.then_some(h), || park_now(&w), || {});
 }
 
 /// 主动打开（点 toast、托盘、第二次启动）：拿键盘焦点；返回之前的前台窗口。

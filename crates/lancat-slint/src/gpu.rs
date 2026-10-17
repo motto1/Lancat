@@ -143,6 +143,92 @@ float4 ps_mix(V i) : SV_Target {
 }
 "#;
 
+/// 变形窗口（以及面板的液态玻璃底）：圆角矩形玻璃 + 透镜折射 + 色调 + 高光 + 阴影 + 拉伸叠内容，
+/// 与 morph.rs render_impl（stretch 模式）逐步对应。坐标：目标像素（SV_Position，像素中心 +0.5）。
+const MORPH_HLSL: &str = r#"
+cbuffer M : register(b0) {
+  float4 rect;  // 形状 x0 y0 x1 y1（目标 px）
+  float4 m0;    // radius, shadow, sh_dy, bevel
+  float4 m1;    // strength, rim_w, content op, 整体透明度
+  float4 body;  // 色调 rgb, 色调透明度
+  float4 m2;    // rim_a, sheen_a, shadow_a, 有玻璃
+  float4 gmap;  // 目标 → 玻璃全分辨率坐标的偏移 xy, 1/(f*smallW), 1/(f*smallH)
+  float4 cmap;  // 内容：卡片左上 cax cay, kx ky
+  float4 csz;   // 1/cw, 1/ch, 0, 0
+};
+Texture2D G : register(t0);
+Texture2D C : register(t1);
+SamplerState SL : register(s0);
+SamplerState SB : register(s1);
+struct V { float4 pos : SV_Position; };
+
+float sdf_n(float2 p, float4 r, float rad, out float2 n) {
+  float2 hh = (r.zw - r.xy) * 0.5;
+  rad = max(min(rad, min(hh.x, hh.y)), 0);
+  float2 f = p - (r.xy + hh);
+  float2 q = abs(f) - (hh - rad);
+  float d = length(max(q, 0)) + min(max(q.x, q.y), 0) - rad;
+  if (q.x > 0 && q.y > 0) n = q / max(length(q), 1e-6);
+  else if (q.x > q.y) n = float2(1, 0);
+  else n = float2(0, 1);
+  n *= float2(f.x >= 0 ? 1 : -1, f.y >= 0 ? 1 : -1);
+  return d;
+}
+
+float4 ps_morph(V i) : SV_Target {
+  float2 p = i.pos.xy;
+  float2 nrm; float2 nn;
+  float d = sdf_n(p, rect, m0.x, nrm);
+  float ds = sdf_n(p - float2(0, m0.z), rect, m0.x, nn);
+  float shadow = m0.y;
+  float sh = ds > -shadow ? m2.z * exp(-pow(max(ds, 0) / (shadow * 0.42), 2)) : m2.z;
+  float cov = saturate(0.5 - d);
+  if (cov <= 0) return float4(0, 0, 0, sh) * m1.w;
+  float depth = -d;
+  float bevel = m0.w;
+  float ba = body.a;
+  float3 rgb; float a;
+  if (m2.w > 0.5) {
+    float off = 0;
+    if (depth > 0 && depth < bevel) { float t = 1 - depth / bevel; off = (1 - sqrt(max(1 - t * t, 0))) * m1.x; }
+    float2 q = p + gmap.xy;
+    float3 g1 = G.Sample(SL, (q - nrm * off) * gmap.zw).rgb;
+    float3 c0 = g1;
+    if (off > 0.5) {
+      c0.r = G.Sample(SL, (q - nrm * off * 1.08) * gmap.zw).r;
+      c0.b = G.Sample(SL, (q - nrm * off * 0.92) * gmap.zw).b;
+    }
+    float lum = dot(c0, float3(0.2126, 0.7152, 0.0722));
+    c0 = saturate(lum + (c0 - lum) * 1.25);
+    float lift = depth < bevel ? pow(1 - depth / bevel, 2) * (22.0 / 255.0) : 0;
+    rgb = min(c0 + lift, 1) * (1 - ba) + body.rgb * ba;
+    a = 1;
+  } else {
+    rgb = body.rgb * ba;
+    a = ba;
+  }
+  float tyk = saturate((p.y - rect.y) / max((rect.w - rect.y) * 0.45, 1));
+  float sheen = m2.y * (1 - tyk);
+  if (sheen > 0) { rgb += (1 - rgb) * sheen; a += (1 - a) * sheen; }
+  float rimw = m1.y;
+  if (depth < rimw) {
+    float kk = saturate(1 - depth / rimw);
+    float light = clamp(0.55 - 0.45 * nrm.y, 0.1, 1);
+    float ra = m2.x * kk * light;
+    rgb += (1 - rgb) * ra; a += (1 - a) * ra;
+  }
+  if (m1.z > 0) {
+    float2 cp = cmap.xy + (p - rect.xy) * cmap.zw;
+    float4 c = C.Sample(SB, cp * csz.xy);
+    float inv = 1 - c.a * m1.z;
+    rgb = c.rgb * m1.z + rgb * inv;
+    a = c.a * m1.z + a * inv;
+  }
+  rgb *= cov; a *= cov;
+  return float4(rgb, a + sh * (1 - a)) * m1.w;
+}
+"#;
+
 struct Tex {
     t: ID3D11Texture2D,
     srv: Option<ID3D11ShaderResourceView>,
@@ -159,6 +245,7 @@ struct Shaders {
     down: ID3D11PixelShader,
     boxp: ID3D11PixelShader,
     mix: ID3D11PixelShader,
+    morph: ID3D11PixelShader,
 }
 
 /// 纯模糊层的模糊结果（与层姿态无关，compose 决定何时重算）
@@ -185,6 +272,8 @@ pub struct Gpu {
     b_none: ID3D11BlendState,
     rs: ID3D11RasterizerState,
     cb: ID3D11Buffer,
+    /// 变形着色器的常量（32 个 float）
+    cb2: ID3D11Buffer,
     // 帧尺寸的纹理
     fw: u32,
     fh: u32,
@@ -223,9 +312,76 @@ fn log_err<T>(what: &str, r: windows::core::Result<T>) -> Option<T> {
     }
 }
 
-/// 想不想用 GPU（LANCAT_CPU_COMPOSE=1 关掉）
+/// 设置里选了 CPU 渲染（Settings.render_mode == "cpu"）
+static PREF_CPU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// GPU 初始化（设备 / 着色器 / 交换链）失败过：自动退回 CPU
+static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// UI 线程 id（设备建好后给它发唤醒消息；切回 GPU 时重建设备用）
+static UI_THREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 环境变量 LANCAT_CPU_COMPOSE=1：强制 CPU（优先于设置）
+pub fn env_forced_cpu() -> bool {
+    std::env::var("LANCAT_CPU_COMPOSE").as_deref() == Ok("1")
+}
+
+/// 想不想用 GPU（LANCAT_CPU_COMPOSE=1 或设置里选了 CPU 就不用）
 pub fn wanted() -> bool {
-    std::env::var("LANCAT_CPU_COMPOSE").as_deref() != Ok("1")
+    !env_forced_cpu() && !PREF_CPU.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 设置里的渲染方式（启动时在建面板窗口之前设；运行中切换见 win.rs apply_render_mode）
+pub fn set_pref_cpu(cpu: bool) {
+    PREF_CPU.store(cpu, std::sync::atomic::Ordering::Relaxed);
+    if cpu {
+        // 后台已经建好的设备用不上了
+        if PREP_STATE.load(std::sync::atomic::Ordering::Acquire) == 1 && !active() {
+            PREP.lock().unwrap().take();
+        }
+    }
+}
+
+/// 实际的渲染状态（设置页显示）："gpu" | "warp"（软件 D3D，只用来呈现）| "pending" | "cpu"（设置）|
+/// "cpu-env"（LANCAT_CPU_COMPOSE=1）| "failed"（GPU 初始化失败，自动用 CPU）
+pub fn status() -> &'static str {
+    if env_forced_cpu() {
+        return "cpu-env";
+    }
+    if active() {
+        return if hardware() { "gpu" } else { "warp" };
+    }
+    if PREF_CPU.load(std::sync::atomic::Ordering::Relaxed) {
+        return "cpu";
+    }
+    if FAILED.load(std::sync::atomic::Ordering::Relaxed) || PREP_STATE.load(std::sync::atomic::Ordering::Acquire) == 2 {
+        return "failed";
+    }
+    "pending"
+}
+
+/// 切到 CPU：丢掉设备、交换链和所有纹理（调用方先把用 GPU 的窗口换回 CPU 版）
+pub fn shutdown() {
+    drop_panel_glass();
+    let g = GPU.with(|g| g.borrow_mut().take());
+    if let Some(g) = g {
+        unsafe {
+            g.ctx.ClearState();
+            g.ctx.Flush();
+        }
+        drop(g);
+        log::info!("gpu: shut down (CPU rendering)");
+    }
+    PREP.lock().unwrap().take();
+    PREP_STATE.store(0, std::sync::atomic::Ordering::Release);
+    PREP_STARTED.store(false, std::sync::atomic::Ordering::Release);
+}
+
+/// 切回 GPU：后台重新建设备（窗口按 GPU 重建后 poll_attach 接上）
+pub fn restart() {
+    FAILED.store(false, std::sync::atomic::Ordering::Relaxed);
+    let t = UI_THREAD.load(std::sync::atomic::Ordering::Relaxed);
+    if t != 0 {
+        prewarm(t);
+    }
 }
 
 fn compile(src: &str, entry: &str, target: &str) -> Option<Vec<u8>> {
@@ -300,7 +456,13 @@ fn build_prep() -> Option<Prep> {
         log_err("vs", unsafe { dev.CreateVertexShader(&code, None, Some(&mut s)) })?;
         s
     })();
-    let sh = Shaders { vs: vs?, present: ps("ps_present")?, over: ps("ps_over")?, disp: ps("ps_disp")?, down: ps("ps_down")?, boxp: ps("ps_box")?, mix: ps("ps_mix")? };
+    let morph = (|| {
+        let code = compile(MORPH_HLSL, "ps_morph", "ps_4_0")?;
+        let mut s = None;
+        log_err("ps_morph", unsafe { dev.CreatePixelShader(&code, None, Some(&mut s)) })?;
+        s
+    })();
+    let sh = Shaders { vs: vs?, present: ps("ps_present")?, over: ps("ps_over")?, disp: ps("ps_disp")?, down: ps("ps_down")?, boxp: ps("ps_box")?, mix: ps("ps_mix")?, morph: morph? };
     let name = unsafe { dev.cast::<IDXGIDevice>().and_then(|d| d.GetAdapter()).and_then(|a| a.GetDesc()) }
         .map(|d| String::from_utf16_lossy(&d.Description[..d.Description.iter().position(|c| *c == 0).unwrap_or(d.Description.len())]))
         .unwrap_or_default();
@@ -311,11 +473,18 @@ fn build_prep() -> Option<Prep> {
 /// 进程一开始就在后台线程建设备、编译着色器（硬件设备 + 编译要 ~0.5 s，不能挡住第一帧）；
 /// 好了之后给 UI 线程发一条唤醒消息（`ui_thread`），事件循环里 poll_attach 接上。
 pub fn prewarm(ui_thread: u32) {
-    if !wanted() || PREP_STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+    UI_THREAD.store(ui_thread, std::sync::atomic::Ordering::Relaxed);
+    if env_forced_cpu() || PREP_STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return;
     }
     std::thread::spawn(move || {
         let p = build_prep();
+        if PREF_CPU.load(std::sync::atomic::Ordering::Relaxed) {
+            // 设置里是 CPU：设备用不上，放掉（显卡驱动的线程和内存）
+            drop(p);
+            PREP_STARTED.store(false, std::sync::atomic::Ordering::Release);
+            return;
+        }
         let ok = p.is_some();
         *PREP.lock().unwrap() = p;
         PREP_STATE.store(if ok { 1 } else { 2 }, std::sync::atomic::Ordering::Release);
@@ -356,33 +525,8 @@ fn attach(hwnd: HWND, w: u32, h: u32, p: Prep) -> bool {
     let Prep { dev, ctx, sh, warp } = p;
     let g = (|| -> windows::core::Result<Gpu> {
         unsafe {
-            let dxgi: IDXGIDevice = dev.cast()?;
-            let adapter = dxgi.GetAdapter()?;
-            let factory: IDXGIFactory2 = adapter.GetParent()?;
             let (w, h) = (w.max(1), h.max(1));
-            let desc = DXGI_SWAP_CHAIN_DESC1 {
-                Width: w,
-                Height: h,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                Stereo: false.into(),
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: 2,
-                Scaling: DXGI_SCALING_STRETCH,
-                SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-                AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
-                Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
-            };
-            let swap = factory.CreateSwapChainForComposition(&dev, &desc, None)?;
-            let sc2: IDXGISwapChain2 = swap.cast()?;
-            sc2.SetMaximumFrameLatency(1)?;
-            let wait = sc2.GetFrameLatencyWaitableObject();
-            let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dxgi)?;
-            let target = dcomp.CreateTargetForHwnd(hwnd, true)?;
-            let visual = dcomp.CreateVisual()?;
-            visual.SetContent(&swap)?;
-            target.SetRoot(&visual)?;
-            dcomp.Commit()?;
+            let (swap, wait, dcomp, target, visual) = make_swap(&dev, hwnd, w, h)?;
             let samp = |addr: D3D11_TEXTURE_ADDRESS_MODE| -> windows::core::Result<ID3D11SamplerState> {
                 let d = D3D11_SAMPLER_DESC {
                     Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
@@ -422,6 +566,9 @@ fn attach(hwnd: HWND, w: u32, h: u32, p: Prep) -> bool {
             let bd = D3D11_BUFFER_DESC { ByteWidth: 128, Usage: D3D11_USAGE_DYNAMIC, BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32, CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32, MiscFlags: 0, StructureByteStride: 0 };
             let mut cb = None;
             dev.CreateBuffer(&bd, None, Some(&mut cb))?;
+            let bd2 = D3D11_BUFFER_DESC { ByteWidth: 128, ..bd };
+            let mut cb2 = None;
+            dev.CreateBuffer(&bd2, None, Some(&mut cb2))?;
             let mut g = Gpu {
                 s_lin: samp(D3D11_TEXTURE_ADDRESS_CLAMP)?,
                 s_bord: samp(D3D11_TEXTURE_ADDRESS_BORDER)?,
@@ -429,6 +576,7 @@ fn attach(hwnd: HWND, w: u32, h: u32, p: Prep) -> bool {
                 b_none: blend(false)?,
                 rs: rs.unwrap(),
                 cb: cb.unwrap(),
+                cb2: cb2.unwrap(),
                 dev: dev.clone(),
                 ctx: ctx.clone(),
                 swap,
@@ -477,9 +625,41 @@ fn attach(hwnd: HWND, w: u32, h: u32, p: Prep) -> bool {
         }
         Err(e) => {
             log::warn!("gpu: attach failed: {e}; falling back to CPU present");
+            FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
             false
         }
     }
+}
+
+/// 给一个 HWND（带 WS_EX_NOREDIRECTIONBITMAP）建 composition swapchain + DComp target/visual
+unsafe fn make_swap(dev: &ID3D11Device, hwnd: HWND, w: u32, h: u32) -> windows::core::Result<(IDXGISwapChain1, HANDLE, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual)> {
+    let dxgi: IDXGIDevice = dev.cast()?;
+    let adapter = dxgi.GetAdapter()?;
+    let factory: IDXGIFactory2 = adapter.GetParent()?;
+    let desc = DXGI_SWAP_CHAIN_DESC1 {
+        Width: w.max(1),
+        Height: h.max(1),
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        Stereo: false.into(),
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+        BufferCount: 2,
+        Scaling: DXGI_SCALING_STRETCH,
+        SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+        AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+        Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
+    };
+    let swap = factory.CreateSwapChainForComposition(dev, &desc, None)?;
+    let sc2: IDXGISwapChain2 = swap.cast()?;
+    sc2.SetMaximumFrameLatency(1)?;
+    let wait = sc2.GetFrameLatencyWaitableObject();
+    let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dxgi)?;
+    let target = dcomp.CreateTargetForHwnd(hwnd, true)?;
+    let visual = dcomp.CreateVisual()?;
+    visual.SetContent(&swap)?;
+    target.SetRoot(&visual)?;
+    dcomp.Commit()?;
+    Ok((swap, wait, dcomp, target, visual))
 }
 
 fn refresh_ms() -> u32 {
@@ -575,13 +755,17 @@ impl Gpu {
     }
 
     fn draw_rtv(&self, ps: &ID3D11PixelShader, rtv: Option<&ID3D11RenderTargetView>, w: u32, h: u32, srvs: [Option<ID3D11ShaderResourceView>; 2], cb: &[f32; 24], over: bool, scissor: Option<RECT>) {
+        self.draw_with(ps, rtv, w, h, srvs, &self.cb, cb, over, scissor);
+    }
+
+    fn draw_with(&self, ps: &ID3D11PixelShader, rtv: Option<&ID3D11RenderTargetView>, w: u32, h: u32, srvs: [Option<ID3D11ShaderResourceView>; 2], buf: &ID3D11Buffer, cb: &[f32], over: bool, scissor: Option<RECT>) {
         let Some(rtv) = rtv else { return };
         unsafe {
             let c = &self.ctx;
             let mut m = D3D11_MAPPED_SUBRESOURCE::default();
-            if c.Map(&self.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut m)).is_ok() {
-                std::ptr::copy_nonoverlapping(cb.as_ptr(), m.pData as *mut f32, 24);
-                c.Unmap(&self.cb, 0);
+            if c.Map(buf, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut m)).is_ok() {
+                std::ptr::copy_nonoverlapping(cb.as_ptr(), m.pData as *mut f32, cb.len().min(32));
+                c.Unmap(buf, 0);
             }
             c.PSSetShaderResources(0, Some(&[None, None]));
             c.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
@@ -593,7 +777,7 @@ impl Gpu {
             c.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             c.VSSetShader(&self.sh_.vs, None);
             c.PSSetShader(ps, None);
-            c.PSSetConstantBuffers(0, Some(&[Some(self.cb.clone())]));
+            c.PSSetConstantBuffers(0, Some(&[Some(buf.clone())]));
             c.PSSetSamplers(0, Some(&[Some(self.s_lin.clone()), Some(self.s_bord.clone())]));
             c.PSSetShaderResources(0, Some(&srvs));
             c.Draw(3, 0);
@@ -903,6 +1087,7 @@ pub fn set_settle(s: f32) {
 
 /// 液态玻璃底（窗口尺寸，预乘）；None = 去掉
 pub fn set_lq(base: Option<(&[Bgra], usize, usize)>) {
+    drop_panel_glass();
     with(|g| match base {
         Some((px, w, h)) if px.len() == w * h && w > 0 => {
             if !g.lq.as_ref().is_some_and(|t| t.w == w as u32 && t.h == h as u32) {
@@ -1030,4 +1215,263 @@ pub fn readback() -> Option<(Vec<Bgra>, usize, usize)> {
         Some((out, w, h))
     })
     .flatten()
+}
+
+// ------------------------------------------------------------------ 其它窗口（变形窗口等，和面板共用设备）
+
+/// 和面板共用 D3D 设备的另一个 DComp 交换链（窗口要带 WS_EX_NOREDIRECTIONBITMAP）
+pub struct Surface {
+    swap: IDXGISwapChain1,
+    wait: HANDLE,
+    _dcomp: IDCompositionDevice,
+    _target: IDCompositionTarget,
+    _visual: IDCompositionVisual,
+    bb: Option<ID3D11RenderTargetView>,
+    pub w: u32,
+    pub h: u32,
+}
+
+impl Surface {
+    pub fn new(hwnd: HWND, w: u32, h: u32) -> Option<Surface> {
+        with(|g| unsafe {
+            let r = (|| -> windows::core::Result<Surface> {
+                let (swap, wait, d, t, v) = make_swap(&g.dev, hwnd, w, h)?;
+                let mut s = Surface { swap, wait, _dcomp: d, _target: t, _visual: v, bb: None, w: w.max(1), h: h.max(1) };
+                s.make_bb(&g.dev)?;
+                Ok(s)
+            })();
+            log_err("surface", r)
+        })
+        .flatten()
+    }
+
+    unsafe fn make_bb(&mut self, dev: &ID3D11Device) -> windows::core::Result<()> {
+        let b: ID3D11Texture2D = self.swap.GetBuffer(0)?;
+        let mut rtv = None;
+        dev.CreateRenderTargetView(&b, None, Some(&mut rtv))?;
+        self.bb = rtv;
+        Ok(())
+    }
+
+    pub fn resize(&mut self, w: u32, h: u32) -> bool {
+        let (w, h) = (w.max(1), h.max(1));
+        if self.w == w && self.h == h && self.bb.is_some() {
+            return true;
+        }
+        with(|g| unsafe {
+            self.bb = None;
+            g.ctx.OMSetRenderTargets(None, None);
+            g.ctx.ClearState();
+            g.ctx.Flush();
+            if let Err(e) = self.swap.ResizeBuffers(2, w, h, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
+                log::warn!("gpu: surface ResizeBuffers {w}x{h} failed: {e}");
+                return false;
+            }
+            self.w = w;
+            self.h = h;
+            log_err("surface backbuffer", self.make_bb(&g.dev)).is_some()
+        })
+        .unwrap_or(false)
+    }
+
+    /// 交换链的 frame-latency 句柄：有信号 = 可以画下一帧（跟 vsync / DWM 合成节拍）
+    pub fn handle(&self) -> HANDLE {
+        self.wait
+    }
+
+    pub fn wait(&self, ms: u32) -> bool {
+        unsafe { WaitForSingleObjectEx(self.wait, ms, false) == WAIT_OBJECT_0 }
+    }
+
+    pub fn clear(&self) {
+        with(|g| unsafe {
+            if let Some(bb) = &self.bb {
+                g.ctx.ClearRenderTargetView(bb, &[0.0; 4]);
+            }
+        });
+    }
+
+    pub fn present(&self) {
+        unsafe {
+            let hr = self.swap.Present(1, DXGI_PRESENT(0));
+            if hr.is_err() {
+                log::warn!("gpu: surface Present failed: {hr:?}");
+            }
+        }
+    }
+}
+
+impl Drop for Surface {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.wait);
+        }
+    }
+}
+
+/// 背后屏幕的模糊图（GPU 上）：半分辨率、三次盒式模糊（= morph::blur_half），`org` 是全分辨率左上角的屏幕坐标
+pub struct Glass {
+    small: Tex,
+    pub org: (i32, i32),
+    pub w: u32,
+    pub h: u32,
+}
+
+/// 截到的屏幕像素（不透明 BGRA）上传并在 GPU 上模糊。`radius`：全分辨率半径（同 blur_half）
+pub fn glass_from_pixels(px: &[Bgra], w: usize, h: usize, org: (i32, i32), radius: f64) -> Option<std::rc::Rc<Glass>> {
+    if w == 0 || h == 0 || px.len() != w * h {
+        return None;
+    }
+    with(|g| {
+        let g: &Gpu = g;
+        let full = g.tex(w as u32, h as u32, DXGI_FORMAT_B8G8R8A8_UNORM)?;
+        g.upload(&full, px, w, 0, h);
+        let (sw, sh) = (w.div_ceil(2) as u32, h.div_ceil(2) as u32);
+        let fmt = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        let pair = [g.tex(sw, sh, fmt)?, g.tex(sw, sh, fmt)?];
+        let mut cb = [0f32; 24];
+        cb[10] = 2.0;
+        cb[16] = w as f32;
+        cb[17] = h as f32;
+        cb[18] = sw as f32;
+        cb[19] = sh as f32;
+        g.draw(&g.sh_.down, &pair[0], [Some(&full), None], &cb, false, None);
+        let rs = (radius / 2.0).round().max(1.0) as f32;
+        let mut i = 0usize;
+        for _ in 0..3 {
+            for dir in [(1.0, 0.0), (0.0, 1.0)] {
+                cb[20] = rs;
+                cb[21] = dir.0;
+                cb[22] = dir.1;
+                g.draw(&g.sh_.boxp, &pair[1 - i], [Some(&pair[i]), None], &cb, false, None);
+                i = 1 - i;
+            }
+        }
+        let [a, b] = pair;
+        let small = if i == 0 { a } else { b };
+        Some(std::rc::Rc::new(Glass { small, org, w: w as u32, h: h as u32 }))
+    })
+    .flatten()
+}
+
+/// GPU 上的一张图（面板快照）
+pub struct GTex(Tex);
+
+impl GTex {
+    pub fn size(&self) -> (usize, usize) {
+        (self.0.w as usize, self.0.h as usize)
+    }
+}
+
+/// 面板当前显示的帧（GPU 合成结果或上传的 CPU 帧）复制一份：变形动画用，不读回 CPU
+pub fn snapshot() -> Option<GTex> {
+    with(|g| {
+        let g: &Gpu = g;
+        let src = if g.frame_gpu { g.acc[g.cur].as_ref() } else { g.cpu.as_ref() }?;
+        let t = g.tex(src.w, src.h, DXGI_FORMAT_B8G8R8A8_UNORM)?;
+        unsafe { g.ctx.CopyResource(&t.t, &src.t) };
+        Some(GTex(t))
+    })
+    .flatten()
+}
+
+/// 变形一帧的输入
+pub struct MorphDraw<'a> {
+    pub frame: &'a crate::morph::Frame,
+    pub look: &'a crate::morph::Look,
+    /// 目标左上角的屏幕坐标（玻璃按屏幕坐标取样）
+    pub org: (f64, f64),
+    pub glass: Option<&'a Glass>,
+    /// 内容和卡片在内容图里的左上角（拉伸模式）；None = 不叠内容
+    pub content: Option<(&'a GTex, (f64, f64))>,
+    /// 整体透明度（淡出）
+    pub alpha: f32,
+}
+
+/// 与 morph::render_impl 同一套参数（Windows：stretch 模式，没有 Rest）
+fn morph_cb(d: &MorphDraw) -> [f32; 32] {
+    let f = d.frame;
+    let look = d.look;
+    let sc = look.scale;
+    let r = f.rect;
+    let bevel = (14.0 * sc).min((r[2] - r[0]).min(r[3] - r[1]) / 2.0).max(1.0);
+    let g = f.grow.clamp(0.0, 1.0);
+    let k_acc = (1.0 - g * 2.2).clamp(0.0, 1.0);
+    let (tint, ta) = match (look.dark, d.glass.is_some()) {
+        (true, true) => ((0.10, 0.10, 0.12), 0.40),
+        (false, true) => ((0.98, 0.98, 0.99), 0.46),
+        (true, false) => ((0.13, 0.13, 0.15), 0.90),
+        (false, false) => ((0.97, 0.97, 0.98), 0.92),
+    };
+    let mix = |a: f64, b: f64| a * (1.0 - k_acc) + b * k_acc;
+    let body = [mix(tint.0, look.accent.0), mix(tint.1, look.accent.1), mix(tint.2, look.accent.2), mix(ta, 0.85)];
+    let rim_a = if look.dark { 0.30 } else { 0.75 } * g.max(0.25);
+    let sheen_a = if look.dark { 0.10 } else { 0.30 } * (1.0 - f.content * 0.7) * g;
+    let shadow_a = 0.20 * g.max(0.25);
+    let mut k = [0f32; 32];
+    k[0..4].copy_from_slice(&[r[0] as f32, r[1] as f32, r[2] as f32, r[3] as f32]);
+    k[4..8].copy_from_slice(&[f.radius as f32, (14.0 * sc) as f32, (2.0 * sc) as f32, bevel as f32]);
+    let c_op = if d.content.is_some() { f.content.clamp(0.0, 1.0) } else { 0.0 };
+    k[8..12].copy_from_slice(&[(18.0 * sc) as f32, (1.2 * sc) as f32, c_op as f32, d.alpha.clamp(0.0, 1.0)]);
+    k[12..16].copy_from_slice(&[body[0] as f32, body[1] as f32, body[2] as f32, body[3] as f32]);
+    k[16..20].copy_from_slice(&[rim_a as f32, sheen_a as f32, shadow_a as f32, if d.glass.is_some() { 1.0 } else { 0.0 }]);
+    if let Some(gl) = d.glass {
+        let (sw, sh) = (gl.small.w as f64, gl.small.h as f64);
+        k[20..24].copy_from_slice(&[(d.org.0 - gl.org.0 as f64) as f32, (d.org.1 - gl.org.1 as f64) as f32, (1.0 / (2.0 * sw)) as f32, (1.0 / (2.0 * sh)) as f32]);
+    }
+    if let Some((c, at)) = d.content {
+        let (pw, ph) = (c.0.w as f64, c.0.h as f64);
+        let (cw, ch) = ((pw - 2.0 * at.0).max(1.0), (ph - 2.0 * at.1).max(1.0));
+        let (kx, ky) = (cw / (r[2] - r[0]).max(1e-3), ch / (r[3] - r[1]).max(1e-3));
+        k[24..28].copy_from_slice(&[at.0 as f32, at.1 as f32, kx as f32, ky as f32]);
+        k[28..32].copy_from_slice(&[(1.0 / pw) as f32, (1.0 / ph) as f32, 0.0, 0.0]);
+    }
+    k
+}
+
+/// 画一帧变形到 surface（整幅覆盖）
+pub fn draw_morph(surf: &Surface, d: &MorphDraw) {
+    with(|g| {
+        let g: &Gpu = g;
+        let cb = morph_cb(d);
+        let srvs = [d.glass.and_then(|x| x.small.srv.clone()), d.content.and_then(|(c, _)| c.0.srv.clone())];
+        g.draw_with(&g.sh_.morph, surf.bb.as_ref(), surf.w, surf.h, srvs, &g.cb2, &cb, false, None);
+    });
+}
+
+thread_local! {
+    /// 面板液态玻璃底用的那张模糊图（收起动画直接接着用）
+    static PANEL_GLASS: RefCell<Option<std::rc::Rc<Glass>>> = const { RefCell::new(None) };
+}
+
+/// 面板的液态玻璃底在 GPU 上画（= win.rs set_liquid 的 CPU 版：morph::render，形状 = 整个面板，无内容）。
+/// `org`：面板左上角屏幕坐标。glass 留着给收起动画。
+pub fn set_lq_glass(glass: std::rc::Rc<Glass>, org: (i32, i32), w: usize, h: usize, look: &crate::morph::Look, frame: &crate::morph::Frame) -> bool {
+    let ok = with(|g| {
+        if !g.lq.as_ref().is_some_and(|t| t.w == w as u32 && t.h == h as u32) {
+            g.lq = g.tex(w as u32, h as u32, DXGI_FORMAT_B8G8R8A8_UNORM);
+        }
+        let g: &Gpu = g;
+        let Some(t) = g.lq.as_ref() else { return false };
+        let d = MorphDraw { frame, look, org: (org.0 as f64, org.1 as f64), glass: Some(&glass), content: None, alpha: 1.0 };
+        let cb = morph_cb(&d);
+        g.draw_with(&g.sh_.morph, t.rtv.as_ref(), t.w, t.h, [glass.small.srv.clone(), None], &g.cb2, &cb, false, None);
+        true
+    })
+    .unwrap_or(false);
+    PANEL_GLASS.with(|p| *p.borrow_mut() = ok.then_some(glass));
+    ok
+}
+
+pub fn panel_glass() -> Option<std::rc::Rc<Glass>> {
+    PANEL_GLASS.with(|p| p.borrow().clone())
+}
+
+pub fn drop_panel_glass() {
+    PANEL_GLASS.with(|p| *p.borrow_mut() = None);
+}
+
+/// 硬件设备（不是 WARP）
+pub fn hardware() -> bool {
+    with(|g| !g.warp).unwrap_or(false)
 }
