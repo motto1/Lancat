@@ -132,7 +132,8 @@ impl slint::platform::Platform for Win32Platform {
                 }
             }
             // GPU 面板在合成 / 层动画中：按显示器刷新率逐帧要帧（144 Hz），不再等 15 ms 的 tick
-            let fast = wins.iter().any(|w| w.gpu.get()) && (crate::compose::animating() || crate::compose::gpu_frame());
+            // （普通的 Slint 动画仍按 16 ms；静止的合成画面不空转）
+            let fast = wins.iter().any(|w| w.gpu.get()) && (crate::compose::animating() || wins.iter().any(|w| w.gpu.get() && w.settling()));
             if fast && crate::compose::pose_animating() {
                 if let Some(p) = wins.iter().find(|w| w.gpu.get()) {
                     p.needs_redraw.set(true);
@@ -1224,6 +1225,11 @@ pub fn panel_hide(prev: Option<isize>) {
 }
 
 /// 面板最后一帧（先把还没画的变化画进缓冲）：(预乘 BGRA, 宽, 高)
+/// 面板还停放着（alpha 0：没打开，或正在等变形动画）
+pub fn panel_parked() -> bool {
+    panel().is_none_or(|w| w.alpha.get() == 0)
+}
+
 fn panel_snapshot() -> Option<(Vec<Bgra>, usize, usize)> {
     let w = panel()?;
     let size = w.size.get();

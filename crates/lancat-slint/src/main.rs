@@ -1222,7 +1222,13 @@ impl App {
                     ui.set_drop_slots(ModelRc::new(VecModel::from(slots)));
                 }
                 ui.set_drag_count(n as i32);
-                if !ui.get_dragging() {
+                // 面板是被这次拖拽从停靠条拉开的（还停放着）：选择器直接以终态出现，变形动画截的那张面板图里
+                // 就已经有设备群，停稳后真面板接上时不会「一下冒出全部设备」
+                #[cfg(windows)]
+                let fresh = crate::win::panel_parked();
+                #[cfg(not(windows))]
+                let fresh = false;
+                if !ui.get_dragging() && !fresh {
                     compose::start(5);
                 }
                 ui.set_dragging(true);
