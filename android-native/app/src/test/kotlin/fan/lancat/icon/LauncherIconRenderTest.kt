@@ -52,13 +52,13 @@ class LauncherIconRenderTest {
     }
 
     @Test fun notificationIconIsMonochrome() {
-        val b = render(R.drawable.ic_stat, 96, "ic_stat")
+        val b = render(R.drawable.ic_notify, 96, "ic_notify")
         var opaque = 0
         for (y in 0 until b.height) for (x in 0 until b.width) {
             val p = b.getPixel(x, y); val a = p ushr 24
             if (a > 0) {
                 val rgb = p and 0xFFFFFF
-                assertTrue("ic_stat must be white only, got ${Integer.toHexString(p)}", rgb == 0xFFFFFF || a < 255)
+                assertTrue("ic_notify must be white only, got ${Integer.toHexString(p)}", rgb == 0xFFFFFF || a < 255)
                 if (a == 255) opaque++
             }
         }

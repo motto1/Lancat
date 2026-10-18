@@ -246,13 +246,18 @@ fun ChatScreen(
     val targets: () -> List<String> = {
         if (isAll) peers.filter { it.online && !it.blocked }.map { it.id } else listOf(peerId)
     }
+    val viewing = remember { mutableStateOf<Body.File?>(null) }
     val fileActions = remember(repo) {
         object : FileActions {
             override fun pause(id: String) { scope.launch { repo.pause(id) } }
             override fun resume(id: String) { scope.launch { repo.resume(id) } }
             override fun retry(id: String) { scope.launch { repo.retry(id) } }
             override fun cancel(id: String) { scope.launch { repo.cancel(id) } }
-            override fun open(body: Body.File) { if (!openFile(ctx, body)) flash.show("没有可以打开此文件的应用") }
+            override fun open(body: Body.File) {
+                // 图片在应用内全屏看；其他文件交给系统关联的应用
+                if (showsAsImage(body)) viewing.value = body
+                else if (!FileIntents.open(ctx, body)) flash.show(if (body.localUri == null) "文件不存在" else "没有可以打开此文件的应用")
+            }
         }
     }
     var lastTypingSent by remember { mutableLongStateOf(0L) }
@@ -368,7 +373,10 @@ fun ChatScreen(
                     onCopy = { (t.item.m.body as? Body.Text)?.let { copyToClipboard(ctx, it.text); flash.show("已复制") }; menu = null },
                     onDelete = { scope.launch { repo.deleteMessage(t.item.m.id) }; menu = null },
                     onRetry = { scope.launch { repo.retry(t.item.m.id) }; menu = null },
-                    onReveal = { if (!revealInFolder(ctx)) flash.show("没有可用的文件管理器"); menu = null },
+                    onReveal = {
+                        (t.item.m.body as? Body.File)?.let { f -> if (!FileIntents.reveal(ctx, f)) flash.show("没有可用的文件管理器") }
+                        menu = null
+                    },
                     onForward = { forwardIds = listOf(t.item.m.id); menu = null },
                     onSelect = { selection[t.item.m.id] = true; menu = null },
                 )
@@ -381,6 +389,15 @@ fun ChatScreen(
                 val co = coordsMap[it.m.id]
                 menu = MenuTarget(it, if (co != null && co.isAttached) co.boundsInRoot() else Rect(0f, 600f, 600f, 700f))
             }
+        }
+        // 全屏看图（盖在整个聊天页上）
+        viewing.value?.let { f ->
+            ImageViewer(
+                f,
+                onDismiss = { viewing.value = null },
+                onOpenWith = { if (!FileIntents.open(ctx, f)) flash.show("没有可以打开此文件的应用") },
+                onReveal = { if (!FileIntents.reveal(ctx, f)) flash.show("没有可用的文件管理器") },
+            )
         }
     }
 

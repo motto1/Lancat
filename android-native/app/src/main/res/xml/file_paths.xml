@@ -6,4 +6,8 @@
     <cache-path name="updates" path="updates/" />
     <!-- 收到的文件落在 Android 8–9 的公共 Download/Lancat 时，用 FileProvider 交给其他应用打开 -->
     <external-path name="downloads" path="Download/" />
+    <!-- 收到 / 发出的文件在主存储任意位置（发出的文件按真实路径读）：点开时换成 content:// 交给关联应用 -->
+    <external-path name="storage" path="." />
+    <external-files-path name="app_external" path="." />
+    <files-path name="app_files" path="." />
 </paths>

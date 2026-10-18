@@ -25,7 +25,8 @@ class OpenFileActivity : Activity() {
         when (i.getStringExtra(EXTRA_MODE)) {
             MODE_OPEN -> {
                 val uri = i.getStringExtra(EXTRA_URI)?.let(Uri::parse)
-                if (uri != null) launch(ReceiveStorage.openIntent(this, uri, i.getStringExtra(EXTRA_MIME)))
+                val open = uri?.let { runCatching { ReceiveStorage.openIntent(this, it, i.getStringExtra(EXTRA_MIME)) }.getOrNull() }
+                if (open != null) launch(open) else Toast.makeText(this, R.string.open_failed, Toast.LENGTH_SHORT).show()
             }
             MODE_REVEAL -> {
                 val dir = i.getStringExtra(EXTRA_DIR) ?: ReceiveStorage.DEFAULT_DIR
@@ -46,7 +47,8 @@ class OpenFileActivity : Activity() {
         true
     } catch (_: ActivityNotFoundException) {
         false
-    } catch (_: SecurityException) {
+    } catch (_: Exception) {
+        // SecurityException / FileUriExposed / 部分 ROM 的 IllegalArgument：只提示，不闪退
         false
     }
 

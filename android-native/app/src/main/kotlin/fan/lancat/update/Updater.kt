@@ -308,7 +308,7 @@ object Updater : AppUpdater {
     @Volatile private var lastNotif = 0L
 
     private fun base(rel: AppRelease) = NotificationCompat.Builder(app, CHANNEL)
-        .setSmallIcon(R.drawable.ic_stat)
+        .setSmallIcon(R.drawable.ic_notify)
         .setColor(0xFFD97757.toInt())
         .setContentTitle("Lancat ${rel.version}")
         .setOnlyAlertOnce(true)

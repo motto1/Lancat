@@ -37,6 +37,7 @@ object LancatIcons {
         "search" to "M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14Z M20 20l-4-4",
         "plus" to "M12 5v14 M5 12h14",
         "x" to "M6 6l12 12 M18 6 6 18",
+        "external" to "M14 4h6v6 M20 4l-9 9 M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4",
         "pause" to "M9 6v12 M15 6v12",
         "play" to "M8 5.5v13l10.5-6.5z",
         "radar" to "M12 12m-1 0a1 1 0 1 0 2 0a1 1 0 1 0-2 0 M7.8 16.2a6 6 0 0 1 0-8.4 M16.2 7.8a6 6 0 0 1 0 8.4 M5 19a10 10 0 0 1 0-14 M19 5a10 10 0 0 1 0 14",

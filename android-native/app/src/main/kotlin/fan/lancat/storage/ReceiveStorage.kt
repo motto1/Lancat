@@ -92,14 +92,36 @@ object ReceiveStorage {
         return tree.toString()
     }
 
-    /** 「打开」：file:// 转成本应用 FileProvider，content:// 原样；带读授权 */
-    fun openIntent(ctx: Context, uri: Uri, mime: String?): Intent {
+    /**
+     * 「打开」：file:// 转成本应用 FileProvider（file_paths.xml 覆盖整个主存储），不在范围内再查 MediaStore；
+     * content:// 原样；带读授权。换不出可分享的 uri 返回 null（不能把 file:// 交出去：Android 7+ 直接抛异常闪退）。
+     */
+    fun openIntent(ctx: Context, uri: Uri, mime: String?): Intent? {
         val u = if (uri.scheme == "file") {
-            FileProvider.getUriForFile(ctx, "${ctx.packageName}.files", File(uri.path!!))
+            val f = File(uri.path ?: return null)
+            runCatching { FileProvider.getUriForFile(ctx, "${ctx.packageName}.files", f) }.getOrNull()
+                ?: mediaStoreUri(ctx, f) ?: return null
         } else uri
-        val type = mime ?: ctx.contentResolver.getType(u) ?: guessMime(u.lastPathSegment ?: "")
+        val type = mime?.takeIf { it.isNotBlank() && it != "*/*" } ?: runCatching { ctx.contentResolver.getType(u) }.getOrNull() ?: guessMime(uri.lastPathSegment ?: "")
         return Intent(Intent.ACTION_VIEW).setDataAndType(u, type)
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            .also { it.clipData = android.content.ClipData.newRawUri("", u) }
+    }
+
+    private fun mediaStoreUri(ctx: Context, f: File): Uri? = runCatching {
+        val files = MediaStore.Files.getContentUri("external")
+        ctx.contentResolver.query(files, arrayOf(MediaStore.MediaColumns._ID), "${MediaStore.MediaColumns.DATA}=?", arrayOf(f.absolutePath), null)?.use { c ->
+            if (c.moveToFirst()) android.content.ContentUris.withAppendedId(files, c.getLong(0)) else null
+        }
+    }.getOrNull()
+
+    /** 主存储上的文件 → ExternalStorageProvider 文档 id（primary:Download/Lancat/a.jpg） */
+    private fun primaryDocId(f: File): String? {
+        @Suppress("DEPRECATION")
+        val root = Environment.getExternalStorageDirectory().absolutePath.trimEnd('/')
+        val p = f.absolutePath
+        val base = listOf(root, "/sdcard", "/storage/self/primary").firstOrNull { p == it || p.startsWith("$it/") } ?: return null
+        return "primary:" + p.removePrefix(base).trimStart('/')
     }
 
     /**
@@ -108,9 +130,24 @@ object ReceiveStorage {
      * 2. 默认目录：DocumentsUI 打开 primary:Download/Lancat（AOSP / Pixel 可用，部分 OEM 文件管理器不认）
      * 3. 系统「下载」界面 DownloadManager.ACTION_VIEW_DOWNLOADS
      */
-    fun revealIntents(ctx: Context, receiveDir: String, @Suppress("UNUSED_PARAMETER") fileUri: Uri?): List<Intent> {
+    fun revealIntents(ctx: Context, receiveDir: String, fileUri: Uri?): List<Intent> {
         val list = mutableListOf<Intent>()
         val dirMime = DocumentsContract.Document.MIME_TYPE_DIR
+        // 文件本身在主存储上：系统「文件」收到文件的文档 uri 会打开它所在的那一层（AOSP launchToDocument），再退到所在文件夹
+        val docId = fileUri?.takeIf { it.scheme == "file" }?.path?.let { primaryDocId(File(it)) }
+        if (docId != null) {
+            val fileDoc = DocumentsContract.buildDocumentUri("com.android.externalstorage.documents", docId)
+            for (pkg in listOf("com.google.android.documentsui", "com.android.documentsui")) {
+                list += Intent(Intent.ACTION_VIEW).setDataAndType(fileDoc, dirMime).setPackage(pkg).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            val parent = DocumentsContract.buildDocumentUri("com.android.externalstorage.documents", docId.substringBeforeLast('/', "primary:"))
+            list += Intent(Intent.ACTION_VIEW).setDataAndType(parent, dirMime).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        } else if (fileUri != null && fileUri.scheme == "content" && runCatching { DocumentsContract.isDocumentUri(ctx, fileUri) }.getOrDefault(false)) {
+            for (pkg in listOf("com.google.android.documentsui", "com.android.documentsui")) {
+                list += Intent(Intent.ACTION_VIEW).setDataAndType(fileUri, dirMime).setPackage(pkg)
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        }
         if (isTree(receiveDir)) {
             val tree = Uri.parse(receiveDir)
             val doc = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree))

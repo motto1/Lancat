@@ -276,21 +276,8 @@ fun fileMeta(m: Message, f: Body.File, pct: Float): String {
     }
 }
 
-/** 打开收到 / 发出的文件。 */
-fun openFile(ctx: Context, f: Body.File): Boolean {
-    val uri = f.localUri ?: return false
-    val i = Intent(Intent.ACTION_VIEW).apply {
-        setDataAndType(Uri.parse(uri), f.mime ?: "*/*")
-        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-    }
-    return try { ctx.startActivity(Intent.createChooser(i, "打开 ${f.name}").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); true }
-    catch (e: ActivityNotFoundException) { false } catch (e: SecurityException) { false }
-}
-
-/** 「在文件夹中显示」：默认接收目录是 Download/Lancat，打开系统下载内容视图。 */
-fun revealInFolder(ctx: Context): Boolean = try {
-    ctx.startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); true
-} catch (e: ActivityNotFoundException) { false }
+/** 打开收到 / 发出的文件（交给系统关联的应用；见 [FileIntents]）。 */
+fun openFile(ctx: Context, f: Body.File): Boolean = FileIntents.open(ctx, f)
 
 @Composable
 fun SelectCircle(selected: Boolean, modifier: Modifier = Modifier, size: Dp = 22.dp) {

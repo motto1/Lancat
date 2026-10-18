@@ -165,7 +165,8 @@ class LancatService : Service() {
 
     private fun onTimeoutCommon() {
         val n = NotificationCompat.Builder(this, Channels.XFER)
-            .setSmallIcon(R.drawable.ic_stat)
+            .setSmallIcon(R.drawable.ic_notify)
+            .setColor(0xFFD97757.toInt())
             .setContentTitle(getString(R.string.svc_timeout_title))
             .setContentText(getString(R.string.svc_timeout_text))
             .setContentIntent(openApp())
@@ -197,7 +198,8 @@ class LancatService : Service() {
 
     private fun buildNotification(s: ServiceController.State): Notification {
         val b = NotificationCompat.Builder(this, Channels.SVC)
-            .setSmallIcon(R.drawable.ic_stat)
+            .setSmallIcon(R.drawable.ic_notify)
+            .setColor(0xFFD97757.toInt())
             .setOngoing(true)
             .setSilent(true)
             .setShowWhen(false)

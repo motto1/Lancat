@@ -129,8 +129,8 @@ object TransferNotifier {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val b = NotificationCompat.Builder(ctx, Channels.XFER)
-            .setSmallIcon(R.drawable.ic_stat)
-            .setColor(0xFF0A84FF.toInt())
+            .setSmallIcon(R.drawable.ic_notify)
+            .setColor(0xFFD97757.toInt())
             .setCategory(NotificationCompat.CATEGORY_PROGRESS)
             .setContentIntent(openChat)
             .setOnlyAlertOnce(true)
@@ -218,7 +218,7 @@ object TransferNotifier {
         if (sdk >= 36) {
             val style = NotificationCompat.ProgressStyle()
                 .setStyledByProgress(true)
-                .setProgressSegments(listOf(NotificationCompat.ProgressStyle.Segment(1000).setColor(0xFF0A84FF.toInt())))
+                .setProgressSegments(listOf(NotificationCompat.ProgressStyle.Segment(1000).setColor(0xFFD97757.toInt())))
                 .setProgressIndeterminate(indeterminate)
             if (!indeterminate) style.setProgress(value * 1000 / max.coerceAtLeast(1))
             b.setStyle(style)

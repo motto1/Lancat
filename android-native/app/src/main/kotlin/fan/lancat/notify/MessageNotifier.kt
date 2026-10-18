@@ -131,7 +131,7 @@ object MessageNotifier {
             NotificationActionReceiver.intent(ctx, NotificationActionReceiver.ACTION_REPLY, peerId = peer.id),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
         )
-        val reply = NotificationCompat.Action.Builder(R.drawable.ic_stat, ctx.getString(R.string.act_reply), replyPi)
+        val reply = NotificationCompat.Action.Builder(R.drawable.ic_notify, ctx.getString(R.string.act_reply), replyPi)
             .addRemoteInput(remoteInput)
             .setAllowGeneratedReplies(true)
             .setSemanticAction(NotificationCompat.Action.SEMANTIC_ACTION_REPLY)
@@ -142,7 +142,7 @@ object MessageNotifier {
             NotificationActionReceiver.intent(ctx, NotificationActionReceiver.ACTION_MARK_READ, peerId = peer.id),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        val markRead = NotificationCompat.Action.Builder(R.drawable.ic_stat, ctx.getString(R.string.act_mark_read), readPi)
+        val markRead = NotificationCompat.Action.Builder(R.drawable.ic_notify, ctx.getString(R.string.act_mark_read), readPi)
             .setSemanticAction(NotificationCompat.Action.SEMANTIC_ACTION_MARK_AS_READ)
             .setShowsUserInterface(false)
             .build()
@@ -150,8 +150,8 @@ object MessageNotifier {
         val sid = ShortcutPublisher.shortcutId(peer.id)
         val incoming = lines.count { !it.outgoing }
         return NotificationCompat.Builder(ctx, Channels.MSG)
-            .setSmallIcon(R.drawable.ic_stat)
-            .setColor(0xFF0A84FF.toInt())
+            .setSmallIcon(R.drawable.ic_notify)
+            .setColor(0xFFD97757.toInt())
             .setStyle(style)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .setPriority(NotificationCompat.PRIORITY_HIGH)

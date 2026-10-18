@@ -4,7 +4,7 @@
 输出（相对 android-native/app/src/main/res）：
   drawable/ic_launcher_foreground.xml   自适应图标前景（108dp 矢量，像素猫居中，落在 66dp 安全区内）
   drawable/ic_launcher_monochrome.xml   Android 13+ 主题图标：猫剪影，两个半箭头镂空
-  drawable/ic_stat.xml                  通知小图标（24dp 白色剪影，箭头镂空）
+  drawable/ic_notify.xml                  通知小图标（24dp 白色剪影，箭头镂空）
   drawable/ic_tile.xml                  快捷设置 Tile 图标（同通知小图标）
   values/ic_launcher_background.xml     背景色 = 桌面图标底色 #F3EEE3
   mipmap-*/ic_launcher.png / ic_launcher_round.png   旧式位图（圆角方 / 圆），48dp 各密度
@@ -78,7 +78,7 @@ for col in sorted(set(cells.values())):
 write("drawable/ic_launcher_foreground.xml", vector(108, 108, "".join(body)))
 write("drawable/ic_launcher_monochrome.xml", silhouette_xml(108, CELL, "#FF000000"))
 # ---- 通知 / Tile：24dp，格子 1.375dp（猫 22×19.25dp）
-write("drawable/ic_stat.xml", silhouette_xml(24, 1.375, "#FFFFFFFF"))
+write("drawable/ic_notify.xml", silhouette_xml(24, 1.375, "#FFFFFFFF"))
 write("drawable/ic_tile.xml", silhouette_xml(24, 1.375, "#FFFFFFFF"))
 write("values/ic_launcher_background.xml",
       f'<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <!-- 桌面图标底色（docs/assets/logo.svg） -->\n    <color name="ic_launcher_background">{BG}</color>\n</resources>\n')
