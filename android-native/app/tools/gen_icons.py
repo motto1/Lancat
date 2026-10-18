@@ -7,7 +7,7 @@
   drawable/ic_notify.xml                  通知小图标（24dp 白色剪影，箭头镂空）
   drawable/ic_tile.xml                  快捷设置 Tile 图标（同通知小图标）
   values/ic_launcher_background.xml     背景色 = 桌面图标底色 #F3EEE3
-  mipmap-*/ic_launcher.png / ic_launcher_round.png   旧式位图（圆角方 / 圆），48dp 各密度
+  mipmap-*/ic_app_v2.png / ic_app_v2_round.png   旧式位图（圆角方 / 圆），48dp 各密度
 用法：python3 app/tools/gen_icons.py [repo 根目录]（需要 Pillow）
 """
 import re, sys, os
@@ -104,7 +104,7 @@ def render(px, shape, scale=4):
 
 
 for dens, px in {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}.items():
-    for name, shape in (("ic_launcher", "square"), ("ic_launcher_round", "round")):
+    for name, shape in (("ic_app_v2", "square"), ("ic_app_v2_round", "round")):
         p = os.path.join(RES, f"mipmap-{dens}", name + ".png"); os.makedirs(os.path.dirname(p), exist_ok=True)
         render(px, shape).save(p, optimize=True); print("wrote", p)
 

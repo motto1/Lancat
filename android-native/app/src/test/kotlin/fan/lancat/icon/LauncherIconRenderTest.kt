@@ -35,11 +35,11 @@ class LauncherIconRenderTest {
     }
 
     @Test fun launcher() {
-        val d = ContextCompat.getDrawable(ctx, R.mipmap.ic_launcher)
+        val d = ContextCompat.getDrawable(ctx, R.mipmap.ic_app_v2)
         assertTrue("ic_launcher 应是自适应图标", d is AdaptiveIconDrawable)
         assertTrue("应有主题图标（monochrome）层", (d as AdaptiveIconDrawable).monochrome != null)
-        val b = render(R.mipmap.ic_launcher, 432, "ic_launcher")
-        render(R.mipmap.ic_launcher_round, 432, "ic_launcher_round")
+        val b = render(R.mipmap.ic_app_v2, 432, "ic_launcher")
+        render(R.mipmap.ic_app_v2_round, 432, "ic_launcher_round")
         render(R.drawable.ic_launcher_foreground, 432, "ic_launcher_foreground")
         render(R.drawable.ic_launcher_monochrome, 432, "ic_launcher_monochrome")
         // 中心偏下是猫身（橙红：R 高、B 低）

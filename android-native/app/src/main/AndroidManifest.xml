@@ -38,9 +38,9 @@
         android:name=".LancatApplication"
         android:allowBackup="false"
         android:enableOnBackInvokedCallback="true"
-        android:icon="@mipmap/ic_launcher"
+        android:icon="@mipmap/ic_app_v2"
         android:label="@string/app_name"
-        android:roundIcon="@mipmap/ic_launcher_round"
+        android:roundIcon="@mipmap/ic_app_v2_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.Lancat"
         tools:targetApi="36">
