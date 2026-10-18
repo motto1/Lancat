@@ -882,7 +882,7 @@ dependencies = [
 
 [[package]]
 name = "lancat-core"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "anyhow",
  "axum",
@@ -907,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "lancat-ffi"
-version = "0.2.10"
+version = "0.2.11"
 dependencies = [
  "anyhow",
  "blake3",
